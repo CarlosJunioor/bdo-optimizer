@@ -191,6 +191,7 @@ pub struct App {
 impl App {
     /// Construct the app and kick off background hardware detection.
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        configure_ui(&cc.egui_ctx);
         let detect_rx = detect::spawn(cc.egui_ctx.clone());
         Self {
             tab: Tab::Hardware,
@@ -358,17 +359,37 @@ impl eframe::App for App {
         self.poll_capture();
         self.drive_overlay(&ui.ctx().clone());
 
-        egui::Panel::top("tabs").show(ui, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.heading("BDO Optimizer");
-                ui.separator();
-                ui.selectable_value(&mut self.tab, Tab::Hardware, "Hardware");
-                ui.selectable_value(&mut self.tab, Tab::Optimize, "Optimize");
-                ui.selectable_value(&mut self.tab, Tab::Benchmark, "Benchmark");
+        egui::Panel::top("tabs")
+            .exact_size(64.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgb(14, 22, 34))
+                    .inner_margin(egui::Margin::symmetric(20, 12)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("BDO // OPTIMIZER")
+                            .monospace()
+                            .strong()
+                            .size(20.0)
+                            .color(egui::Color32::from_rgb(104, 200, 255)),
+                    );
+                    ui.separator();
+                    ui.selectable_value(&mut self.tab, Tab::Hardware, "Hardware");
+                    ui.selectable_value(&mut self.tab, Tab::Optimize, "Optimize");
+                    ui.selectable_value(&mut self.tab, Tab::Benchmark, "Benchmark");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                                .monospace()
+                                .size(12.0)
+                                .color(egui::Color32::from_rgb(150, 166, 186)),
+                        )
+                        .on_hover_text("Current BDO Optimizer version");
+                    });
+                });
             });
-            ui.add_space(4.0);
-        });
 
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| match self.tab {
@@ -378,4 +399,26 @@ impl eframe::App for App {
             });
         });
     }
+}
+
+fn configure_ui(ctx: &egui::Context) {
+    ctx.set_theme(egui::Theme::Dark);
+    let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
+    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+    style.spacing.button_padding = egui::vec2(14.0, 9.0);
+    style.spacing.interact_size = egui::vec2(44.0, 40.0);
+    style.visuals = egui::Visuals::dark();
+    style.visuals.panel_fill = egui::Color32::from_rgb(10, 16, 26);
+    style.visuals.window_fill = egui::Color32::from_rgb(16, 25, 39);
+    style.visuals.extreme_bg_color = egui::Color32::from_rgb(7, 12, 20);
+    style.visuals.faint_bg_color = egui::Color32::from_rgb(19, 31, 47);
+    style.visuals.selection.bg_fill = egui::Color32::from_rgb(25, 113, 160);
+    style.visuals.selection.stroke.color = egui::Color32::from_rgb(177, 229, 255);
+    style.visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(25, 38, 56);
+    style.visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(34, 56, 78);
+    style.visuals.widgets.active.weak_bg_fill = egui::Color32::from_rgb(31, 92, 122);
+    style.visuals.hyperlink_color = egui::Color32::from_rgb(104, 200, 255);
+    style.visuals.warn_fg_color = egui::Color32::from_rgb(255, 191, 92);
+    style.visuals.error_fg_color = egui::Color32::from_rgb(255, 112, 112);
+    ctx.set_style_of(egui::Theme::Dark, style);
 }

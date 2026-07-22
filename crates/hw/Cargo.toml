@@ -6,7 +6,7 @@ license.workspace = true
 description = "CPU/GPU detection and BDO affinity-mask recommendation engine"
 
 [dependencies]
-sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+sysinfo = { version = "0.39", default-features = false, features = ["disk", "system"] }
 # Minimal wgpu: adapter enumeration only. No wgsl/naga shader stack needed.
 wgpu = { version = "30", default-features = false, features = [
     "dx12",

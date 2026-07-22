@@ -1,4 +1,4 @@
-//! Hardware tab: CPU topology, GPUs, and the prominent affinity recommendation.
+//! Hardware inventory and affinity recommendation.
 
 use egui::{Color32, RichText};
 
@@ -7,8 +7,11 @@ use bdo_hw::{vcache_ccd, GpuDeviceType, GpuVendor};
 use crate::app::App;
 use crate::format;
 
-const ACCENT: Color32 = Color32::from_rgb(0x4d, 0xa6, 0xff);
-const VCACHE: Color32 = Color32::from_rgb(0x63, 0xd6, 0x88);
+const ACCENT: Color32 = Color32::from_rgb(104, 200, 255);
+const VCACHE: Color32 = Color32::from_rgb(99, 214, 136);
+const MUTED: Color32 = Color32::from_rgb(150, 166, 186);
+const SURFACE: Color32 = Color32::from_rgb(16, 25, 39);
+const BORDER: Color32 = Color32::from_rgb(42, 59, 79);
 
 impl App {
     pub(crate) fn hardware_ui(&mut self, ui: &mut egui::Ui) {
@@ -16,204 +19,289 @@ impl App {
             ui.add_space(20.0);
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label(RichText::new("Detecting hardware…").size(16.0));
+                ui.label(RichText::new("Reading this PC...").size(16.0));
             });
             return;
         };
 
-        // -------------------------------------------------------------- CPU
-        ui.heading("CPU");
-        let cpu = &det.cpu;
-        egui::Grid::new("cpu_grid")
-            .num_columns(2)
-            .spacing([16.0, 4.0])
-            .show(ui, |ui| {
-                ui.label(RichText::new("Model").strong());
-                ui.label(if cpu.model.is_empty() {
-                    "Unknown"
-                } else {
-                    &cpu.model
-                });
-                ui.end_row();
-                ui.label(RichText::new("Physical cores").strong());
-                ui.label(cpu.physical_cores.to_string());
-                ui.end_row();
-                ui.label(RichText::new("Logical processors").strong());
-                ui.label(cpu.logical_cores.to_string());
-                ui.end_row();
-            });
+        ui.label(RichText::new("This PC").size(28.0).strong());
+        ui.label(
+            RichText::new("The hardware facts that affect an affinity benchmark.")
+                .color(MUTED)
+                .size(13.0),
+        );
+        ui.add_space(10.0);
 
-        ui.add_space(8.0);
-        ui.label(RichText::new("L3 cache domains").strong());
-        let vcache = vcache_ccd(&cpu.l3_domains);
-        if cpu.l3_domains.is_empty() {
-            ui.label(
-                RichText::new("L3 topology unavailable on this platform.")
-                    .italics()
-                    .weak(),
-            );
+        ui.columns(3, |columns| {
+            egui::Frame::new()
+                .fill(SURFACE)
+                .stroke(egui::Stroke::new(1.0, BORDER))
+                .corner_radius(8)
+                .inner_margin(egui::Margin::same(14))
+                .show(&mut columns[0], |ui| {
+                    ui.label(
+                        RichText::new("PROCESSOR")
+                            .monospace()
+                            .size(11.0)
+                            .color(MUTED),
+                    );
+                    ui.label(RichText::new(&det.cpu.model).strong().size(15.0));
+                    ui.label(format!(
+                        "{} cores / {} threads",
+                        det.cpu.physical_cores, det.cpu.logical_cores
+                    ));
+                });
+            egui::Frame::new()
+                .fill(SURFACE)
+                .stroke(egui::Stroke::new(1.0, BORDER))
+                .corner_radius(8)
+                .inner_margin(egui::Margin::same(14))
+                .show(&mut columns[1], |ui| {
+                    ui.label(RichText::new("MEMORY").monospace().size(11.0).color(MUTED));
+                    ui.label(
+                        RichText::new(format::bytes(det.system.total_memory_bytes))
+                            .strong()
+                            .size(22.0)
+                            .color(ACCENT),
+                    );
+                    ui.label(format!(
+                        "{} available now",
+                        format::bytes(det.system.available_memory_bytes)
+                    ));
+                });
+            egui::Frame::new()
+                .fill(SURFACE)
+                .stroke(egui::Stroke::new(1.0, BORDER))
+                .corner_radius(8)
+                .inner_margin(egui::Margin::same(14))
+                .show(&mut columns[2], |ui| {
+                    ui.label(RichText::new("SYSTEM").monospace().size(11.0).color(MUTED));
+                    ui.label(RichText::new(&det.system.os).strong().size(15.0));
+                    ui.label(format!(
+                        "{} GPU{} / {} drive{}",
+                        det.gpus.len(),
+                        if det.gpus.len() == 1 { "" } else { "s" },
+                        det.system.disks.len(),
+                        if det.system.disks.len() == 1 { "" } else { "s" }
+                    ));
+                });
+        });
+
+        ui.add_space(14.0);
+        self.recommendation_panel(ui);
+        ui.add_space(14.0);
+
+        ui.label(RichText::new("CPU cache topology").size(20.0).strong());
+        if det.cpu.caches.is_empty() {
+            ui.label(RichText::new("Cache details are unavailable on this platform.").color(MUTED));
         } else {
+            egui::Grid::new("cache_summary")
+                .num_columns(3)
+                .striped(true)
+                .spacing([28.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Level").strong());
+                    ui.label(RichText::new("Total capacity").strong());
+                    ui.label(RichText::new("Cache records").strong());
+                    ui.end_row();
+                    for cache in &det.cpu.caches {
+                        ui.label(
+                            RichText::new(format!("L{}", cache.level))
+                                .monospace()
+                                .strong(),
+                        );
+                        ui.label(format::cache_size(cache.total_size_bytes));
+                        ui.label(cache.instances.to_string());
+                        ui.end_row();
+                    }
+                });
+        }
+
+        let vcache = vcache_ccd(&det.cpu.l3_domains);
+        if !det.cpu.l3_domains.is_empty() {
+            ui.add_space(8.0);
+            ui.label(RichText::new("L3 domains / CCDs").strong());
             egui::Grid::new("l3_grid")
                 .num_columns(3)
                 .striped(true)
-                .spacing([16.0, 4.0])
+                .spacing([28.0, 8.0])
                 .show(ui, |ui| {
                     ui.label(RichText::new("Domain").strong());
-                    ui.label(RichText::new("Size").strong());
-                    ui.label(RichText::new("Logical cores").strong());
+                    ui.label(RichText::new("Capacity").strong());
+                    ui.label(RichText::new("Logical processors").strong());
                     ui.end_row();
-                    for (i, dom) in cpu.l3_domains.iter().enumerate() {
-                        let is_vcache = vcache == Some(dom);
-                        let tag = if is_vcache {
-                            format!("CCD {i} — V-Cache")
-                        } else {
-                            format!("CCD {i}")
-                        };
+                    for (i, domain) in det.cpu.l3_domains.iter().enumerate() {
+                        let is_vcache = vcache == Some(domain);
                         let color = if is_vcache {
                             VCACHE
                         } else {
                             ui.visuals().text_color()
                         };
-                        ui.label(RichText::new(tag).color(color).strong());
-                        ui.label(RichText::new(format::cache_size(dom.size_bytes)).color(color));
-                        ui.label(RichText::new(format::cores(&dom.logical_cores)).color(color));
+                        ui.label(
+                            RichText::new(if is_vcache {
+                                format!("CCD {i} / 3D V-Cache")
+                            } else {
+                                format!("CCD {i}")
+                            })
+                            .color(color)
+                            .strong(),
+                        );
+                        ui.label(RichText::new(format::cache_size(domain.size_bytes)).color(color));
+                        ui.label(RichText::new(format::cores(&domain.logical_cores)).color(color));
                         ui.end_row();
                     }
                 });
-            if vcache.is_some() {
-                ui.label(
-                    RichText::new(
-                        "● The highlighted CCD carries the 3D V-Cache — the die BDO should run on.",
-                    )
-                    .color(VCACHE)
-                    .size(12.0),
-                );
+        }
+
+        ui.add_space(18.0);
+        ui.separator();
+        ui.add_space(10.0);
+        ui.label(RichText::new("Graphics").size(20.0).strong());
+        if det.gpus.is_empty() {
+            ui.label(RichText::new("No GPU adapters detected.").color(MUTED));
+        } else {
+            for gpu in &det.gpus {
+                egui::Frame::new()
+                    .fill(SURFACE)
+                    .stroke(egui::Stroke::new(1.0, BORDER))
+                    .corner_radius(8)
+                    .inner_margin(egui::Margin::same(14))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(&gpu.name).strong().size(16.0));
+                        ui.label(format!(
+                            "{} / {} / {}",
+                            vendor_str(gpu.vendor),
+                            device_type_str(gpu.device_type),
+                            gpu.backend
+                        ));
+                        if !gpu.driver.is_empty() {
+                            ui.label(RichText::new(&gpu.driver).color(MUTED).size(12.0));
+                        }
+                    });
             }
         }
 
-        ui.add_space(12.0);
+        ui.add_space(18.0);
         ui.separator();
-
-        // -------------------------------------------------------------- GPUs
-        ui.heading("GPUs");
-        if det.gpus.is_empty() {
-            ui.label(RichText::new("No GPU adapters detected.").italics().weak());
+        ui.add_space(10.0);
+        ui.label(RichText::new("Storage").size(20.0).strong());
+        if det.system.disks.is_empty() {
+            ui.label(RichText::new("No local storage detected.").color(MUTED));
         } else {
-            egui::Grid::new("gpu_grid")
-                .num_columns(3)
-                .striped(true)
-                .spacing([16.0, 4.0])
-                .show(ui, |ui| {
-                    ui.label(RichText::new("Name").strong());
-                    ui.label(RichText::new("Vendor").strong());
-                    ui.label(RichText::new("Type").strong());
-                    ui.end_row();
-                    for gpu in &det.gpus {
-                        ui.label(&gpu.name);
-                        ui.label(vendor_str(gpu.vendor));
-                        ui.label(device_type_str(gpu.device_type));
+            egui::ScrollArea::horizontal().show(ui, |ui| {
+                egui::Grid::new("storage_grid")
+                    .num_columns(6)
+                    .striped(true)
+                    .spacing([20.0, 8.0])
+                    .show(ui, |ui| {
+                        for heading in [
+                            "Drive",
+                            "Type",
+                            "Capacity",
+                            "Available",
+                            "File system",
+                            "Mount",
+                        ] {
+                            ui.label(RichText::new(heading).strong());
+                        }
                         ui.end_row();
-                    }
-                });
+                        for disk in &det.system.disks {
+                            ui.label(if disk.name.is_empty() {
+                                "Local disk"
+                            } else {
+                                &disk.name
+                            });
+                            ui.label(RichText::new(&disk.kind).color(if disk.kind == "SSD" {
+                                VCACHE
+                            } else {
+                                MUTED
+                            }));
+                            ui.label(format::bytes(disk.total_bytes));
+                            ui.label(format::bytes(disk.available_bytes));
+                            ui.label(&disk.file_system);
+                            ui.label(RichText::new(&disk.mount_point).monospace().size(12.0));
+                            ui.end_row();
+                        }
+                    });
+            });
         }
-
-        ui.add_space(12.0);
-        ui.separator();
-
-        // ---------------------------------------------------- Recommendation
-        self.recommendation_panel(ui);
     }
 
     fn recommendation_panel(&self, ui: &mut egui::Ui) {
         let Some(det) = &self.detection else { return };
-        let rec = &det.recommendation;
-
-        egui::Frame::group(ui.style())
-            .fill(ui.visuals().faint_bg_color)
-            .inner_margin(12.0)
+        let recommendation = &det.recommendation;
+        egui::Frame::new()
+            .fill(Color32::from_rgb(14, 37, 53))
+            .stroke(egui::Stroke::new(1.0, Color32::from_rgb(35, 117, 156)))
+            .corner_radius(8)
+            .inner_margin(egui::Margin::same(16))
             .show(ui, |ui| {
                 ui.label(
-                    RichText::new("Recommended affinity")
-                        .size(20.0)
-                        .strong()
+                    RichText::new("RECOMMENDED AFFINITY")
+                        .monospace()
+                        .size(11.0)
                         .color(ACCENT),
                 );
-                ui.add_space(4.0);
-
-                match &rec.mask_hex {
+                match &recommendation.mask_hex {
                     Some(mask) => {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("Mask").strong());
-                            ui.label(
-                                RichText::new(format!("0x{mask}"))
-                                    .monospace()
-                                    .size(18.0)
-                                    .color(ACCENT),
-                            );
-                        });
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(RichText::new("Enabled cores").strong());
-                            ui.label(RichText::new(format::cores(&rec.cores)).monospace());
-                        });
-                        if !rec.alternates.is_empty() {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(RichText::new("Alternates to A/B test").strong());
-                                ui.label(
-                                    RichText::new(
-                                        rec.alternates
-                                            .iter()
-                                            .map(|a| format!("0x{a}"))
-                                            .collect::<Vec<_>>()
-                                            .join(", "),
-                                    )
-                                    .monospace(),
-                                );
-                            });
+                        ui.label(
+                            RichText::new(format!("0x{mask}"))
+                                .monospace()
+                                .size(30.0)
+                                .strong()
+                                .color(ACCENT),
+                        );
+                        ui.label(format!(
+                            "Logical processors: {}",
+                            format::cores(&recommendation.cores)
+                        ));
+                        if !recommendation.alternates.is_empty() {
+                            ui.label(format!(
+                                "A/B test against: {}",
+                                recommendation
+                                    .alternates
+                                    .iter()
+                                    .map(|mask| format!("0x{mask}"))
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            ));
                         }
                     }
                     None => {
                         ui.label(
-                            RichText::new("No mask change recommended for this CPU.").italics(),
+                            RichText::new("No mask change recommended")
+                                .size(20.0)
+                                .strong(),
                         );
                     }
                 }
-
-                ui.add_space(6.0);
-                ui.label(&rec.explanation);
-
-                ui.add_space(6.0);
-                match rec.topology_confirmed {
-                    Some(true) => ui.label(
-                        RichText::new("✔ Live L3 topology confirmed the V-Cache CCD matches this mask.")
-                            .color(VCACHE),
-                    ),
-                    Some(false) => ui.label(
-                        RichText::new(
-                            "⚠ Live topology differed from the static table — the mask above is derived from the actual V-Cache CCD.",
-                        )
-                        .color(Color32::from_rgb(0xff, 0xc1, 0x07)),
-                    ),
-                    None => ui.label(
-                        RichText::new("Topology cross-check: not applicable for this CPU.")
-                            .weak()
-                            .size(12.0),
-                    ),
-                };
-
                 ui.add_space(4.0);
-                if rec.mask_hex.is_some() {
+                ui.label(&recommendation.explanation);
+                match recommendation.topology_confirmed {
+                    Some(true) => {
+                        ui.label(RichText::new("Live L3 topology confirms the V-Cache CCD.").color(VCACHE));
+                    }
+                    Some(false) => {
+                        ui.label(
+                            RichText::new("Live topology differs from the CPU table; this mask uses the detected V-Cache CCD.")
+                                .color(ui.visuals().warn_fg_color),
+                        );
+                    }
+                    None => {}
+                }
+                if recommendation.mask_hex.is_some() {
                     ui.label(
-                        RichText::new("Apply this on the Optimize tab — it is pre-filled there.")
-                            .size(12.0)
-                            .weak(),
+                        RichText::new("The Optimize tab is pre-filled with this result.")
+                            .color(MUTED)
+                            .size(12.0),
                     );
                 }
             });
     }
 }
 
-fn vendor_str(v: GpuVendor) -> &'static str {
-    match v {
+fn vendor_str(vendor: GpuVendor) -> &'static str {
+    match vendor {
         GpuVendor::Nvidia => "NVIDIA",
         GpuVendor::Amd => "AMD",
         GpuVendor::Intel => "Intel",
@@ -221,12 +309,12 @@ fn vendor_str(v: GpuVendor) -> &'static str {
     }
 }
 
-fn device_type_str(t: GpuDeviceType) -> &'static str {
-    match t {
+fn device_type_str(device_type: GpuDeviceType) -> &'static str {
+    match device_type {
         GpuDeviceType::Discrete => "Discrete",
         GpuDeviceType::Integrated => "Integrated",
         GpuDeviceType::Virtual => "Virtual",
-        GpuDeviceType::Cpu => "CPU (software)",
+        GpuDeviceType::Cpu => "Software",
         GpuDeviceType::Other => "Other",
     }
 }

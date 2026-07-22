@@ -376,14 +376,29 @@ impl App {
     // ------------------------------------------------------------ Session table
     fn sessions_section(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Saved sessions").strong().size(16.0));
-            if ui.small_button("⟳ Refresh").clicked() {
+            ui.label(RichText::new("Choose two runs").strong().size(20.0));
+            ui.label(
+                RichText::new(format!(
+                    "{} / 2 selected",
+                    self.benchmark
+                        .selected
+                        .iter()
+                        .filter(|selected| **selected)
+                        .count()
+                ))
+                .monospace()
+                .color(COL_AVG),
+            );
+            if ui.button("Refresh").clicked() {
                 self.benchmark.reload();
+            }
+            if ui.button("Clear").clicked() {
+                self.benchmark.selected.fill(false);
             }
         });
         ui.label(
-            RichText::new(format!("Stored in: {}", self.benchmark.store_dir.display()))
-                .size(11.0)
+            RichText::new("Select exactly two sessions—normally one run for each affinity mask.")
+                .size(12.0)
                 .weak(),
         );
 
@@ -399,77 +414,97 @@ impl App {
 
         let mut delete_stem: Option<String> = None;
 
-        egui::Grid::new("sessions_grid")
-            .num_columns(10)
-            .striped(true)
-            .spacing([12.0, 4.0])
-            .show(ui, |ui| {
-                for h in [
-                    "Cmp",
-                    "Timestamp",
-                    "Label",
-                    "Mask",
-                    "Frames",
-                    "Duration",
-                    "Avg",
-                    "P1 low",
-                    "1% integral",
-                    "",
-                ] {
-                    ui.label(RichText::new(h).strong());
-                }
-                ui.end_row();
-
-                for (i, session) in self.benchmark.sessions.iter().enumerate() {
-                    if let Some(sel) = self.benchmark.selected.get_mut(i) {
-                        ui.checkbox(sel, "");
-                    } else {
-                        ui.label("");
-                    }
-                    ui.label(RichText::new(&session.timestamp).size(12.0));
-                    ui.label(&session.label);
-                    ui.label(
-                        session
-                            .affinity_mask
-                            .as_deref()
-                            .map(|m| format!("0x{m}"))
-                            .unwrap_or_else(|| "-".to_string()),
-                    );
-
-                    match session.metrics() {
-                        Ok(m) => {
-                            let frames = if m.low_confidence {
-                                RichText::new(format!("{} ⚠", m.frame_count)).color(WARN)
-                            } else {
-                                RichText::new(m.frame_count.to_string())
-                            };
-                            ui.label(frames).on_hover_text(if m.low_confidence {
-                                "Fewer than 1000 frames — tail (1% low) metrics are noisy."
-                            } else {
-                                "Frame count"
-                            });
-                            ui.label(format::duration_secs(m.duration_seconds));
-                            ui.label(format::fps(m.avg_fps));
-                            ui.label(format::fps(m.p1_low_fps));
-                            ui.label(format::fps(m.one_percent_low_integral_fps));
-                        }
-                        Err(_) => {
-                            for _ in 0..5 {
-                                ui.label("-");
-                            }
-                        }
-                    }
-
-                    if ui
-                        .small_button("🗑")
-                        .on_hover_text("Delete this session")
-                        .clicked()
-                    {
-                        delete_stem = Some(session.file_stem());
+        egui::ScrollArea::horizontal().show(ui, |ui| {
+            egui::Grid::new("sessions_grid")
+                .num_columns(8)
+                .striped(true)
+                .spacing([18.0, 8.0])
+                .show(ui, |ui| {
+                    for heading in [
+                        "Compare", "Run", "Mask", "Average", "P1 low", "1% low", "Frames", "",
+                    ] {
+                        ui.label(RichText::new(heading).strong());
                     }
                     ui.end_row();
-                }
-            });
+
+                    let picked = self
+                        .benchmark
+                        .selected
+                        .iter()
+                        .filter(|selected| **selected)
+                        .count();
+                    for (i, session) in self.benchmark.sessions.iter().enumerate() {
+                        let metrics = session.metrics();
+                        if let Some(selected) = self.benchmark.selected.get_mut(i) {
+                            ui.add_enabled(
+                                metrics.is_ok() && (*selected || picked < 2),
+                                egui::Checkbox::new(selected, "Pick"),
+                            );
+                        } else {
+                            ui.label("");
+                        }
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(&session.label).strong());
+                            ui.label(RichText::new(&session.timestamp).size(11.0).weak());
+                        });
+                        ui.label(
+                            RichText::new(
+                                session
+                                    .affinity_mask
+                                    .as_deref()
+                                    .map(|mask| format!("0x{mask}"))
+                                    .unwrap_or_else(|| "—".to_string()),
+                            )
+                            .monospace()
+                            .color(COL_AVG),
+                        );
+
+                        if let Ok(metrics) = metrics {
+                            ui.label(format::fps(metrics.avg_fps));
+                            ui.label(format::fps(metrics.p1_low_fps));
+                            ui.label(format::fps(metrics.one_percent_low_integral_fps));
+                            ui.label(
+                                RichText::new(if metrics.low_confidence {
+                                    format!("{} ⚠", metrics.frame_count)
+                                } else {
+                                    metrics.frame_count.to_string()
+                                })
+                                .color(
+                                    if metrics.low_confidence {
+                                        WARN
+                                    } else {
+                                        ui.visuals().text_color()
+                                    },
+                                ),
+                            )
+                            .on_hover_text(format!(
+                                "{} · {}",
+                                format::duration_secs(metrics.duration_seconds),
+                                if metrics.low_confidence {
+                                    "short sample; low metrics may be noisy"
+                                } else {
+                                    "good sample size"
+                                }
+                            ));
+                        } else {
+                            for _ in 0..4 {
+                                ui.label("—");
+                            }
+                        }
+
+                        if ui.button("Delete").clicked() {
+                            delete_stem = Some(session.file_stem());
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+
+        ui.label(
+            RichText::new(format!("Stored in {}", self.benchmark.store_dir.display()))
+                .size(11.0)
+                .weak(),
+        );
 
         if let Some(stem) = delete_stem {
             let _ = SessionStore::new(&self.benchmark.store_dir).delete(&stem);
@@ -479,81 +514,208 @@ impl App {
 
     // -------------------------------------------------------- Comparison chart
     fn comparison_section(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Comparison").strong().size(16.0));
+        ui.label(RichText::new("A/B comparison").strong().size(24.0));
+        ui.label(
+            RichText::new("The delta is B minus A. Higher FPS is better.")
+                .size(12.0)
+                .weak(),
+        );
 
-        // Gather selected sessions with computable metrics.
-        let picked: Vec<(String, Metrics)> = self
+        let picked: Vec<(_, Metrics)> = self
             .benchmark
             .sessions
             .iter()
             .zip(self.benchmark.selected.iter())
             .filter(|(_, sel)| **sel)
-            .filter_map(|(s, _)| s.metrics().ok().map(|m| (s.label.clone(), m)))
+            .filter_map(|(session, _)| session.metrics().ok().map(|metrics| (session, metrics)))
             .collect();
 
-        if picked.is_empty() {
+        if picked.len() < 2 {
             ui.label(
-                RichText::new("Tick the Cmp box on two or more sessions to compare them.")
-                    .italics()
-                    .weak(),
+                RichText::new(format!(
+                    "Choose {} more run{} above to compare.",
+                    2 - picked.len(),
+                    if picked.is_empty() { "s" } else { "" }
+                ))
+                .italics()
+                .weak(),
             );
             return;
         }
 
-        let group_span = 4.0; // 3 bars + a gap per session group.
-        let mk = |offset: f64, name: &str, color: Color32, pick: &dyn Fn(&Metrics) -> f64| {
-            let bars: Vec<Bar> = picked
-                .iter()
-                .enumerate()
-                .map(|(i, (label, m))| {
-                    Bar::new(i as f64 * group_span + offset, pick(m))
-                        .width(0.9)
-                        .name(format!("{label}: {:.1}", pick(m)))
-                })
-                .collect();
-            BarChart::new(name.to_string(), bars).color(color)
+        let (session_a, metrics_a) = &picked[0];
+        let (session_b, metrics_b) = &picked[1];
+        let mask = |session: &bdo_bench::Session| {
+            session
+                .affinity_mask
+                .as_deref()
+                .map(|value| format!("0x{value}"))
+                .unwrap_or_else(|| "No mask".to_string())
         };
 
-        let avg = mk(0.0, "Avg FPS", COL_AVG, &|m| m.avg_fps);
-        let p1 = mk(1.0, "P1 low", COL_P1, &|m| m.p1_low_fps);
-        let integral = mk(2.0, "1% low integral", COL_INTEGRAL, &|m| {
-            m.one_percent_low_integral_fps
+        ui.add_space(10.0);
+        ui.columns(2, |columns| {
+            for (column, (marker, session, color)) in columns
+                .iter_mut()
+                .zip([("A", *session_a, COL_AVG), ("B", *session_b, COL_P1)])
+            {
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(16, 25, 39))
+                    .stroke(egui::Stroke::new(1.0, color))
+                    .corner_radius(8)
+                    .inner_margin(egui::Margin::same(14))
+                    .show(column, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(marker).monospace().strong().color(color));
+                            ui.label(RichText::new(mask(session)).monospace().strong().size(20.0));
+                        });
+                        ui.label(RichText::new(&session.label).strong());
+                        ui.label(RichText::new(&session.timestamp).size(11.0).weak());
+                    });
+            }
         });
+
+        if session_a.cpu != session_b.cpu || session_a.gpu != session_b.gpu {
+            ui.label(
+                RichText::new("⚠ These runs were recorded on different hardware; the result is not a controlled mask comparison.")
+                    .color(WARN),
+            );
+        }
+        if session_a.affinity_mask == session_b.affinity_mask {
+            ui.label(
+                RichText::new("⚠ These runs use the same affinity mask; choose two different masks for an affinity A/B test.")
+                    .color(WARN),
+            );
+        }
+        if metrics_a.low_confidence || metrics_b.low_confidence {
+            ui.label(
+                RichText::new(
+                    "⚠ At least one run has fewer than 1,000 frames; low-FPS deltas may be noisy.",
+                )
+                .color(WARN),
+            );
+        }
+
+        ui.add_space(10.0);
+        egui::Frame::new()
+            .fill(Color32::from_rgb(14, 22, 34))
+            .stroke(egui::Stroke::new(1.0, Color32::from_rgb(42, 59, 79)))
+            .corner_radius(8)
+            .inner_margin(egui::Margin::same(14))
+            .show(ui, |ui| {
+                egui::Grid::new("comparison_delta_grid")
+                    .num_columns(4)
+                    .striped(true)
+                    .spacing([30.0, 10.0])
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("Metric").strong());
+                        ui.label(RichText::new("A").monospace().strong().color(COL_AVG));
+                        ui.label(RichText::new("B").monospace().strong().color(COL_P1));
+                        ui.label(RichText::new("Delta (B − A)").strong());
+                        ui.end_row();
+
+                        for (label, a, b) in [
+                            ("Average FPS", metrics_a.avg_fps, metrics_b.avg_fps),
+                            ("P1 low", metrics_a.p1_low_fps, metrics_b.p1_low_fps),
+                            (
+                                "1% low · time weighted",
+                                metrics_a.one_percent_low_integral_fps,
+                                metrics_b.one_percent_low_integral_fps,
+                            ),
+                            (
+                                "0.1% low · time weighted",
+                                metrics_a.zero_1_percent_low_integral_fps,
+                                metrics_b.zero_1_percent_low_integral_fps,
+                            ),
+                        ] {
+                            let (delta, percent) = comparison_delta(a, b);
+                            let percent = percent
+                                .map(|value| format!(" · {value:+.1}%"))
+                                .unwrap_or_default();
+                            let color = if delta > 0.05 {
+                                OK_GREEN
+                            } else if delta < -0.05 {
+                                ERR
+                            } else {
+                                ui.visuals().weak_text_color()
+                            };
+                            ui.label(label);
+                            ui.label(RichText::new(format::fps(a)).monospace().size(16.0));
+                            ui.label(RichText::new(format::fps(b)).monospace().size(16.0));
+                            ui.label(
+                                RichText::new(format!("{delta:+.1}{percent}"))
+                                    .monospace()
+                                    .strong()
+                                    .color(color),
+                            );
+                            ui.end_row();
+                        }
+                    });
+            });
+
+        let values_a = [
+            metrics_a.avg_fps,
+            metrics_a.p1_low_fps,
+            metrics_a.one_percent_low_integral_fps,
+        ];
+        let values_b = [
+            metrics_b.avg_fps,
+            metrics_b.p1_low_fps,
+            metrics_b.one_percent_low_integral_fps,
+        ];
+        let bars = |values: [f64; 3], offset: f64, prefix: &str| {
+            values
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    Bar::new(index as f64 * 3.0 + offset, value)
+                        .width(0.85)
+                        .name(format!("{prefix}: {value:.1}"))
+                })
+                .collect()
+        };
 
         Plot::new("cmp_plot")
             .legend(Legend::default())
-            .height(240.0)
+            .height(220.0)
             .allow_scroll(false)
             .allow_drag(false)
             .allow_zoom(false)
             .show_x(false)
             .show(ui, |plot_ui| {
-                plot_ui.bar_chart(avg);
-                plot_ui.bar_chart(p1);
-                plot_ui.bar_chart(integral);
+                plot_ui.bar_chart(BarChart::new("A", bars(values_a, 0.0, "A")).color(COL_AVG));
+                plot_ui.bar_chart(BarChart::new("B", bars(values_b, 1.0, "B")).color(COL_P1));
             });
 
-        // Group index → session label key (x axis is numeric).
         ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("Groups:").size(12.0).strong());
-            for (i, (label, _)) in picked.iter().enumerate() {
-                ui.label(RichText::new(format!("{}) {label}", i + 1)).size(12.0));
+            for label in ["1  Average FPS", "2  P1 low", "3  1% low · time weighted"] {
+                ui.label(RichText::new(label).monospace().size(12.0));
             }
         });
 
         ui.add_space(4.0);
         ui.label(
-            RichText::new("P1 low = 1000 / the 99th-percentile frame time (rank-based 1% low).")
-                .size(11.0)
-                .weak(),
-        );
-        ui.label(
             RichText::new(
-                "1% low integral = time-weighted (CapFrameX): the slowest frames whose durations \
-                 sum to 1% of the session — most sensitive to stutter.",
+                "Use equal-length runs in the same scene. Repeat each mask, then compare representative runs before trusting a small delta.",
             )
-            .size(11.0)
+            .size(12.0)
             .weak(),
         );
+    }
+}
+
+fn comparison_delta(a: f64, b: f64) -> (f64, Option<f64>) {
+    let delta = b - a;
+    (delta, (a.abs() > f64::EPSILON).then_some(delta / a * 100.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::comparison_delta;
+
+    #[test]
+    fn comparison_delta_is_b_minus_a_and_handles_zero_baseline() {
+        assert_eq!(comparison_delta(100.0, 110.0), (10.0, Some(10.0)));
+        assert_eq!(comparison_delta(0.0, 10.0), (10.0, None));
     }
 }

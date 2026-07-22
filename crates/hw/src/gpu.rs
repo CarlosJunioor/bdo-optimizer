@@ -49,6 +49,10 @@ pub struct GpuInfo {
     pub vendor: GpuVendor,
     /// Coarse device class.
     pub device_type: GpuDeviceType,
+    /// Graphics API backend used for enumeration (DX12, Vulkan, Metal, etc.).
+    pub backend: String,
+    /// Driver name and vendor-supplied version/details when available.
+    pub driver: String,
 }
 
 /// Enumerate the host GPUs across all available `wgpu` backends.
@@ -73,6 +77,12 @@ pub fn detect_gpus() -> Vec<GpuInfo> {
                 name: info.name.trim().to_string(),
                 vendor: GpuVendor::from_pci_id(info.vendor),
                 device_type: map_device_type(info.device_type),
+                backend: format!("{:?}", info.backend),
+                driver: [info.driver.trim(), info.driver_info.trim()]
+                    .into_iter()
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" / "),
             }
         })
         .collect::<Vec<_>>();
@@ -165,6 +175,8 @@ mod tests {
             name: name.to_string(),
             vendor,
             device_type: dt,
+            backend: "Test".to_string(),
+            driver: "Test driver".to_string(),
         }
     }
 

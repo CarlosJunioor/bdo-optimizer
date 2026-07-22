@@ -29,6 +29,20 @@ pub fn cache_size(bytes: u64) -> String {
     }
 }
 
+/// Format byte capacities with binary units, keeping one decimal where useful.
+pub fn bytes(bytes: u64) -> String {
+    const TIB: f64 = 1024.0 * 1024.0 * 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    if bytes as f64 >= TIB {
+        format!("{:.2} TiB", bytes as f64 / TIB)
+    } else if bytes as f64 >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB)
+    } else {
+        format!("{:.0} MiB", bytes as f64 / MIB)
+    }
+}
+
 /// Format an FPS value with one decimal place.
 pub fn fps(v: f64) -> String {
     if v.is_finite() {
@@ -74,6 +88,13 @@ mod tests {
         assert_eq!(cache_size(96 * 1024 * 1024), "96 MB");
         assert_eq!(cache_size(32 * 1024 * 1024), "32 MB");
         assert_eq!(cache_size(512 * 1024), "512 KB");
+    }
+
+    #[test]
+    fn bytes_uses_binary_capacity() {
+        assert_eq!(bytes(2 * 1024 * 1024 * 1024 * 1024), "2.00 TiB");
+        assert_eq!(bytes(16 * 1024 * 1024 * 1024), "16.0 GiB");
+        assert_eq!(bytes(512 * 1024 * 1024), "512 MiB");
     }
 
     #[test]

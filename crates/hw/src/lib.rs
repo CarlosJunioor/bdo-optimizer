@@ -18,8 +18,10 @@ mod cpu;
 mod gpu;
 mod mask;
 mod recommend;
+mod system;
 
-pub use cpu::{detect_cpu, vcache_ccd, CpuInfo, L3Domain};
+pub use cpu::{detect_cpu, vcache_ccd, CacheInfo, CpuInfo, L3Domain};
 pub use gpu::{detect_gpus, GpuDeviceType, GpuInfo, GpuVendor};
 pub use mask::{cores_to_mask, mask_to_cores, MaskError};
 pub use recommend::{recommend, Recommendation};
+pub use system::{detect_system, DiskInfo, SystemInfo};

@@ -9,12 +9,15 @@
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver};
 
-use bdo_hw::{detect_cpu, detect_gpus, recommend, CpuInfo, GpuInfo, Recommendation};
+use bdo_hw::{
+    detect_cpu, detect_gpus, detect_system, recommend, CpuInfo, GpuInfo, Recommendation, SystemInfo,
+};
 
 /// Everything discovered about the host at startup.
 pub struct DetectResult {
     pub cpu: CpuInfo,
     pub gpus: Vec<GpuInfo>,
+    pub system: SystemInfo,
     pub recommendation: Recommendation,
     /// BDO install directories (Windows only; empty elsewhere).
     pub installs: Vec<PathBuf>,
@@ -26,12 +29,14 @@ pub fn spawn(ctx: egui::Context) -> Receiver<DetectResult> {
     std::thread::spawn(move || {
         let cpu = detect_cpu();
         let gpus = detect_gpus();
+        let system = detect_system();
         let recommendation = recommend(&cpu);
         let installs = find_installs();
         // If the receiver is gone the app is closing; ignore the send error.
         let _ = tx.send(DetectResult {
             cpu,
             gpus,
+            system,
             recommendation,
             installs,
         });

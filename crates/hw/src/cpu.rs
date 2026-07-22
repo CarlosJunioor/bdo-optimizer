@@ -13,6 +13,14 @@ pub struct L3Domain {
     pub logical_cores: Vec<usize>,
 }
 
+/// Total cache capacity reported for one CPU cache level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheInfo {
+    pub level: u8,
+    pub total_size_bytes: u64,
+    pub instances: usize,
+}
+
 /// Detected CPU characteristics used by the recommendation engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CpuInfo {
@@ -25,6 +33,8 @@ pub struct CpuInfo {
     /// L3 cache domains (one per CCD on AMD). Empty when topology is
     /// unavailable (e.g. macOS).
     pub l3_domains: Vec<L3Domain>,
+    /// Total capacity and instance count for each reported cache level.
+    pub caches: Vec<CacheInfo>,
 }
 
 /// Detect the host CPU: model string, core counts and L3 topology.
@@ -55,11 +65,13 @@ pub fn detect_cpu() -> CpuInfo {
 
     let physical_cores = System::physical_core_count().unwrap_or(logical_cores.max(1));
 
+    let (l3_domains, caches) = detect_caches();
     CpuInfo {
         model,
         physical_cores,
         logical_cores,
-        l3_domains: detect_l3_domains(),
+        l3_domains,
+        caches,
     }
 }
 
@@ -96,25 +108,26 @@ pub fn vcache_ccd(domains: &[L3Domain]) -> Option<&L3Domain> {
 // Windows: GetLogicalProcessorInformationEx(RelationCache)
 // ---------------------------------------------------------------------------
 #[cfg(windows)]
-fn detect_l3_domains() -> Vec<L3Domain> {
+fn detect_caches() -> (Vec<L3Domain>, Vec<CacheInfo>) {
     use windows::Win32::System::SystemInformation::{
         GetLogicalProcessorInformationEx, RelationCache, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
     };
 
     let mut domains = Vec::new();
+    let mut levels = std::collections::BTreeMap::<u8, (u64, usize)>::new();
 
     unsafe {
         // First call: query required buffer length.
         let mut len: u32 = 0;
         let _ = GetLogicalProcessorInformationEx(RelationCache, None, &mut len);
         if len == 0 {
-            return domains;
+            return (domains, Vec::new());
         }
 
         let mut buffer = vec![0u8; len as usize];
         let ptr = buffer.as_mut_ptr() as *mut SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX;
         if GetLogicalProcessorInformationEx(RelationCache, Some(ptr), &mut len).is_err() {
-            return domains;
+            return (domains, Vec::new());
         }
 
         // Records are variable-length; advance by each record's `Size`.
@@ -129,15 +142,19 @@ fn detect_l3_domains() -> Vec<L3Domain> {
 
             if record.Relationship == RelationCache {
                 let cache = &record.Anonymous.Cache;
-                if cache.Level == 3 {
-                    let group = cache.Anonymous.GroupMask;
-                    let base = group.Group as usize * 64;
-                    let mask = group.Mask as u64;
-                    let cores: Vec<usize> = (0..64u32)
-                        .filter(|i| mask & (1u64 << i) != 0)
-                        .map(|i| base + i as usize)
-                        .collect();
-                    if !cores.is_empty() {
+                let group = cache.Anonymous.GroupMask;
+                let base = group.Group as usize * 64;
+                let mask = group.Mask as u64;
+                let cores: Vec<usize> = (0..64u32)
+                    .filter(|i| mask & (1u64 << i) != 0)
+                    .map(|i| base + i as usize)
+                    .collect();
+                if !cores.is_empty() {
+                    let level = cache.Level;
+                    let summary = levels.entry(level).or_default();
+                    summary.0 += cache.CacheSize as u64;
+                    summary.1 += 1;
+                    if level == 3 {
                         domains.push(L3Domain {
                             size_bytes: cache.CacheSize as u64,
                             logical_cores: cores,
@@ -150,23 +167,34 @@ fn detect_l3_domains() -> Vec<L3Domain> {
         }
     }
 
-    domains
+    (
+        domains,
+        levels
+            .into_iter()
+            .map(|(level, (total_size_bytes, instances))| CacheInfo {
+                level,
+                total_size_bytes,
+                instances,
+            })
+            .collect(),
+    )
 }
 
 // ---------------------------------------------------------------------------
 // Linux: /sys/devices/system/cpu/cpu*/cache/index*/
 // ---------------------------------------------------------------------------
 #[cfg(target_os = "linux")]
-fn detect_l3_domains() -> Vec<L3Domain> {
+fn detect_caches() -> (Vec<L3Domain>, Vec<CacheInfo>) {
     use std::collections::BTreeSet;
     use std::fs;
 
     let mut domains: Vec<L3Domain> = Vec::new();
-    let mut seen: BTreeSet<Vec<usize>> = BTreeSet::new();
+    let mut levels = std::collections::BTreeMap::<u8, (u64, usize)>::new();
+    let mut seen: BTreeSet<(u8, String, Vec<usize>)> = BTreeSet::new();
 
     let cpu_root = match fs::read_dir("/sys/devices/system/cpu") {
         Ok(d) => d,
-        Err(_) => return domains,
+        Err(_) => return (domains, Vec::new()),
     };
 
     for cpu_entry in cpu_root.flatten() {
@@ -182,30 +210,45 @@ fn detect_l3_domains() -> Vec<L3Domain> {
         };
         for index_entry in indices.flatten() {
             let path = index_entry.path();
-            let level = read_trimmed(&path.join("level"));
-            if level.as_deref() != Some("3") {
+            let Some(level) = read_trimmed(&path.join("level")).and_then(|v| v.parse().ok()) else {
                 continue;
-            }
+            };
+            let cache_type = read_trimmed(&path.join("type")).unwrap_or_default();
             let cores = match read_trimmed(&path.join("shared_cpu_list"))
                 .and_then(|s| parse_cpu_list(&s))
             {
                 Some(c) if !c.is_empty() => c,
                 _ => continue,
             };
-            if !seen.insert(cores.clone()) {
+            if !seen.insert((level, cache_type, cores.clone())) {
                 continue;
             }
             let size_bytes = read_trimmed(&path.join("size"))
                 .and_then(|s| parse_cache_size(&s))
                 .unwrap_or(0);
-            domains.push(L3Domain {
-                size_bytes,
-                logical_cores: cores,
-            });
+            let summary = levels.entry(level).or_default();
+            summary.0 += size_bytes;
+            summary.1 += 1;
+            if level == 3 {
+                domains.push(L3Domain {
+                    size_bytes,
+                    logical_cores: cores,
+                });
+            }
         }
     }
 
-    domains
+    (
+        domains,
+        levels
+            .into_iter()
+            .map(|(level, (total_size_bytes, instances))| CacheInfo {
+                level,
+                total_size_bytes,
+                instances,
+            })
+            .collect(),
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -260,8 +303,8 @@ fn parse_cache_size(s: &str) -> Option<u64> {
 // macOS / other: no portable per-cache topology API; degrade gracefully.
 // ---------------------------------------------------------------------------
 #[cfg(not(any(windows, target_os = "linux")))]
-fn detect_l3_domains() -> Vec<L3Domain> {
-    Vec::new()
+fn detect_caches() -> (Vec<L3Domain>, Vec<CacheInfo>) {
+    (Vec::new(), Vec::new())
 }
 
 #[cfg(test)]

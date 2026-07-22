@@ -355,6 +355,7 @@ mod tests {
             physical_cores: physical,
             logical_cores: logical,
             l3_domains: Vec::new(),
+            caches: Vec::new(),
         }
     }
 
