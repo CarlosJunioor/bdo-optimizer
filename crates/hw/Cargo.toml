@@ -3,5 +3,25 @@ name = "bdo-hw"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "CPU/GPU detection and BDO affinity-mask recommendation engine"
 
 [dependencies]
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+# Minimal wgpu: adapter enumeration only. No wgsl/naga shader stack needed.
+wgpu = { version = "30", default-features = false, features = [
+    "dx12",
+    "metal",
+    "vulkan",
+    "gles",
+] }
+
+# x86-only CPUID access (brand string, topology hints).
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+raw-cpuid = "11"
+
+# Windows-only cache-topology enumeration.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_SystemInformation",
+] }
