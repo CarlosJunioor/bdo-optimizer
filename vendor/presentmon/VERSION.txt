@@ -1,0 +1,3 @@
+﻿PresentMon 2.5.1 (console application, x64)
+Source: https://github.com/GameTechDev/PresentMon/releases/tag/v2.5.1
+License: MIT (see LICENSE.txt)
