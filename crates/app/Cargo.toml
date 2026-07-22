@@ -1,0 +1,10 @@
+[package]
+name = "bdo-optimizer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bdo-hw = { path = "../hw" }
+bdo-launch = { path = "../launch" }
+bdo-bench = { path = "../bench" }

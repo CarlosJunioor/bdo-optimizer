@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/app", "crates/hw", "crates/launch", "crates/bench"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/ccravig/bdo-optimizer"
+
+[profile.release]
+strip = true
+lto = "thin"
