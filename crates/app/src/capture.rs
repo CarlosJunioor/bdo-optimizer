@@ -81,6 +81,15 @@ impl CaptureWorker {
     }
 }
 
+fn capture_elapsed(start: &mut Option<Instant>, running: bool, now: Instant) -> Option<Duration> {
+    if running {
+        let started = *start.get_or_insert(now);
+        Some(now.duration_since(started))
+    } else {
+        start.map(|started| now.duration_since(started))
+    }
+}
+
 fn run(p: CaptureParams, stop: Arc<AtomicBool>, tx: Sender<CaptureMsg>, ctx: egui::Context) {
     let cfg = CaptureConfig {
         presentmon_path: p.presentmon_path.clone(),
@@ -102,22 +111,20 @@ fn run(p: CaptureParams, stop: Arc<AtomicBool>, tx: Sender<CaptureMsg>, ctx: egu
         }
     };
 
-    let start = Instant::now();
+    let mut start = None;
     let mut game_seen = false;
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
         }
         let running = is_process_running(GAME_EXE).is_some();
+        let elapsed = capture_elapsed(&mut start, running, Instant::now());
         if running {
             game_seen = true;
         }
-        let _ = tx.send(if game_seen {
-            CaptureMsg::Capturing {
-                elapsed: start.elapsed(),
-            }
-        } else {
-            CaptureMsg::Waiting
+        let _ = tx.send(match elapsed {
+            Some(elapsed) => CaptureMsg::Capturing { elapsed },
+            None => CaptureMsg::Waiting,
         });
         ctx.request_repaint();
 
@@ -174,4 +181,25 @@ fn run(p: CaptureParams, stop: Arc<AtomicBool>, tx: Sender<CaptureMsg>, ctx: egu
         }
     }
     ctx.request_repaint();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_timer_starts_when_game_appears() {
+        let armed = Instant::now();
+        let mut start = None;
+
+        assert_eq!(capture_elapsed(&mut start, false, armed), None);
+        assert_eq!(
+            capture_elapsed(&mut start, true, armed),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            capture_elapsed(&mut start, true, armed + Duration::from_secs(2)),
+            Some(Duration::from_secs(2))
+        );
+    }
 }

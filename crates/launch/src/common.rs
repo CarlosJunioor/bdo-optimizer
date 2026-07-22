@@ -80,15 +80,34 @@ pub fn mask_to_cores(mask: u64) -> Vec<usize> {
 
 /// Build the argument string passed to `cmd.exe` inside an optimized shortcut.
 ///
-/// Produces, for mask `555` and `steam == false`:
-/// `/c start "" /affinity 555 "BlackDesertLauncher.exe"`
+/// Produces, for mask `555`, `steam == false`, and launcher dir
+/// `C:\Games\BDO`:
+/// `/c cd /d "C:\Games\BDO" && start "" /affinity 555 "BlackDesertLauncher.exe"`
 ///
-/// The empty `""` after `start` is the (ignored) window title, required so that
-/// `start` does not mistake a quoted program path for its title argument. The
-/// shortcut's working directory is the launcher folder, so only the launcher's
-/// file name is needed here.
-pub fn build_cmd_arguments(mask_hex: &str, steam: bool, launcher_filename: &str) -> String {
-    let mut args = format!("/c start \"\" /affinity {mask_hex} \"{launcher_filename}\"");
+/// # Why `cd /d` and not just the working directory
+///
+/// Both consumers of this command cross a UAC elevation boundary — the
+/// run-as-administrator `.lnk` shortcut and `launch_via_elevated_shell`'s
+/// `ShellExecuteExW`/`runas`. Windows does **not** honor a requested working
+/// directory across elevation: the elevated `cmd.exe` starts in `system32`, so a
+/// bare relative launcher file name (`"BlackDesertLauncher.exe"`) cannot be
+/// found — `start` fails and the hidden `cmd` window dies silently, the user's
+/// "nothing happens". Making the command self-contained with an explicit
+/// `cd /d "<launcher dir>"` first (exactly what the community guide's `.bat`
+/// does) fixes this regardless of where the elevated shell starts.
+///
+/// `&&` ensures `start` only runs if the `cd` succeeded. The empty `""` after
+/// `start` is the (ignored) window title, required so that `start` does not
+/// mistake a quoted program path for its title argument.
+pub fn build_cmd_arguments(
+    mask_hex: &str,
+    steam: bool,
+    launcher_dir: &str,
+    launcher_filename: &str,
+) -> String {
+    let mut args = format!(
+        "/c cd /d \"{launcher_dir}\" && start \"\" /affinity {mask_hex} \"{launcher_filename}\""
+    );
     if steam {
         args.push_str(" -steam");
     }
@@ -254,16 +273,36 @@ mod tests {
     #[test]
     fn cmd_arguments_basic() {
         assert_eq!(
-            build_cmd_arguments("555", false, "BlackDesertLauncher.exe"),
-            "/c start \"\" /affinity 555 \"BlackDesertLauncher.exe\""
+            build_cmd_arguments("555", false, r"C:\Games\BDO", "BlackDesertLauncher.exe"),
+            "/c cd /d \"C:\\Games\\BDO\" && start \"\" /affinity 555 \"BlackDesertLauncher.exe\""
         );
     }
 
     #[test]
     fn cmd_arguments_steam() {
         assert_eq!(
-            build_cmd_arguments("554", true, "BlackDesertLauncher.exe"),
-            "/c start \"\" /affinity 554 \"BlackDesertLauncher.exe\" -steam"
+            build_cmd_arguments("554", true, r"C:\Games\BDO", "BlackDesertLauncher.exe"),
+            "/c cd /d \"C:\\Games\\BDO\" && start \"\" /affinity 554 \"BlackDesertLauncher.exe\" -steam"
+        );
+    }
+
+    #[test]
+    fn cmd_arguments_cd_prefix_handles_spaces_in_path() {
+        // The elevated cmd starts in system32; the command must cd into the
+        // launcher's own folder first, even when that folder contains spaces.
+        let args = build_cmd_arguments(
+            "555",
+            false,
+            r"C:\BDO EUW\BlackDesert",
+            "BlackDesertLauncher.exe",
+        );
+        assert!(
+            args.starts_with("/c cd /d \"C:\\BDO EUW\\BlackDesert\" && "),
+            "expected a self-contained cd /d prefix, got: {args}"
+        );
+        assert_eq!(
+            args,
+            "/c cd /d \"C:\\BDO EUW\\BlackDesert\" && start \"\" /affinity 555 \"BlackDesertLauncher.exe\""
         );
     }
 
