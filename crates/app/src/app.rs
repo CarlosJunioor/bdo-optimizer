@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bdo_bench::{Session, SessionStore};
 
@@ -34,8 +34,6 @@ pub struct OptimizeState {
     pub manual_launcher: Option<PathBuf>,
     /// The affinity mask being edited (hex).
     pub mask_input: String,
-    /// Alternate masks worth trying (from the recommendation).
-    pub alternates: Vec<String>,
     /// Append `-steam` to the launch.
     pub steam: bool,
     /// Result of the last Create-Shortcut action.
@@ -45,8 +43,10 @@ pub struct OptimizeState {
     /// [`bdo_launch::LaunchError`] so the UI can distinguish a UAC cancellation
     /// from a real failure.
     pub launch_result: Option<Result<bdo_launch::LaunchMethod, bdo_launch::LaunchError>>,
-    /// Result of the last Verify action.
+    /// Latest automatic affinity verification result.
     pub verify: Option<VerifyOutcome>,
+    /// Last automatic verification poll.
+    pub last_verify_at: Option<Instant>,
     /// Whether `mask_input` has been seeded from the recommendation yet.
     pub seeded: bool,
 }
@@ -115,6 +115,13 @@ pub struct BenchmarkState {
     pub presentmon: Option<PathBuf>,
     /// Whether we have attempted PresentMon resolution.
     pub presentmon_resolved: bool,
+    /// Whether the app is running elevated (administrator). Checked once at
+    /// startup; drives the "run as administrator" warning banner. Always `true`
+    /// off Windows (elevation is not a concept there and live capture is
+    /// Windows-only anyway).
+    pub elevated: bool,
+    /// Message from the last failed "Restart as administrator" attempt, if any.
+    pub relaunch_error: Option<String>,
 }
 
 impl BenchmarkState {
@@ -124,6 +131,12 @@ impl BenchmarkState {
             .unwrap_or_else(|_| PathBuf::from("sessions"));
         let sessions = SessionStore::new(&store_dir).list().unwrap_or_default();
         let selected = vec![false; sessions.len()];
+        // Check elevation once at startup so the Benchmark tab can warn up front
+        // that a capture needs administrator rights (PresentMon's ETW session).
+        #[cfg(windows)]
+        let elevated = bdo_launch::is_elevated();
+        #[cfg(not(windows))]
+        let elevated = true;
         Self {
             label: String::new(),
             label_edited: false,
@@ -134,6 +147,8 @@ impl BenchmarkState {
             worker: None,
             presentmon: None,
             presentmon_resolved: false,
+            elevated,
+            relaunch_error: None,
         }
     }
 
@@ -180,7 +195,6 @@ impl App {
                 if let Some(mask) = &result.recommendation.mask_hex {
                     self.optimize.mask_input = mask.clone();
                 }
-                self.optimize.alternates = result.recommendation.alternates.clone();
                 self.optimize.seeded = true;
             }
             self.detection = Some(result);

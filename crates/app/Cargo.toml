@@ -31,3 +31,13 @@ egui_plot = "0.36"
 
 # Native file picker for the launcher path.
 rfd = "0.17"
+
+# Windows-only: relaunch the app elevated (ShellExecuteW verb "runas") from the
+# Benchmark tab's "Restart as administrator" button.
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62.2"
+features = [
+    "Win32_Foundation",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]

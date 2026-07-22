@@ -37,6 +37,20 @@ pub enum BenchError {
     #[error("PresentMon executable not found at {0}")]
     PresentMonNotFound(PathBuf),
 
+    /// PresentMon ran but exited with a nonzero status for a reason other than
+    /// missing elevation.
+    ///
+    /// Carries PresentMon's process exit code (when the OS reported one) and the
+    /// first ~500 characters of what it wrote to stderr, so the UI can show the
+    /// actual message instead of a misleading "capture file not found" error.
+    #[error("PresentMon exited with an error (exit code {code:?}): {stderr}")]
+    PresentMonFailed {
+        /// The process exit code, if one was reported.
+        code: Option<i32>,
+        /// The captured stderr (already truncated to ~500 chars).
+        stderr: String,
+    },
+
     /// Spawning or controlling the capture child process failed.
     #[error("failed to run capture process: {0}")]
     Spawn(String),

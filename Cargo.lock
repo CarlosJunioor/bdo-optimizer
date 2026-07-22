@@ -439,6 +439,7 @@ dependencies = [
  "egui",
  "egui_plot",
  "rfd",
+ "windows",
 ]
 
 [[package]]

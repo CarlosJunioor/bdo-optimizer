@@ -24,6 +24,7 @@ impl App {
     pub(crate) fn benchmark_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Benchmark");
 
+        self.elevation_banner(ui);
         self.capture_section(ui);
         ui.add_space(10.0);
         ui.separator();
@@ -31,6 +32,77 @@ impl App {
         ui.add_space(10.0);
         ui.separator();
         self.comparison_section(ui);
+    }
+
+    // ------------------------------------------------ Elevation warning banner
+    /// Prominent banner shown at the top of the Benchmark tab when the app is not
+    /// running as administrator. Benchmarking needs admin rights for PresentMon's
+    /// ETW trace session, so we warn up front and offer a one-click elevated
+    /// relaunch rather than letting the user hit a capture error first.
+    fn elevation_banner(&mut self, ui: &mut egui::Ui) {
+        if self.benchmark.elevated {
+            return;
+        }
+
+        // Windows-only: relaunching elevated is a Windows concept, and `elevated`
+        // is always true off Windows, so this body only ever runs there.
+        #[cfg(windows)]
+        {
+            let frame = egui::Frame::new()
+                .fill(Color32::from_rgb(0x3a, 0x2e, 0x12))
+                .stroke(egui::Stroke::new(1.0, WARN))
+                .inner_margin(egui::Margin::same(10))
+                .corner_radius(6);
+
+            frame.show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("⚠").color(WARN).size(20.0));
+                    ui.label(
+                        RichText::new("Benchmarking requires administrator rights")
+                            .color(WARN)
+                            .strong()
+                            .size(15.0),
+                    );
+                });
+                ui.label(
+                    "PresentMon captures frames through Windows event tracing (ETW), which only \
+                     an elevated process may start. Restart the app as administrator before \
+                     capturing.",
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(RichText::new("🛡 Restart as administrator").strong())
+                        .on_hover_text(
+                            "Relaunches this app with a UAC prompt, then closes this window.",
+                        )
+                        .clicked()
+                    {
+                        self.benchmark.relaunch_error = None;
+                        match crate::relaunch::relaunch_as_admin() {
+                            crate::relaunch::RelaunchOutcome::Launched => {
+                                // Elevated instance is starting; close this one.
+                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                            crate::relaunch::RelaunchOutcome::Cancelled => {
+                                // User dismissed UAC — stay open, show nothing scary.
+                            }
+                            crate::relaunch::RelaunchOutcome::Failed(e) => {
+                                self.benchmark.relaunch_error = Some(e);
+                            }
+                        }
+                    }
+                    if let Some(err) = &self.benchmark.relaunch_error {
+                        ui.label(
+                            RichText::new(format!("Could not relaunch: {err}"))
+                                .color(ERR)
+                                .size(12.0),
+                        );
+                    }
+                });
+            });
+            ui.add_space(8.0);
+        }
     }
 
     // ----------------------------------------------------------- Capture panel
@@ -135,13 +207,16 @@ impl App {
             }
             CaptureStatus::NeedsElevation => {
                 ui.label(
-                    RichText::new("Benchmarking requires running this app as administrator.")
-                        .color(ERR),
+                    RichText::new(
+                        "Benchmarking needs administrator rights for Windows event tracing — \
+                         use Restart as administrator above.",
+                    )
+                    .color(ERR),
                 )
                 .on_hover_text(
                     "PresentMon captures frames through Windows ETW, which only an elevated \
-                     (administrator) process may open. Close the app and relaunch it via \
-                     'Run as administrator', then try again.",
+                     (administrator) process may open. Use the 'Restart as administrator' \
+                     button above, then try again.",
                 );
             }
             CaptureStatus::Error(e) => {

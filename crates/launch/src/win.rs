@@ -253,12 +253,16 @@ fn launch_via_elevated_shell(
     }
 }
 
-/// Whether the current process is running elevated (admin).
+/// Whether the current process is running elevated (administrator).
 ///
 /// Opens the process token (`OpenProcessToken` + `TOKEN_QUERY`) and reads
-/// `TokenElevation`. Any failure is treated as "not elevated" so we fall back to
-/// the UAC path rather than attempting a direct launch that would fail.
-fn is_elevated() -> bool {
+/// `TokenElevation`. Any failure is treated as "not elevated" so callers fall
+/// back to a UAC path rather than attempting an operation that would fail.
+///
+/// Exposed so the GUI can check elevation once at startup and warn the user that
+/// benchmarking (PresentMon's ETW trace session) requires administrator rights
+/// before they attempt a capture. Windows-only.
+pub fn is_elevated() -> bool {
     unsafe {
         let mut token = HANDLE::default();
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {

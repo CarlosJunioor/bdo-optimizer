@@ -18,6 +18,8 @@ mod format;
 mod hardware;
 mod optimize;
 mod presentmon;
+#[cfg(windows)]
+mod relaunch;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {

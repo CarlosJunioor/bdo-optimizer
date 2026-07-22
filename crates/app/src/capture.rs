@@ -139,18 +139,30 @@ fn run(p: CaptureParams, stop: Arc<AtomicBool>, tx: Sender<CaptureMsg>, ctx: egu
         std::thread::sleep(POLL);
     }
 
-    // Terminate PresentMon (no-op if it already exited) so the CSV is released.
-    let _ = handle.stop();
+    // Terminate PresentMon (no-op if it already exited) and inspect *why* it
+    // ended. If it exited on its own with a failure — most importantly the
+    // unelevated "access denied" case — surface that instead of blaming a missing
+    // CSV. A deliberate stop (PresentMon still running) or a clean exit returns Ok.
+    if let Err(e) = handle.finish() {
+        let _ = tx.send(match e {
+            BenchError::NeedsElevation => CaptureMsg::NeedsElevation,
+            other => CaptureMsg::Error(other.to_string()),
+        });
+        ctx.request_repaint();
+        return;
+    }
 
     let _ = tx.send(CaptureMsg::Saving);
     ctx.request_repaint();
 
+    // PresentMon exited cleanly (finish() returned Ok), so the CSV should exist.
+    // Any problem here is genuinely unexpected rather than the elevation failure.
     let frames = match std::fs::File::open(&p.output_csv) {
         Ok(file) => match parse_presentmon_csv(file, Some(GAME_EXE)) {
             Ok(frames) => frames,
             Err(e) => {
                 let _ = tx.send(CaptureMsg::Error(format!(
-                    "Capture produced no usable frame data ({e}). Did the game run long enough, and is the app elevated?"
+                    "Capture produced no usable frame data ({e}). Did the game run long enough to record frames?"
                 )));
                 ctx.request_repaint();
                 return;
@@ -158,7 +170,7 @@ fn run(p: CaptureParams, stop: Arc<AtomicBool>, tx: Sender<CaptureMsg>, ctx: egu
         },
         Err(e) => {
             let _ = tx.send(CaptureMsg::Error(format!(
-                "Could not read the capture file {}: {e}",
+                "PresentMon finished but its capture file {} could not be read: {e}",
                 p.output_csv.display()
             )));
             ctx.request_repaint();

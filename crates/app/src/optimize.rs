@@ -12,6 +12,60 @@ const OK_GREEN: Color32 = Color32::from_rgb(0x63, 0xd6, 0x88);
 const WARN: Color32 = Color32::from_rgb(0xff, 0xc1, 0x07);
 const ERR: Color32 = Color32::from_rgb(0xff, 0x6b, 0x6b);
 
+const MASK_PRESETS: &[(&str, &str)] = &[
+    ("C", "AMD 4-core without SMT"),
+    ("50", "AMD 4-core with SMT"),
+    ("540", "AMD 6-core Zen/Zen+"),
+    ("5500", "AMD 8-core Zen/Zen+"),
+    ("554", "Ryzen 9 7900X3D alternate"),
+    ("555", "AMD 6-core / 6-core CCD"),
+    ("5550", "AMD 8-core alternate"),
+    ("5554", "AMD 8-core single CCD"),
+    ("5555", "Ryzen 9 7950X3D V-Cache CCD"),
+    ("555000", "Ryzen 9 12-core second CCD"),
+    ("5550000", "Ryzen 9 16-core second CCD"),
+    ("AA", "Intel 4-core with Hyper-Threading"),
+    ("AAA", "Intel 6-core with Hyper-Threading"),
+    ("AAA0", "Intel 8+ core with Hyper-Threading"),
+    ("FC", "Intel 8-core without Hyper-Threading"),
+];
+
+fn available_masks(
+    recommendation: &bdo_hw::Recommendation,
+    logical_cores: usize,
+) -> Vec<(String, String, bool)> {
+    let mut rows = Vec::new();
+    let mut add = |mask: &str, profile: &str, recommended: bool| {
+        let valid = bdo_launch::parse_mask_hex(mask)
+            .and_then(|value| bdo_launch::validate_mask(value, Some(logical_cores)))
+            .is_ok();
+        if valid
+            && !rows
+                .iter()
+                .any(|(known, _, _): &(String, String, bool)| known.eq_ignore_ascii_case(mask))
+        {
+            rows.push((mask.to_uppercase(), profile.to_string(), recommended));
+        }
+    };
+
+    if let Some(mask) = &recommendation.mask_hex {
+        add(mask, "Best match for this CPU", true);
+    }
+    for mask in &recommendation.alternates {
+        add(mask, "Suggested benchmark alternate", false);
+    }
+    for &(mask, profile) in MASK_PRESETS {
+        add(mask, profile, false);
+    }
+    rows
+}
+
+#[cfg(windows)]
+fn verification_due(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last.map(|last| now.saturating_duration_since(last) >= std::time::Duration::from_secs(1))
+        .unwrap_or(true)
+}
+
 impl App {
     pub(crate) fn optimize_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("Optimize");
@@ -126,54 +180,118 @@ impl App {
     fn mask_section(&mut self, ui: &mut egui::Ui) {
         ui.label(RichText::new("Affinity mask").strong().size(16.0));
 
+        let Some(detection) = &self.detection else {
+            return;
+        };
+        let recommendation = &detection.recommendation;
         ui.horizontal(|ui| {
-            ui.label("Mask (hex):");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.optimize.mask_input)
-                    .desired_width(120.0)
-                    .font(egui::TextStyle::Monospace),
-            );
+            if let Some(mask) = &recommendation.mask_hex {
+                if ui
+                    .button("Use recommended mask")
+                    .on_hover_text(format!("Set the affinity mask to 0x{mask}"))
+                    .clicked()
+                {
+                    self.optimize.mask_input = mask.clone();
+                    self.optimize.last_verify_at = None;
+                }
+                ui.label(
+                    RichText::new(format!("0x{mask} for {}", detection.cpu.model))
+                        .color(OK_GREEN)
+                        .strong(),
+                );
+            } else {
+                ui.add_enabled(false, egui::Button::new("No exact recommendation"));
+            }
+        });
+        ui.label(
+            RichText::new(&recommendation.explanation)
+                .size(12.0)
+                .weak(),
+        );
+
+        ui.horizontal(|ui| {
+            ui.label("Current mask:");
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.optimize.mask_input)
+                        .desired_width(120.0)
+                        .font(egui::TextStyle::Monospace),
+                )
+                .changed()
+            {
+                self.optimize.last_verify_at = None;
+            }
             ui.checkbox(&mut self.optimize.steam, "Steam version (-steam)");
         });
 
-        // Quick buttons: the recommended mask + alternates.
-        let mut alternates = self.optimize.alternates.clone();
-        if let Some(rec) = self
-            .detection
-            .as_ref()
-            .and_then(|d| d.recommendation.mask_hex.clone())
-        {
-            if !alternates.contains(&rec) {
-                alternates.insert(0, rec);
-            }
-        }
-        if !alternates.is_empty() {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Quick set:").size(12.0));
-                for alt in &alternates {
-                    if ui.button(format!("0x{alt}")).clicked() {
-                        self.optimize.mask_input = alt.clone();
-                    }
-                }
-            });
-        }
+        let logical = detection.cpu.logical_cores;
+        let rows = available_masks(recommendation, logical);
+        ui.label(
+            RichText::new(format!(
+                "{} supported BDO masks fit this CPU's {logical} logical processors.",
+                rows.len()
+            ))
+            .size(12.0)
+            .weak(),
+        );
 
-        // Live validation against the detected logical-core count.
-        let logical = self.detection.as_ref().map(|d| d.cpu.logical_cores);
+        egui::ScrollArea::vertical()
+            .id_salt("affinity_mask_table_scroll")
+            .max_height(260.0)
+            .show(ui, |ui| {
+                egui::Grid::new("affinity_mask_table")
+                    .num_columns(5)
+                    .striped(true)
+                    .spacing([16.0, 5.0])
+                    .show(ui, |ui| {
+                        for heading in ["", "Mask", "Logical cores", "CPU profile", ""] {
+                            ui.label(RichText::new(heading).strong());
+                        }
+                        ui.end_row();
+
+                        for (mask, profile, recommended) in rows {
+                            if recommended {
+                                ui.label(RichText::new("Recommended").color(OK_GREEN).strong());
+                            } else {
+                                ui.label("");
+                            }
+                            ui.monospace(format!("0x{mask}"));
+                            let cores = bdo_launch::parse_mask_hex(&mask)
+                                .map(bdo_launch::mask_to_cores)
+                                .unwrap_or_default();
+                            ui.label(format::cores(&cores));
+                            ui.label(profile);
+
+                            let selected = self.optimize.mask_input.eq_ignore_ascii_case(&mask);
+                            if ui
+                                .add_enabled(
+                                    !selected,
+                                    egui::Button::new(if selected { "Selected" } else { "Use" }),
+                                )
+                                .clicked()
+                            {
+                                self.optimize.mask_input = mask;
+                                self.optimize.last_verify_at = None;
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+
         match bdo_launch::parse_mask_hex(&self.optimize.mask_input) {
             Ok(mask) => {
                 let cores = bdo_launch::mask_to_cores(mask);
-                match bdo_launch::validate_mask(mask, logical) {
+                match bdo_launch::validate_mask(mask, Some(logical)) {
                     Ok(()) => {
                         ui.label(
-                            RichText::new(format!("Selects cores: {}", format::cores(&cores)))
+                            RichText::new(format!("Selected cores: {}", format::cores(&cores)))
                                 .color(OK_GREEN),
                         );
                     }
                     Err(e) => {
                         ui.label(
                             RichText::new(format!(
-                                "Selects cores: {} — but {}",
+                                "Selected cores: {} - but {}",
                                 format::cores(&cores),
                                 e
                             ))
@@ -227,6 +345,7 @@ impl App {
                 {
                     self.optimize.launch_result =
                         Some(win_actions::launch(launcher.clone(), &mask_hex, steam));
+                    self.optimize.last_verify_at = None;
                 }
             });
 
@@ -283,11 +402,10 @@ impl App {
 
     // ------------------------------------------------------------------ Verify
     fn verify_section(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Verify running game").strong().size(16.0));
+        ui.label(RichText::new("Automatic verification").strong().size(16.0));
         ui.label(
             RichText::new(
-                "Read-only check: the app never writes to the running game. Affinity is inherited \
-                 at launch, so this only reads back what took effect.",
+                "The app checks the running game every second. This is read-only; the game inherits the mask at launch.",
             )
             .size(12.0)
             .weak(),
@@ -300,34 +418,44 @@ impl App {
 
         #[cfg(windows)]
         {
-            let expected = self.optimize.mask_input.clone();
-            if ui.button("Verify").clicked() {
-                self.optimize.verify = Some(win_actions::verify(&expected));
+            let now = std::time::Instant::now();
+            if verification_due(self.optimize.last_verify_at, now) {
+                self.optimize.verify = Some(win_actions::verify(&self.optimize.mask_input));
+                self.optimize.last_verify_at = Some(now);
             }
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_secs(1));
 
             if let Some(outcome) = &self.optimize.verify {
                 match outcome {
                     VerifyOutcome::NotRunning => {
-                        ui.label(RichText::new("Game is not running.").weak());
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Watching for BlackDesert64.exe...");
+                        });
                     }
                     VerifyOutcome::Match { mask } => {
                         ui.label(
                             RichText::new(format!(
-                                "✔ Match — running mask 0x{mask:x} equals the expected mask.",
+                                "Verified: running mask 0x{mask:x} matches the selected mask.",
                             ))
-                            .color(OK_GREEN),
+                            .color(OK_GREEN)
+                            .strong(),
                         );
                     }
                     VerifyOutcome::Mismatch { actual, expected } => {
                         ui.label(
                             RichText::new(format!(
-                                "⚠ Mismatch — running mask 0x{actual:x}, expected 0x{expected:x}.",
+                                "Mismatch: running mask 0x{actual:x}, selected mask 0x{expected:x}.",
                             ))
-                            .color(WARN),
+                            .color(WARN)
+                            .strong(),
                         );
                     }
                     VerifyOutcome::BadExpected(e) => {
-                        ui.label(RichText::new(format!("Expected mask invalid: {e}")).color(ERR));
+                        ui.label(
+                            RichText::new(format!("Selected mask is invalid: {e}")).color(ERR),
+                        );
                     }
                     VerifyOutcome::Error(e) => {
                         ui.label(RichText::new(format!("Verification error: {e}")).color(ERR));

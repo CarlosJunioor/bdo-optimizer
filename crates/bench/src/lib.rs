@@ -30,8 +30,8 @@ pub mod metrics;
 pub mod session;
 
 pub use capture::{
-    build_presentmon_args, is_process_running, start_capture, wait_for_process, CaptureConfig,
-    CaptureHandle,
+    build_presentmon_args, classify_presentmon_failure, is_process_running, start_capture,
+    wait_for_process, CaptureConfig, CaptureHandle,
 };
 pub use csv_parse::parse_presentmon_csv;
 pub use error::BenchError;
