@@ -3,8 +3,31 @@ name = "bdo-optimizer"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Desktop GUI: detect hardware, apply the optimal BDO CPU-affinity, and benchmark FPS locally"
+
+[[bin]]
+name = "bdo-optimizer"
+path = "src/main.rs"
 
 [dependencies]
 bdo-hw = { path = "../hw" }
 bdo-launch = { path = "../launch" }
 bdo-bench = { path = "../bench" }
+
+# GUI stack — pinned together on egui 0.35. eframe's DEFAULT backend is wgpu
+# (v29), which would collide with the wgpu v30 that `bdo-hw` pulls for adapter
+# enumeration — two wgpu copies in the tree. We disable defaults and select the
+# `glow` (OpenGL) backend instead, so eframe brings no wgpu at all and the only
+# egui in the tree is v0.35. egui_plot 0.36 targets egui ^0.35.
+eframe = { version = "0.35", default-features = false, features = [
+    "glow",
+    "accesskit",
+    "default_fonts",
+    "wayland",
+    "x11",
+] }
+egui = "0.35"
+egui_plot = "0.36"
+
+# Native file picker for the launcher path.
+rfd = "0.17"
