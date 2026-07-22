@@ -17,6 +17,7 @@ mod detect;
 mod format;
 mod hardware;
 mod optimize;
+mod overlay;
 mod presentmon;
 #[cfg(windows)]
 mod relaunch;

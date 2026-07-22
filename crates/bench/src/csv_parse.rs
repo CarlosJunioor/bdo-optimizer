@@ -16,10 +16,69 @@ use std::io::Read;
 use crate::error::BenchError;
 
 /// Candidate header names for the per-frame time column, in priority order.
-const FRAME_TIME_HEADERS: &[&str] = &["MsBetweenPresents", "FrameTime", "msBetweenPresents"];
+pub(crate) const FRAME_TIME_HEADERS: &[&str] =
+    &["MsBetweenPresents", "FrameTime", "msBetweenPresents"];
 
 /// Candidate header names for the process-name column.
-const PROCESS_HEADERS: &[&str] = &["Application", "ProcessName", "process"];
+pub(crate) const PROCESS_HEADERS: &[&str] = &["Application", "ProcessName", "process"];
+
+/// Resolved column positions for a PresentMon CSV, found by header **name**.
+///
+/// This is the single source of truth for "which column holds the frame time and
+/// which (if any) holds the process name", shared by the batch
+/// [`parse_presentmon_csv`] parser and the incremental
+/// [`LiveReader`](crate::live::LiveReader) so the two can never drift apart.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HeaderLayout {
+    /// Column index of the frame-time field.
+    pub(crate) frame_time: usize,
+    /// Column index of the process-name field, when present.
+    pub(crate) process: Option<usize>,
+}
+
+impl HeaderLayout {
+    /// Resolve a header row (already split into trimmed-or-not fields) into a layout.
+    ///
+    /// Returns `None` when no recognised frame-time header is present — the caller
+    /// decides whether that is an error (batch parse) or simply "header not written
+    /// yet, keep waiting" (live parse).
+    pub(crate) fn resolve<S: AsRef<str>>(fields: &[S]) -> Option<HeaderLayout> {
+        let frame_time = find_header_idx(fields, FRAME_TIME_HEADERS)?;
+        let process = find_header_idx(fields, PROCESS_HEADERS);
+        Some(HeaderLayout {
+            frame_time,
+            process,
+        })
+    }
+}
+
+/// Case-insensitive lookup of the first matching header, returning its column index.
+pub(crate) fn find_header_idx<S: AsRef<str>>(fields: &[S], candidates: &[&str]) -> Option<usize> {
+    for cand in candidates {
+        for (i, h) in fields.iter().enumerate() {
+            if h.as_ref().trim().eq_ignore_ascii_case(cand) {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// Parse one frame-time field, keeping only finite, strictly-positive values.
+///
+/// Blank, non-numeric, zero, negative and non-finite samples yield `None` and are
+/// skipped by callers rather than aborting the parse. Shared so batch and live
+/// parsing apply identical acceptance rules.
+pub(crate) fn parse_frame_time(field: &str) -> Option<f64> {
+    let s = field.trim();
+    if s.is_empty() {
+        return None;
+    }
+    match s.parse::<f64>() {
+        Ok(v) if v.is_finite() && v > 0.0 => Some(v),
+        _ => None,
+    }
+}
 
 /// Parse a PresentMon CSV, returning per-frame times in milliseconds.
 ///
@@ -43,8 +102,10 @@ pub fn parse_presentmon_csv(
 
     let headers = rdr.headers()?.clone();
 
-    let ft_idx = find_header(&headers, FRAME_TIME_HEADERS).ok_or(BenchError::NoFrameTimeColumn)?;
-    let proc_idx = find_header(&headers, PROCESS_HEADERS);
+    let header_fields: Vec<&str> = headers.iter().collect();
+    let layout = HeaderLayout::resolve(&header_fields).ok_or(BenchError::NoFrameTimeColumn)?;
+    let ft_idx = layout.frame_time;
+    let proc_idx = layout.process;
 
     let mut frames = Vec::new();
     let mut record = csv::StringRecord::new();
@@ -65,15 +126,8 @@ pub fn parse_presentmon_csv(
         }
 
         // Frame time: skip blanks / non-numeric / non-positive silently.
-        match record.get(ft_idx).map(str::trim) {
-            Some(s) if !s.is_empty() => {
-                if let Ok(v) = s.parse::<f64>() {
-                    if v.is_finite() && v > 0.0 {
-                        frames.push(v);
-                    }
-                }
-            }
-            _ => {}
+        if let Some(v) = record.get(ft_idx).and_then(parse_frame_time) {
+            frames.push(v);
         }
     }
 
@@ -81,18 +135,6 @@ pub fn parse_presentmon_csv(
         return Err(BenchError::NoFrameData);
     }
     Ok(frames)
-}
-
-/// Case-insensitive lookup of the first matching header, returning its column index.
-fn find_header(headers: &csv::StringRecord, candidates: &[&str]) -> Option<usize> {
-    for cand in candidates {
-        for (i, h) in headers.iter().enumerate() {
-            if h.trim().eq_ignore_ascii_case(cand) {
-                return Some(i);
-            }
-        }
-    }
-    None
 }
 
 #[cfg(test)]

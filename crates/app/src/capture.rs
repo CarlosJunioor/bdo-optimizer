@@ -19,8 +19,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bdo_bench::{
-    is_process_running, parse_presentmon_csv, start_capture, BenchError, CaptureConfig, Session,
-    SessionStore,
+    is_process_running, parse_presentmon_csv, start_capture, BenchError, CaptureConfig, LiveReader,
+    Metrics, Session, SessionStore,
 };
 
 /// The running game process name PresentMon targets.
@@ -32,12 +32,39 @@ pub const PRESENTMON_VERSION: &str = "2.5.1";
 /// Poll cadence for the game-process / PresentMon-liveness check.
 const POLL: Duration = Duration::from_millis(500);
 
+/// Live stats sampled from the growing capture CSV, sent to the UI ~2×/second so
+/// the Benchmark live panel and the always-on-top overlay can update while playing.
+///
+/// This is a compact, copy-cheap snapshot — the full frame series stays in the
+/// worker's [`LiveReader`]. `sparkline` carries only the most recent ~10 s of
+/// frame times for the live chart, so the message stays small regardless of how
+/// long the capture has run.
+#[derive(Debug, Clone, Default)]
+pub struct LiveSnapshot {
+    /// Seconds since the game was first seen.
+    pub elapsed: Duration,
+    /// Total frames captured so far.
+    pub frames: usize,
+    /// Smoothed instantaneous FPS (last ~30 frames).
+    pub current_fps: f64,
+    /// Whole-session time-weighted average FPS so far.
+    pub avg_fps: f64,
+    /// 1% low (percentile method) over the series so far.
+    pub p1_low_fps: f64,
+    /// 1% low integral (CapFrameX method) over the series so far.
+    pub one_percent_low_integral_fps: f64,
+    /// The most recent ~10 s of frame times (ms) for the live sparkline.
+    pub sparkline: Vec<f64>,
+}
+
 /// A progress message from the worker to the UI.
 pub enum CaptureMsg {
     /// PresentMon is armed but the game process has not appeared yet.
     Waiting,
     /// Actively capturing; `elapsed` since the game was first seen.
     Capturing { elapsed: Duration },
+    /// Real-time stats sampled from the growing CSV mid-capture.
+    Live(LiveSnapshot),
     /// Capture ended; parsing/saving in progress.
     Saving,
     /// Session written to disk.
@@ -46,6 +73,29 @@ pub enum CaptureMsg {
     NeedsElevation,
     /// Any other failure, already formatted for display.
     Error(String),
+}
+
+/// The most recent frame times covering up to `max_seconds` of wall-clock, capped
+/// at `max_points` samples, for a bounded-size live sparkline.
+fn recent_frame_times(frames: &[f64], max_seconds: f64, max_points: usize) -> Vec<f64> {
+    let budget_ms = max_seconds * 1000.0;
+    let mut acc = 0.0;
+    let mut start = frames.len();
+    for (i, &t) in frames.iter().enumerate().rev() {
+        if t.is_finite() && t > 0.0 {
+            acc += t;
+        }
+        start = i;
+        if acc >= budget_ms {
+            break;
+        }
+    }
+    let slice = &frames[start..];
+    if slice.len() > max_points {
+        slice[slice.len() - max_points..].to_vec()
+    } else {
+        slice.to_vec()
+    }
 }
 
 /// Inputs needed to run one capture.
@@ -111,6 +161,10 @@ fn run(p: CaptureParams, stop: Arc<AtomicBool>, tx: Sender<CaptureMsg>, ctx: egu
         }
     };
 
+    // Tail the growing CSV for live stats. Same process filter as the final parse,
+    // so the running numbers match the saved session.
+    let mut live = LiveReader::new(p.output_csv.clone(), Some(GAME_EXE.to_string()));
+
     let mut start = None;
     let mut game_seen = false;
     loop {
@@ -126,6 +180,24 @@ fn run(p: CaptureParams, stop: Arc<AtomicBool>, tx: Sender<CaptureMsg>, ctx: egu
             Some(elapsed) => CaptureMsg::Capturing { elapsed },
             None => CaptureMsg::Waiting,
         });
+
+        // Read whatever PresentMon has appended and publish a live snapshot. A
+        // transient read error (file mid-write) is ignored — the next poll retries.
+        let _ = live.poll();
+        let frames = live.frames();
+        if !frames.is_empty() {
+            if let Ok(m) = Metrics::from_frame_times(frames) {
+                let _ = tx.send(CaptureMsg::Live(LiveSnapshot {
+                    elapsed: elapsed.unwrap_or_default(),
+                    frames: frames.len(),
+                    current_fps: live.current_fps(),
+                    avg_fps: m.avg_fps,
+                    p1_low_fps: m.p1_low_fps,
+                    one_percent_low_integral_fps: m.one_percent_low_integral_fps,
+                    sparkline: recent_frame_times(frames, 10.0, 1200),
+                }));
+            }
+        }
         ctx.request_repaint();
 
         // PresentMon exits itself when the game closes (--terminate_on_proc_exit).
@@ -198,6 +270,25 @@ fn run(p: CaptureParams, stop: Arc<AtomicBool>, tx: Sender<CaptureMsg>, ctx: egu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recent_frame_times_bounds_by_seconds_and_points() {
+        // 1000 frames of 10ms = 10s total. Ask for the last 1s → ~100 frames.
+        let frames = vec![10.0; 1000];
+        let recent = recent_frame_times(&frames, 1.0, 10_000);
+        // Walking back accumulates 10ms each until >= 1000ms → ~100–101 frames.
+        assert!((100..=101).contains(&recent.len()), "got {}", recent.len());
+
+        // max_points caps the result regardless of the time budget.
+        let capped = recent_frame_times(&frames, 100.0, 50);
+        assert_eq!(capped.len(), 50);
+    }
+
+    #[test]
+    fn recent_frame_times_short_series_returns_all() {
+        let frames = vec![16.6, 16.7, 16.8];
+        assert_eq!(recent_frame_times(&frames, 10.0, 100), frames);
+    }
 
     #[test]
     fn capture_timer_starts_when_game_appears() {

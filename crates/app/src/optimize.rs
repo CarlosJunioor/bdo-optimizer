@@ -203,11 +203,7 @@ impl App {
                 ui.add_enabled(false, egui::Button::new("No exact recommendation"));
             }
         });
-        ui.label(
-            RichText::new(&recommendation.explanation)
-                .size(12.0)
-                .weak(),
-        );
+        ui.label(RichText::new(&recommendation.explanation).size(12.0).weak());
 
         ui.horizontal(|ui| {
             ui.label("Current mask:");
@@ -512,5 +508,45 @@ mod win_actions {
             }
             Err(e) => VerifyOutcome::Error(e.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mask_table_keeps_recommendation_first_and_filters_for_cpu() {
+        let recommendation = bdo_hw::Recommendation {
+            mask_hex: Some("555".to_string()),
+            cores: vec![0, 2, 4, 6, 8, 10],
+            alternates: vec!["554".to_string()],
+            explanation: String::new(),
+            topology_confirmed: None,
+        };
+
+        let rows = available_masks(&recommendation, 12);
+
+        assert_eq!(rows.first().map(|row| row.0.as_str()), Some("555"));
+        assert!(rows.first().is_some_and(|row| row.2));
+        assert!(rows.iter().any(|row| row.0 == "554"));
+        assert!(!rows.iter().any(|row| row.0 == "AAA0"));
+        assert_eq!(rows.iter().filter(|row| row.0 == "555").count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn automatic_verification_runs_once_per_second() {
+        let now = std::time::Instant::now();
+
+        assert!(verification_due(None, now));
+        assert!(!verification_due(
+            Some(now),
+            now + std::time::Duration::from_millis(999)
+        ));
+        assert!(verification_due(
+            Some(now),
+            now + std::time::Duration::from_secs(1)
+        ));
     }
 }

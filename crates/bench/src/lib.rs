@@ -15,8 +15,11 @@
 //! # Layout
 //!
 //! * [`metrics`] — pure, heavily-tested FPS math (avg / min / max / P1 / P0.1 /
-//!   time-weighted 1% & 0.1% low). Raw frame times are the source of truth.
+//!   time-weighted 1% & 0.1% low, plus a smoothed live [`current_fps`]). Raw frame
+//!   times are the source of truth.
 //! * [`csv_parse`] — PresentMon CSV parsing, resolving columns by header name.
+//! * [`live`] — incremental tailing of a *growing* capture CSV for real-time stats,
+//!   reusing `csv_parse`'s header resolution so live and final numbers agree.
 //! * [`capture`] — the PresentMon spawn driver and process-detection helpers.
 //! * [`session`] — one-JSON-file-per-run session storage; metrics recomputed on load.
 //! * [`error`] — the shared [`BenchError`] type.
@@ -26,6 +29,7 @@
 pub mod capture;
 pub mod csv_parse;
 pub mod error;
+pub mod live;
 pub mod metrics;
 pub mod session;
 
@@ -35,5 +39,6 @@ pub use capture::{
 };
 pub use csv_parse::parse_presentmon_csv;
 pub use error::BenchError;
-pub use metrics::{Metrics, LOW_CONFIDENCE_FRAMES};
+pub use live::{LiveReader, LiveStats, CURRENT_FPS_WINDOW};
+pub use metrics::{current_fps, Metrics, LOW_CONFIDENCE_FRAMES};
 pub use session::{Session, SessionStore};

@@ -230,12 +230,21 @@ pub fn start_capture(cfg: &CaptureConfig) -> Result<CaptureHandle, BenchError> {
     #[cfg(windows)]
     {
         use std::io::Read;
+        use std::os::windows::process::CommandExt;
         use std::process::{Command, Stdio};
         use std::sync::{Arc, Mutex};
+
+        // Spawn PresentMon without a console window. PresentMon is a console
+        // program; without this flag Windows allocates a visible black console
+        // for it that pops up over the game the moment a capture starts. stdout
+        // and stderr are still piped below, so suppressing the window costs us
+        // nothing — we already read its output through the pipes.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
         let args = build_presentmon_args(cfg);
         let mut child = match Command::new(&cfg.presentmon_path)
             .args(&args)
+            .creation_flags(CREATE_NO_WINDOW)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

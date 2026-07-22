@@ -4,7 +4,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use egui::{Color32, RichText};
-use egui_plot::{Bar, BarChart, Legend, Plot};
+use egui_plot::{Bar, BarChart, Legend, Line, Plot};
 
 use bdo_bench::{Metrics, SessionStore};
 
@@ -172,6 +172,114 @@ impl App {
 
         ui.add_space(6.0);
         self.status_line(ui);
+
+        ui.add_space(6.0);
+        self.overlay_controls(ui);
+        self.live_panel(ui);
+    }
+
+    // ----------------------------------------------------------- Overlay toggle
+    /// "Show overlay" / "Auto-show" checkboxes for the always-on-top FPS window.
+    fn overlay_controls(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.benchmark.overlay_enabled, "Show overlay")
+                .on_hover_text(
+                    "Floats a small always-on-top FPS window over the game. It works in \
+                     windowed / borderless-windowed mode (BDO's usual mode); it cannot appear \
+                     over exclusive fullscreen. It is NOT injected into the game — it is a \
+                     separate window this app draws, so it stays anti-cheat safe.",
+                );
+            ui.checkbox(&mut self.benchmark.overlay_auto, "Auto-show on capture")
+                .on_hover_text("Automatically show the overlay when a capture starts.");
+        });
+    }
+
+    // ------------------------------------------------------------- Live panel
+    /// Live-updating stats + frame-time sparkline shown while a capture runs.
+    fn live_panel(&self, ui: &mut egui::Ui) {
+        let Some(live) = &self.benchmark.live else {
+            return;
+        };
+
+        ui.add_space(8.0);
+        let frame = egui::Frame::new()
+            .fill(Color32::from_rgb(0x1a, 0x1c, 0x22))
+            .stroke(egui::Stroke::new(1.0, Color32::from_rgb(0x33, 0x37, 0x42)))
+            .corner_radius(6)
+            .inner_margin(egui::Margin::same(10));
+
+        frame.show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Live").strong().size(15.0).color(OK_GREEN));
+                ui.label(
+                    RichText::new(format!(
+                        "{} · {} frames",
+                        format::duration(live.elapsed),
+                        live.frames
+                    ))
+                    .size(12.0)
+                    .weak(),
+                );
+            });
+            ui.add_space(4.0);
+
+            egui::Grid::new("live_stats")
+                .num_columns(4)
+                .spacing([22.0, 2.0])
+                .show(ui, |ui| {
+                    for h in ["Current", "Avg", "P1 low", "1% integral"] {
+                        ui.label(RichText::new(h).size(12.0).weak());
+                    }
+                    ui.end_row();
+                    ui.label(
+                        RichText::new(format::fps(live.current_fps))
+                            .size(20.0)
+                            .strong()
+                            .color(OK_GREEN),
+                    );
+                    ui.label(RichText::new(format::fps(live.avg_fps)).size(20.0));
+                    ui.label(
+                        RichText::new(format::fps(live.p1_low_fps))
+                            .size(20.0)
+                            .color(COL_P1),
+                    );
+                    ui.label(
+                        RichText::new(format::fps(live.one_percent_low_integral_fps))
+                            .size(20.0)
+                            .color(COL_INTEGRAL),
+                    );
+                    ui.end_row();
+                });
+
+            ui.add_space(6.0);
+            if live.sparkline.len() >= 2 {
+                let points: Vec<[f64; 2]> = live
+                    .sparkline
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &ms)| [i as f64, ms])
+                    .collect();
+                Plot::new("live_sparkline")
+                    .height(90.0)
+                    .allow_scroll(false)
+                    .allow_drag(false)
+                    .allow_zoom(false)
+                    .show_x(false)
+                    .show_axes([false, true])
+                    .show(ui, |plot_ui| {
+                        plot_ui.line(Line::new("frame ms", points).color(COL_AVG));
+                    });
+                ui.label(
+                    RichText::new(
+                        "Frame time (ms), last ~10 s — lower is better; spikes = stutter.",
+                    )
+                    .size(11.0)
+                    .weak(),
+                );
+            } else {
+                ui.label(RichText::new("Collecting frames…").size(12.0).weak());
+            }
+        });
     }
 
     fn status_line(&self, ui: &mut egui::Ui) {
@@ -251,6 +359,15 @@ impl App {
             gpu: self.gpu_label(),
             store_dir: self.benchmark.store_dir.clone(),
         };
+
+        // Fresh run: clear any stale live stats and reset the overlay snapshot.
+        self.benchmark.live = None;
+        if let Ok(mut g) = self.benchmark.overlay.snapshot.lock() {
+            *g = Default::default();
+        }
+        if self.benchmark.overlay_auto {
+            self.benchmark.overlay_enabled = true;
+        }
 
         self.benchmark.status = CaptureStatus::Waiting;
         self.benchmark.worker = Some(CaptureWorker::start(params, ctx));

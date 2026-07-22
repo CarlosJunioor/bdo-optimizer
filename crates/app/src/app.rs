@@ -2,13 +2,16 @@
 //! `eframe::App` update loop that dispatches to the three tabs.
 
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bdo_bench::{Session, SessionStore};
 
-use crate::capture::{CaptureMsg, CaptureWorker};
+use crate::capture::{CaptureMsg, CaptureWorker, LiveSnapshot};
 use crate::detect::{self, DetectResult};
+use crate::overlay::{self, OverlayShared, OverlaySnapshot};
 
 /// Which tab is currently shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +118,14 @@ pub struct BenchmarkState {
     pub presentmon: Option<PathBuf>,
     /// Whether we have attempted PresentMon resolution.
     pub presentmon_resolved: bool,
+    /// Latest live stats snapshot for the in-tab live panel (cleared between runs).
+    pub live: Option<LiveSnapshot>,
+    /// Shared state feeding the always-on-top overlay window.
+    pub overlay: Arc<OverlayShared>,
+    /// Whether the overlay window is currently shown.
+    pub overlay_enabled: bool,
+    /// Auto-show the overlay when a capture starts.
+    pub overlay_auto: bool,
     /// Whether the app is running elevated (administrator). Checked once at
     /// startup; drives the "run as administrator" warning banner. Always `true`
     /// off Windows (elevation is not a concept there and live capture is
@@ -137,6 +148,9 @@ impl BenchmarkState {
         let elevated = bdo_launch::is_elevated();
         #[cfg(not(windows))]
         let elevated = true;
+        // Shared overlay state + its background affinity poller (idle until shown).
+        let overlay = OverlayShared::new();
+        overlay::spawn_affinity_poller(overlay.clone());
         Self {
             label: String::new(),
             label_edited: false,
@@ -149,6 +163,10 @@ impl BenchmarkState {
             presentmon_resolved: false,
             elevated,
             relaunch_error: None,
+            live: None,
+            overlay,
+            overlay_enabled: false,
+            overlay_auto: true,
         }
     }
 
@@ -215,22 +233,81 @@ impl App {
                 CaptureMsg::Capturing { elapsed } => {
                     self.benchmark.status = CaptureStatus::Capturing { elapsed }
                 }
+                CaptureMsg::Live(snap) => {
+                    self.set_overlay_snapshot(&snap, true);
+                    self.benchmark.live = Some(snap);
+                }
                 CaptureMsg::Saving => self.benchmark.status = CaptureStatus::Saving,
                 CaptureMsg::Saved { frames } => {
                     self.benchmark.status = CaptureStatus::Done { frames };
                     self.benchmark.worker = None;
+                    self.mark_overlay_inactive();
                     self.benchmark.reload();
                 }
                 CaptureMsg::NeedsElevation => {
                     self.benchmark.status = CaptureStatus::NeedsElevation;
                     self.benchmark.worker = None;
+                    self.mark_overlay_inactive();
                 }
                 CaptureMsg::Error(e) => {
                     self.benchmark.status = CaptureStatus::Error(e);
                     self.benchmark.worker = None;
+                    self.mark_overlay_inactive();
                 }
             }
         }
+    }
+
+    /// Mirror a live snapshot into the overlay's shared state.
+    fn set_overlay_snapshot(&self, snap: &LiveSnapshot, active: bool) {
+        if let Ok(mut g) = self.benchmark.overlay.snapshot.lock() {
+            *g = OverlaySnapshot {
+                active,
+                current_fps: snap.current_fps,
+                avg_fps: snap.avg_fps,
+                p1_low_fps: snap.p1_low_fps,
+                one_percent_low_integral_fps: snap.one_percent_low_integral_fps,
+                frames: snap.frames,
+                elapsed_secs: snap.elapsed.as_secs(),
+            };
+        }
+    }
+
+    /// Flag the overlay stats as no longer live (capture ended); last numbers stay.
+    fn mark_overlay_inactive(&self) {
+        if let Ok(mut g) = self.benchmark.overlay.snapshot.lock() {
+            g.active = false;
+        }
+    }
+
+    /// Show / hide the always-on-top overlay viewport and honor its self-close.
+    fn drive_overlay(&mut self, ctx: &egui::Context) {
+        // The overlay's own close button asks the app to untick "Show overlay".
+        if self
+            .benchmark
+            .overlay
+            .close_clicked
+            .swap(false, Ordering::SeqCst)
+        {
+            self.benchmark.overlay_enabled = false;
+        }
+        let enabled = self.benchmark.overlay_enabled;
+        // Gate the background affinity poller on visibility.
+        self.benchmark
+            .overlay
+            .visible
+            .store(enabled, Ordering::SeqCst);
+        if !enabled {
+            return;
+        }
+        let shared = self.benchmark.overlay.clone();
+        ctx.show_viewport_deferred(
+            overlay::viewport_id(),
+            overlay::builder(),
+            move |ui, _class| {
+                overlay::render(ui, &shared);
+            },
+        );
     }
 
     /// CPU model for stamping into sessions (falls back to a placeholder).
@@ -253,9 +330,17 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// Transparent GL clear color so the always-on-top overlay viewport (which is
+    /// created transparent) shows the game through its un-painted areas. The main
+    /// window is opaque and fully covered by its panels, so this does not affect it.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_detection();
         self.poll_capture();
+        self.drive_overlay(&ui.ctx().clone());
 
         egui::Panel::top("tabs").show(ui, |ui| {
             ui.add_space(4.0);

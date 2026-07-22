@@ -120,6 +120,36 @@ impl Metrics {
     }
 }
 
+/// Smoothed *instantaneous* FPS from the most recent frames.
+///
+/// Unlike [`Metrics::avg_fps`] (a whole-session, time-weighted average), this is a
+/// short-window "what is the frame rate right now" reading for a live overlay:
+/// `1000 / mean(last `window` frame times)`. Non-finite / non-positive samples in
+/// the window are ignored. Returns `0.0` when there is nothing usable to average.
+///
+/// A mean of frame times (then inverted) — rather than a mean of `1000/t` — keeps a
+/// single long frame from being under-weighted, matching how the session average is
+/// defined.
+pub fn current_fps(frame_times_ms: &[f64], window: usize) -> f64 {
+    if frame_times_ms.is_empty() || window == 0 {
+        return 0.0;
+    }
+    let n = window.min(frame_times_ms.len());
+    let recent = &frame_times_ms[frame_times_ms.len() - n..];
+    let mut sum = 0.0;
+    let mut count = 0usize;
+    for &t in recent {
+        if t.is_finite() && t > 0.0 {
+            sum += t;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return 0.0;
+    }
+    1000.0 / (sum / count as f64)
+}
+
 /// Linear-interpolated percentile over an **ascending-sorted** slice.
 ///
 /// Uses the same "linear interpolation between closest ranks" definition as NumPy's
@@ -309,5 +339,27 @@ mod tests {
         let frames = vec![16.0, f64::NAN, -3.0, 0.0, 16.0];
         let m = Metrics::from_frame_times(&frames).unwrap();
         assert_eq!(m.frame_count, 2);
+    }
+
+    #[test]
+    fn current_fps_empty_is_zero() {
+        assert_eq!(current_fps(&[], 30), 0.0);
+        assert_eq!(current_fps(&[16.0], 0), 0.0);
+    }
+
+    #[test]
+    fn current_fps_uses_only_recent_window() {
+        // 100 old frames at 100ms (10 fps) then 30 recent at 1000/60 ms (60 fps).
+        let mut frames = vec![100.0; 100];
+        frames.extend(vec![1000.0 / 60.0; 30]);
+        // Window of 30 sees only the fast tail → ~60 fps, not dragged down by the tenths.
+        assert!(approx(current_fps(&frames, 30), 60.0, 1e-6));
+    }
+
+    #[test]
+    fn current_fps_ignores_invalid_in_window() {
+        let frames = vec![f64::NAN, -1.0, 10.0];
+        // Only the 10ms frame counts → 100 fps.
+        assert!(approx(current_fps(&frames, 3), 100.0, 1e-9));
     }
 }
