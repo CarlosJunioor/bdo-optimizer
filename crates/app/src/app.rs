@@ -300,6 +300,22 @@ impl App {
         if !enabled {
             return;
         }
+
+        // A deferred viewport only exists for the passes in which its parent
+        // *declares* it: egui garbage-collects any viewport that a parent pass
+        // does not re-declare, and (unlike an immediate viewport) the deferred
+        // child repainting itself re-runs only its own stored callback, never the
+        // parent's `drive_overlay`. The main window otherwise repaints only on
+        // interaction, so without an explicit wake-up the overlay's first
+        // appearance — and its survival — would hinge on incidental repaints
+        // (widget animations, the capture-worker poll) and window/driver timing.
+        // That is why the overlay could silently fail to appear. Keep the root
+        // viewport ticking while the overlay is enabled so `show_viewport_deferred`
+        // runs every pass: the overlay then appears promptly and self-heals if it
+        // is ever lost. ~4 Hz matches the overlay's own repaint cadence and keeps
+        // the idle main window's CPU cost negligible.
+        ctx.request_repaint_after(Duration::from_millis(250));
+
         let shared = self.benchmark.overlay.clone();
         ctx.show_viewport_deferred(
             overlay::viewport_id(),
