@@ -84,6 +84,15 @@ impl App {
                     self.optimize.manual_launcher = Some(path);
                 }
             }
+            #[cfg(windows)]
+            if ui
+                .button("Re-detect")
+                .on_hover_text("Re-scan common paths, Steam libraries, and the uninstall registry.")
+                .clicked()
+            {
+                self.optimize.installs = bdo_launch::find_bdo_install();
+                self.optimize.selected_install = 0;
+            }
             if let Some(m) = &self.optimize.manual_launcher {
                 ui.label(
                     RichText::new(format!("Manual: {}", m.display()))
@@ -239,14 +248,34 @@ impl App {
                 };
             }
             if let Some(res) = &self.optimize.launch_result {
+                use bdo_launch::{LaunchError, LaunchMethod};
                 match res {
-                    Ok(pid) => ui.label(
+                    Ok(LaunchMethod::Direct { pid }) => ui.label(
                         RichText::new(format!(
-                            "✔ Launched (launcher PID {pid}). The game inherits the mask."
+                            "✔ Launched directly (launcher PID {pid}). The game inherits the mask."
                         ))
-                        .color(OK_GREEN),
+                        .color(OK_GREEN)
+                        .strong(),
                     ),
-                    Err(e) => ui.label(RichText::new(format!("Launch failed: {e}")).color(ERR)),
+                    Ok(LaunchMethod::ElevatedShell) => ui.label(
+                        RichText::new(
+                            "✔ Launch requested via elevated shell (UAC). Once the launcher \
+                             starts, the game inherits the mask.",
+                        )
+                        .color(OK_GREEN)
+                        .strong(),
+                    ),
+                    Err(LaunchError::Cancelled) => ui.label(
+                        RichText::new("Launch cancelled at the UAC prompt.")
+                            .color(WARN)
+                            .strong(),
+                    ),
+                    Err(e) => ui.label(
+                        RichText::new(format!("Launch failed: {e}"))
+                            .color(ERR)
+                            .strong()
+                            .size(14.0),
+                    ),
                 };
             }
         }
@@ -328,10 +357,15 @@ mod win_actions {
         bdo_launch::create_shortcut(opts).map_err(|e| e.to_string())
     }
 
-    pub fn launch(launcher: Option<PathBuf>, mask_hex: &str, steam: bool) -> Result<u32, String> {
-        let launcher = launcher.ok_or_else(|| "no launcher path selected".to_string())?;
-        let mask = parse_mask_hex(mask_hex).map_err(|e| e.to_string())?;
-        bdo_launch::launch_with_affinity(&launcher, mask, steam).map_err(|e| e.to_string())
+    pub fn launch(
+        launcher: Option<PathBuf>,
+        mask_hex: &str,
+        steam: bool,
+    ) -> Result<bdo_launch::LaunchMethod, bdo_launch::LaunchError> {
+        let launcher = launcher
+            .ok_or_else(|| bdo_launch::LaunchError::Os("no launcher path selected".into()))?;
+        let mask = parse_mask_hex(mask_hex)?;
+        bdo_launch::launch_with_affinity(&launcher, mask, steam)
     }
 
     pub fn verify(expected_hex: &str) -> VerifyOutcome {

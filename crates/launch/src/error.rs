@@ -20,6 +20,10 @@ pub enum LaunchError {
     NoParentDir(PathBuf),
     /// This operation is not supported on the current operating system.
     UnsupportedPlatform,
+    /// The user dismissed the UAC elevation prompt (`ERROR_CANCELLED`). This is a
+    /// user choice, not a failure — surfaced separately so the GUI can show a
+    /// calm message instead of a scary OS error.
+    Cancelled,
     /// A Windows / COM / OS call failed. Carries a human-readable context string.
     Os(String),
 }
@@ -43,6 +47,9 @@ impl fmt::Display for LaunchError {
             }
             LaunchError::UnsupportedPlatform => {
                 write!(f, "operation not supported on this platform")
+            }
+            LaunchError::Cancelled => {
+                write!(f, "launch cancelled at the UAC prompt")
             }
             LaunchError::Os(s) => write!(f, "OS error: {s}"),
         }

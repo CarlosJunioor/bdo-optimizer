@@ -6,6 +6,7 @@
 //! [`LaunchError::UnsupportedPlatform`]. The functions exist so the workspace
 //! compiles and links on macOS.
 
+use crate::common::LaunchMethod;
 use crate::error::LaunchError;
 use crate::ShortcutOptions;
 use std::path::{Path, PathBuf};
@@ -15,7 +16,7 @@ pub fn launch_with_affinity(
     _launcher_path: &Path,
     _mask: u64,
     _steam: bool,
-) -> Result<u32, LaunchError> {
+) -> Result<LaunchMethod, LaunchError> {
     Err(LaunchError::UnsupportedPlatform)
 }
 

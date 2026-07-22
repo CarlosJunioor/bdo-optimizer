@@ -6,7 +6,7 @@
 //! file writing. The BDO-specific apply/verify entry points return
 //! [`LaunchError::UnsupportedPlatform`].
 
-use crate::common::{desktop_file_content, generate_taskset_command, mask_to_cores};
+use crate::common::{desktop_file_content, generate_taskset_command, mask_to_cores, LaunchMethod};
 use crate::error::LaunchError;
 use crate::ShortcutOptions;
 use std::path::{Path, PathBuf};
@@ -15,12 +15,13 @@ use std::process::Command;
 /// Launch an arbitrary command pinned to the cores in `mask` via `taskset`.
 ///
 /// BDO itself does not run on Linux; this treats the launcher path as a generic
-/// executable and pins it. Returns the spawned child's PID.
+/// executable and pins it. Returns [`LaunchMethod::Direct`] with the spawned
+/// child's PID (Linux needs no elevation, so there is no elevated-shell path).
 pub fn launch_with_affinity(
     launcher_path: &Path,
     mask: u64,
     _steam: bool,
-) -> Result<u32, LaunchError> {
+) -> Result<LaunchMethod, LaunchError> {
     if !launcher_path.exists() {
         return Err(LaunchError::PathNotFound(launcher_path.to_path_buf()));
     }
@@ -34,7 +35,7 @@ pub fn launch_with_affinity(
         .args(parts)
         .spawn()
         .map_err(|e| LaunchError::Os(format!("failed to spawn: {e}")))?;
-    Ok(child.id())
+    Ok(LaunchMethod::Direct { pid: child.id() })
 }
 
 /// Write a `.desktop` entry that launches the target with the mask's cores

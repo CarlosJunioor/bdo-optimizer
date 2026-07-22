@@ -40,8 +40,11 @@ pub struct OptimizeState {
     pub steam: bool,
     /// Result of the last Create-Shortcut action.
     pub shortcut_result: Option<Result<PathBuf, String>>,
-    /// Result of the last Launch-Now action.
-    pub launch_result: Option<Result<u32, String>>,
+    /// Result of the last Launch-Now action. `Ok` carries how the launch was
+    /// performed (direct with a PID, or via the elevated shell); `Err` carries a
+    /// [`bdo_launch::LaunchError`] so the UI can distinguish a UAC cancellation
+    /// from a real failure.
+    pub launch_result: Option<Result<bdo_launch::LaunchMethod, bdo_launch::LaunchError>>,
     /// Result of the last Verify action.
     pub verify: Option<VerifyOutcome>,
     /// Whether `mask_input` has been seeded from the recommendation yet.

@@ -10,13 +10,20 @@
 //! constraint:
 //!
 //! 1. **Affinity is applied by inheritance, never to the game.** We start
-//!    `BlackDesertLauncher.exe` with the mask already set — either by creating
-//!    the process `CREATE_SUSPENDED`, calling `SetProcessAffinityMask` on the
-//!    *launcher's* handle, then `ResumeThread`
-//!    ([`launch_with_affinity`]); or by writing a shortcut that runs
-//!    `cmd /c start /affinity <hex> …` ([`create_shortcut`]). The launcher
-//!    spawns `BlackDesert64.exe` as a child, and a child **inherits its
-//!    parent's affinity mask**. We never open a write handle to the game.
+//!    `BlackDesertLauncher.exe` with the mask already set. The launcher spawns
+//!    `BlackDesert64.exe` as a child, and a child **inherits its parent's
+//!    affinity mask**. We never open a write handle to the game. Three surfaces
+//!    apply the mask this way:
+//!    - [`launch_with_affinity`] when the app is **elevated**: create the process
+//!      `CREATE_SUSPENDED`, call `SetProcessAffinityMask` on the *launcher's*
+//!      handle, then `ResumeThread` (mask set before the first instruction).
+//!    - [`launch_with_affinity`] when the app is **not elevated**: because the
+//!      launcher's manifest is marked `requireAdministrator` and `CreateProcess`
+//!      cannot raise UAC, we fall back to `ShellExecuteExW` verb `runas` running
+//!      `cmd /c start /affinity <hex> …` — one UAC prompt, and the elevated
+//!      shell applies the mask.
+//!    - [`create_shortcut`] writes a `.lnk` that runs the same
+//!      `cmd /c start /affinity <hex> …`, flagged run-as-administrator.
 //!
 //! 2. **Verification is strictly read-only.** [`read_process_affinity`] opens
 //!    the game with `PROCESS_QUERY_LIMITED_INFORMATION` only and calls
@@ -43,7 +50,7 @@ mod error;
 
 pub use common::{
     build_cmd_arguments, build_launch_command_line, desktop_file_content, generate_taskset_command,
-    mask_to_cores, mask_to_hex, parse_mask_hex, shortcut_description, validate_mask,
+    mask_to_cores, mask_to_hex, parse_mask_hex, shortcut_description, validate_mask, LaunchMethod,
     ShortcutOptions, DEFAULT_SHORTCUT_NAME, GAME_EXE, LAUNCHER_EXE,
 };
 pub use error::LaunchError;

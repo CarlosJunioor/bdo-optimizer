@@ -105,6 +105,26 @@ pub fn build_launch_command_line(launcher_path: &str, steam: bool) -> String {
     line
 }
 
+/// How a launch was actually carried out.
+///
+/// `launch_with_affinity` can no longer always hand back a launcher PID: the
+/// elevated-shell fallback (needed because `BlackDesertLauncher.exe`'s manifest
+/// requires administrator) spawns an intermediate `cmd.exe`, not the launcher,
+/// so its PID would be meaningless. This enum reports honestly which path ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaunchMethod {
+    /// The launcher was started directly (the current process was already
+    /// elevated) via `CreateProcessW` + `CREATE_SUSPENDED` +
+    /// `SetProcessAffinityMask` + `ResumeThread`. `pid` is the launcher's PID and
+    /// the mask was applied before its first instruction ran.
+    Direct { pid: u32 },
+    /// The launcher was started through an elevated `cmd.exe`
+    /// (`ShellExecuteExW` with verb `runas`, which raises one UAC prompt). The
+    /// elevated shell's `start /affinity` applied the mask and the game inherits
+    /// it, but no launcher PID is available from this path.
+    ElevatedShell,
+}
+
 /// Options controlling optimized-shortcut creation.
 #[derive(Debug, Clone)]
 pub struct ShortcutOptions {
