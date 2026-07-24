@@ -193,7 +193,7 @@ impl SessionStore {
     /// [`BenchError::Io`] if the file is missing/unreadable, [`BenchError::Serde`] if it
     /// does not deserialise.
     pub fn load(&self, file_stem: &str) -> Result<Session, BenchError> {
-        let path = self.dir.join(format!("{file_stem}.json"));
+        let path = self.session_path(file_stem)?;
         let text = fs::read_to_string(&path)?;
         let session = serde_json::from_str::<Session>(&text)?;
         Ok(session)
@@ -204,12 +204,27 @@ impl SessionStore {
     /// # Errors
     /// [`BenchError::Io`] on a filesystem failure other than "not found".
     pub fn delete(&self, file_stem: &str) -> Result<(), BenchError> {
-        let path = self.dir.join(format!("{file_stem}.json"));
+        let path = self.session_path(file_stem)?;
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e.into()),
         }
+    }
+
+    fn session_path(&self, file_stem: &str) -> Result<PathBuf, BenchError> {
+        if file_stem.is_empty()
+            || file_stem == "."
+            || file_stem == ".."
+            || sanitize(file_stem) != file_stem
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid session file stem",
+            )
+            .into());
+        }
+        Ok(self.dir.join(format!("{file_stem}.json")))
     }
 }
 
@@ -303,6 +318,20 @@ mod tests {
         assert!(store.load(&s.file_stem()).is_err());
         // Deleting again is a no-op success.
         store.delete(&s.file_stem()).unwrap();
+    }
+
+    #[test]
+    fn load_and_delete_reject_path_traversal() {
+        let dir = TempDir::new().unwrap();
+        let store_dir = dir.path().join("sessions");
+        let store = SessionStore::new(&store_dir);
+        fs::create_dir(&store_dir).unwrap();
+        let outside = dir.path().join("outside.json");
+        fs::write(&outside, serde_json::to_string(&sample()).unwrap()).unwrap();
+
+        assert!(store.load("../outside").is_err());
+        assert!(store.delete("../outside").is_err());
+        assert!(outside.exists());
     }
 
     #[test]

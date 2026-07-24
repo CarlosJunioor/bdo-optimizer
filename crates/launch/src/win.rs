@@ -10,7 +10,9 @@ use crate::common::{
 };
 use crate::error::LaunchError;
 use std::ffi::c_void;
+use std::ffi::OsString;
 use std::mem::size_of;
+use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
 use windows::core::{Interface, HRESULT, PCWSTR, PWSTR};
@@ -20,6 +22,7 @@ use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER,
     COINIT_APARTMENTTHREADED,
 };
+use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows::Win32::System::Threading::{
     CreateProcessW, GetCurrentProcess, GetProcessAffinityMask, OpenProcess, OpenProcessToken,
     ResumeThread, SetProcessAffinityMask, CREATE_SUSPENDED, PROCESS_INFORMATION,
@@ -40,6 +43,15 @@ fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+fn system_cmd() -> Result<PathBuf, LaunchError> {
+    let mut buffer = [0u16; 260];
+    let len = unsafe { GetSystemDirectoryW(Some(&mut buffer)) } as usize;
+    if len == 0 || len >= buffer.len() {
+        return Err(LaunchError::Os("GetSystemDirectoryW failed".to_string()));
+    }
+    Ok(PathBuf::from(OsString::from_wide(&buffer[..len])).join("cmd.exe"))
+}
+
 /// Launch `BlackDesertLauncher.exe` with `mask` applied so the game inherits it.
 ///
 /// # Two paths, and why
@@ -58,7 +70,7 @@ fn to_wide(s: &str) -> Vec<u16> {
 ///   (handled reactively as well as proactively).
 /// - **Non-elevated caller** → `ShellExecuteExW` with verb `runas` on `cmd.exe`,
 ///   running
-///   `/c cd /d "<launcher dir>" && start "" /affinity <mask> "BlackDesertLauncher.exe"`
+///   `/d /c cd /d "<launcher dir>" && start "" /affinity <mask> "BlackDesertLauncher.exe"`
 ///   (+ `-steam`). The command `cd`s into the launcher folder itself — Windows
 ///   does not carry the requested working directory across the UAC elevation
 ///   boundary, so the elevated shell starts in `system32` and a relative
@@ -179,7 +191,7 @@ fn launch_direct(
 ///
 /// Pure so it can be unit-tested. Delegates to [`build_cmd_arguments`] with the
 /// mask rendered as lowercase hex, yielding e.g.
-/// `/c cd /d "<launcher dir>" && start "" /affinity 555 "BlackDesertLauncher.exe"`
+/// `/d /c cd /d "<launcher dir>" && start "" /affinity 555 "BlackDesertLauncher.exe"`
 /// (+ ` -steam`). The `cd /d` prefix is essential here: this path runs the
 /// command through `ShellExecuteExW`/`runas`, and the elevated `cmd.exe` starts
 /// in `system32` — a bare launcher file name would not resolve.
@@ -212,11 +224,10 @@ fn launch_via_elevated_shell(
         .and_then(|f| f.to_str())
         .unwrap_or(LAUNCHER_EXE);
     let params = elevated_shell_params(mask, steam, &workdir.to_string_lossy(), filename);
-    let comspec =
-        std::env::var("ComSpec").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".into());
+    let comspec = system_cmd()?;
 
     let verb_w = to_wide("runas");
-    let file_w = to_wide(&comspec);
+    let file_w = to_wide(&comspec.to_string_lossy());
     let params_w = to_wide(&params);
     let dir_w = to_wide(&workdir.to_string_lossy());
 
@@ -286,7 +297,7 @@ pub fn is_elevated() -> bool {
 /// Create an optimized `.lnk` desktop shortcut.
 ///
 /// The shortcut runs
-/// `cmd.exe /c cd /d "<launcher dir>" && start "" /affinity <mask> "<launcher>"`,
+/// `cmd.exe /d /c cd /d "<launcher dir>" && start "" /affinity <mask> "<launcher>"`,
 /// so `start` applies the affinity and the game inherits it. The link is flagged
 /// **run-as-administrator** (elevation is needed for the affinity/priority
 /// context the guide expects).
@@ -329,8 +340,7 @@ pub fn create_shortcut(opts: ShortcutOptions) -> Result<PathBuf, LaunchError> {
         None => default_desktop_path()?,
     };
 
-    let comspec =
-        std::env::var("ComSpec").unwrap_or_else(|_| r"C:\Windows\System32\cmd.exe".into());
+    let comspec = system_cmd()?;
     let args = build_cmd_arguments(
         &opts.mask_hex,
         opts.steam,
@@ -348,7 +358,7 @@ pub fn create_shortcut(opts: ShortcutOptions) -> Result<PathBuf, LaunchError> {
         }
 
         let result = write_lnk(
-            &comspec,
+            &comspec.to_string_lossy(),
             &args,
             &workdir.to_string_lossy(),
             &description,
@@ -776,11 +786,11 @@ mod tests {
     fn elevated_shell_params_matches_cmd_arguments() {
         assert_eq!(
             elevated_shell_params(0x555, false, r"C:\Games\BDO", "BlackDesertLauncher.exe"),
-            "/c cd /d \"C:\\Games\\BDO\" && start \"\" /affinity 555 \"BlackDesertLauncher.exe\""
+            "/d /c cd /d \"C:\\Games\\BDO\" && start \"\" /affinity 555 \"BlackDesertLauncher.exe\""
         );
         assert_eq!(
             elevated_shell_params(0x554, true, r"C:\Games\BDO", "BlackDesertLauncher.exe"),
-            "/c cd /d \"C:\\Games\\BDO\" && start \"\" /affinity 554 \"BlackDesertLauncher.exe\" -steam"
+            "/d /c cd /d \"C:\\Games\\BDO\" && start \"\" /affinity 554 \"BlackDesertLauncher.exe\" -steam"
         );
     }
 
@@ -793,7 +803,7 @@ mod tests {
             "BlackDesertLauncher.exe",
         );
         assert!(
-            params.starts_with("/c cd /d \"C:\\BDO EUW\\BlackDesert\" && "),
+            params.starts_with("/d /c cd /d \"C:\\BDO EUW\\BlackDesert\" && "),
             "elevated command must cd into the launcher dir first, got: {params}"
         );
     }

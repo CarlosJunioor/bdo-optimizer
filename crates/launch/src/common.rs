@@ -82,7 +82,7 @@ pub fn mask_to_cores(mask: u64) -> Vec<usize> {
 ///
 /// Produces, for mask `555`, `steam == false`, and launcher dir
 /// `C:\Games\BDO`:
-/// `/c cd /d "C:\Games\BDO" && start "" /affinity 555 "BlackDesertLauncher.exe"`
+/// `/d /c cd /d "C:\Games\BDO" && start "" /affinity 555 "BlackDesertLauncher.exe"`
 ///
 /// # Why `cd /d` and not just the working directory
 ///
@@ -106,7 +106,7 @@ pub fn build_cmd_arguments(
     launcher_filename: &str,
 ) -> String {
     let mut args = format!(
-        "/c cd /d \"{launcher_dir}\" && start \"\" /affinity {mask_hex} \"{launcher_filename}\""
+        "/d /c cd /d \"{launcher_dir}\" && start \"\" /affinity {mask_hex} \"{launcher_filename}\""
     );
     if steam {
         args.push_str(" -steam");
@@ -274,7 +274,7 @@ mod tests {
     fn cmd_arguments_basic() {
         assert_eq!(
             build_cmd_arguments("555", false, r"C:\Games\BDO", "BlackDesertLauncher.exe"),
-            "/c cd /d \"C:\\Games\\BDO\" && start \"\" /affinity 555 \"BlackDesertLauncher.exe\""
+            "/d /c cd /d \"C:\\Games\\BDO\" && start \"\" /affinity 555 \"BlackDesertLauncher.exe\""
         );
     }
 
@@ -282,7 +282,7 @@ mod tests {
     fn cmd_arguments_steam() {
         assert_eq!(
             build_cmd_arguments("554", true, r"C:\Games\BDO", "BlackDesertLauncher.exe"),
-            "/c cd /d \"C:\\Games\\BDO\" && start \"\" /affinity 554 \"BlackDesertLauncher.exe\" -steam"
+            "/d /c cd /d \"C:\\Games\\BDO\" && start \"\" /affinity 554 \"BlackDesertLauncher.exe\" -steam"
         );
     }
 
@@ -297,12 +297,12 @@ mod tests {
             "BlackDesertLauncher.exe",
         );
         assert!(
-            args.starts_with("/c cd /d \"C:\\BDO EUW\\BlackDesert\" && "),
+            args.starts_with("/d /c cd /d \"C:\\BDO EUW\\BlackDesert\" && "),
             "expected a self-contained cd /d prefix, got: {args}"
         );
         assert_eq!(
             args,
-            "/c cd /d \"C:\\BDO EUW\\BlackDesert\" && start \"\" /affinity 555 \"BlackDesertLauncher.exe\""
+            "/d /c cd /d \"C:\\BDO EUW\\BlackDesert\" && start \"\" /affinity 555 \"BlackDesertLauncher.exe\""
         );
     }
 
