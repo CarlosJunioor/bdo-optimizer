@@ -111,6 +111,19 @@ pub struct CaptureParams {
     pub store_dir: PathBuf,
 }
 
+/// Best-effort cleanup for the transient raw CSV on every worker exit path.
+struct RawCaptureCleanup(PathBuf);
+
+impl Drop for RawCaptureCleanup {
+    fn drop(&mut self) {
+        match std::fs::remove_file(&self.0) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {}
+        }
+    }
+}
+
 /// Handle to an in-flight capture worker.
 pub struct CaptureWorker {
     stop_flag: Arc<AtomicBool>,
@@ -162,6 +175,7 @@ fn run(p: CaptureParams, stop: Arc<AtomicBool>, tx: Sender<CaptureMsg>, ctx: egu
             return;
         }
     };
+    let _raw_capture_cleanup = RawCaptureCleanup(p.output_csv.clone());
 
     // Tail the growing CSV for live stats. Same process filter as the final parse,
     // so the running numbers match the saved session.
@@ -309,5 +323,16 @@ mod tests {
             capture_elapsed(&mut start, true, armed + Duration::from_secs(2)),
             Some(Duration::from_secs(2))
         );
+    }
+
+    #[test]
+    fn raw_capture_cleanup_removes_the_csv() {
+        let path = std::env::temp_dir().join(format!(
+            "bdo-capture-cleanup-test-{}.csv",
+            std::process::id()
+        ));
+        std::fs::write(&path, "frame data").unwrap();
+        drop(RawCaptureCleanup(path.clone()));
+        assert!(!path.exists());
     }
 }

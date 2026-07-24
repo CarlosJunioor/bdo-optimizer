@@ -2,12 +2,10 @@
 //!
 //! We look for `PresentMon.exe` in two layouts, in priority order:
 //!
-//! 1. **Installed / release layout** — next to the running executable, i.e. the
-//!    bundled copy shipped alongside `bdo-optimizer.exe`.
+//! 1. **Installed / release layout** — the hash-pinned bundled copy next to the
+//!    running `bdo-optimizer.exe`.
 //! 2. **Dev layout** — `vendor/presentmon/PresentMon.exe` at the workspace root,
-//!    found by walking the ancestors of the running executable and the current
-//!    working directory (so `cargo run`, which places the binary under
-//!    `target/debug/`, still finds the checked-in vendor copy).
+//!    resolved from the compile-time manifest directory in debug builds.
 //!
 //! If neither exists, resolution returns `None` and the UI reports the two
 //! expected locations.
@@ -22,34 +20,29 @@ pub const PRESENTMON_EXE: &str = "PresentMon.exe";
 ///
 /// Pure: performs no filesystem access, so it can be unit-tested with synthetic
 /// directories. Candidate order matches the documented priority: the exe-dir
-/// copy first, then `vendor/presentmon/PresentMon.exe` under each ancestor of
-/// the exe dir, then under each ancestor of the working dir.
-pub fn candidate_paths(exe_dir: Option<&Path>, cwd: Option<&Path>) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = Vec::new();
-
+/// copy first, then the compile-time workspace path in debug builds.
+pub fn candidate_paths(exe_dir: Option<&Path>, _cwd: Option<&Path>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
     if let Some(dir) = exe_dir {
         out.push(dir.join(PRESENTMON_EXE));
     }
-
-    let vendor_rel = Path::new("vendor").join("presentmon").join(PRESENTMON_EXE);
-
-    for root in [exe_dir, cwd].into_iter().flatten() {
-        for ancestor in root.ancestors() {
-            let candidate = ancestor.join(&vendor_rel);
-            if !out.contains(&candidate) {
-                out.push(candidate);
-            }
-        }
-    }
-
+    #[cfg(debug_assertions)]
+    out.push(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../vendor/presentmon")
+            .join(PRESENTMON_EXE),
+    );
     out
 }
-
 /// Return the first candidate that satisfies `exists`.
 ///
 /// Split from the filesystem so tests can supply a fake predicate.
 pub fn first_existing(candidates: &[PathBuf], exists: impl Fn(&Path) -> bool) -> Option<PathBuf> {
     candidates.iter().find(|p| exists(p)).cloned()
+}
+
+fn is_trusted_presentmon(path: &Path) -> bool {
+    bdo_bench::is_supported_presentmon(path)
 }
 
 /// Resolve the bundled `PresentMon.exe`, or `None` if it cannot be found.
@@ -59,9 +52,8 @@ pub fn first_existing(candidates: &[PathBuf], exists: impl Fn(&Path) -> bool) ->
 pub fn resolve() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok();
     let exe_dir = exe.as_deref().and_then(Path::parent);
-    let cwd = std::env::current_dir().ok();
-    let candidates = candidate_paths(exe_dir, cwd.as_deref());
-    first_existing(&candidates, |p| p.exists())
+    let candidates = candidate_paths(exe_dir, None);
+    first_existing(&candidates, is_trusted_presentmon).and_then(|path| path.canonicalize().ok())
 }
 
 /// The two human-readable locations shown to the user when resolution fails.
@@ -84,20 +76,15 @@ mod tests {
     }
 
     #[test]
-    fn dev_layout_found_via_ancestor() {
-        // Binary under target/debug; vendor dir at the repo root two levels up.
-        let exe_dir = Path::new("/repo/target/debug");
-        let cands = candidate_paths(Some(exe_dir), None);
-        let expected = PathBuf::from("/repo")
-            .join("vendor")
-            .join("presentmon")
-            .join(PRESENTMON_EXE);
+    fn untrusted_ancestor_is_not_a_candidate() {
+        let cands = candidate_paths(
+            Some(Path::new("/untrusted/target/debug")),
+            Some(Path::new("/untrusted")),
+        );
         assert!(
-            cands.contains(&expected),
-            "candidates {cands:?} should include {expected:?}"
+            !cands.contains(&PathBuf::from("/untrusted/vendor/presentmon").join(PRESENTMON_EXE))
         );
     }
-
     #[test]
     fn first_existing_prefers_earlier_candidate() {
         let a = PathBuf::from("/a/PresentMon.exe");
@@ -122,6 +109,24 @@ mod tests {
     fn none_when_nothing_exists() {
         let cands = candidate_paths(Some(Path::new("/x/bin")), None);
         assert!(first_existing(&cands, |_| false).is_none());
+    }
+
+    #[test]
+    fn bundled_presentmon_hash_rejects_modified_copy() {
+        let bundled = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../vendor/presentmon")
+            .join(PRESENTMON_EXE);
+        assert!(is_trusted_presentmon(&bundled));
+
+        let copy = std::env::temp_dir().join(format!(
+            "bdo-presentmon-hash-test-{}.exe",
+            std::process::id()
+        ));
+        let mut bytes = std::fs::read(&bundled).unwrap();
+        bytes[0] ^= 1;
+        std::fs::write(&copy, bytes).unwrap();
+        assert!(!is_trusted_presentmon(&copy));
+        std::fs::remove_file(copy).unwrap();
     }
 
     #[test]

@@ -37,6 +37,10 @@ pub enum BenchError {
     #[error("PresentMon executable not found at {0}")]
     PresentMonNotFound(PathBuf),
 
+    /// The executable did not match the bundled PresentMon build.
+    #[error("refusing to run an untrusted PresentMon executable at {0}")]
+    UntrustedPresentMon(PathBuf),
+
     /// PresentMon ran but exited with a nonzero status for a reason other than
     /// missing elevation.
     ///

@@ -15,15 +15,75 @@
 //! they can be unit-tested anywhere; only the actual [`start_capture`] spawn is gated
 //! to Windows (other platforms return [`BenchError::UnsupportedPlatform`]).
 
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use sha2::{Digest, Sha256};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
 use crate::error::BenchError;
 
 /// Maximum number of stderr characters carried in [`BenchError::PresentMonFailed`].
 const STDERR_SNIPPET_LEN: usize = 500;
+
+/// Exact bundled PresentMon 2.5.1 binary identity.
+const PRESENTMON_SIZE: u64 = 956_768;
+const PRESENTMON_SHA256: [u8; 32] = [
+    0x9b, 0xec, 0x30, 0x83, 0x06, 0x9f, 0x58, 0xf9, 0x11, 0xe6, 0xa5, 0x12, 0xf4, 0x80, 0x6d, 0xb5,
+    0x1a, 0x27, 0xbd, 0x09, 0x61, 0x03, 0x08, 0x7b, 0xc1, 0xd0, 0x5e, 0xf5, 0x4c, 0x80, 0xa1, 0x91,
+];
+
+/// Maximum raw CSV retained for one capture (512 MiB).
+const MAX_CAPTURE_BYTES: u64 = 512 * 1024 * 1024;
+/// Maximum stderr retained in memory while still draining the child pipe.
+const MAX_STDERR_BYTES: u64 = 64 * 1024;
+
+/// Verify that `path` is the exact bundled PresentMon build before elevation.
+pub fn is_supported_presentmon(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() != PRESENTMON_SIZE {
+        return false;
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => hash.update(&buffer[..read]),
+            Err(_) => return false,
+        }
+    }
+    <[u8; 32]>::from(hash.finalize()) == PRESENTMON_SHA256
+}
+
+/// Copy at most `limit` bytes to `writer`, then drain the rest of `reader`.
+/// Returns `true` when input exceeded the limit.
+fn copy_bounded(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    limit: u64,
+) -> std::io::Result<bool> {
+    std::io::copy(&mut reader.by_ref().take(limit), writer)?;
+    let mut extra = [0_u8; 1];
+    let overflow = reader.read(&mut extra)? != 0;
+    if overflow {
+        std::io::copy(reader, &mut std::io::sink())?;
+    }
+    Ok(overflow)
+}
+
+fn create_capture_file(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
 
 /// Classify why a PresentMon process that exited **nonzero** failed, from its
 /// exit code and captured stderr (pure — no IO, so it is unit-testable).
@@ -68,8 +128,14 @@ pub struct CaptureConfig {
 /// Build the PresentMon CLI argument vector for `cfg` (pure — no IO).
 ///
 /// Produces:
-/// `--process_name <name> --output_file <csv> --terminate_on_proc_exit --stop_existing_session`
+/// `--process_name <name> --output_stdout --no_console_stats --terminate_on_proc_exit --stop_existing_session`
 ///
+/// * `--output_stdout` (instead of `--output_file`) because PresentMon opens its
+///   output file **exclusively** — no other process can read it while the capture
+///   runs, which breaks live tailing. We receive the CSV over the stdout pipe and
+///   write [`CaptureConfig::output_csv`] ourselves, so the file stays readable.
+/// * `--no_console_stats` suppresses the interactive stats display so stdout
+///   carries only CSV.
 /// * `--terminate_on_proc_exit` makes PresentMon exit when the game closes, so the
 ///   capture bounds the game's lifetime automatically.
 /// * `--stop_existing_session` clears any orphaned ETW session left by a prior crash.
@@ -77,8 +143,8 @@ pub fn build_presentmon_args(cfg: &CaptureConfig) -> Vec<String> {
     vec![
         "--process_name".to_string(),
         cfg.process_name.clone(),
-        "--output_file".to_string(),
-        cfg.output_csv.to_string_lossy().into_owned(),
+        "--output_stdout".to_string(),
+        "--no_console_stats".to_string(),
         "--terminate_on_proc_exit".to_string(),
         "--stop_existing_session".to_string(),
     ]
@@ -100,6 +166,9 @@ pub struct CaptureHandle {
     stderr_buf: std::sync::Arc<std::sync::Mutex<String>>,
     #[cfg(windows)]
     stderr_reader: Option<std::thread::JoinHandle<()>>,
+    /// Thread copying PresentMon's stdout (the CSV stream) into `output_csv`.
+    #[cfg(windows)]
+    stdout_writer: Option<std::thread::JoinHandle<Result<(), String>>>,
 }
 
 impl CaptureHandle {
@@ -114,6 +183,15 @@ impl CaptureHandle {
             .lock()
             .map(|g| g.clone())
             .unwrap_or_default()
+    }
+
+    #[cfg(windows)]
+    fn take_stdout_error(&mut self) -> Option<String> {
+        match self.stdout_writer.take().map(|writer| writer.join()) {
+            None | Some(Ok(Ok(()))) => None,
+            Some(Ok(Err(error))) => Some(error),
+            Some(Err(_)) => Some("PresentMon output writer thread panicked".to_string()),
+        }
     }
 
     /// Stop the capture, terminating the PresentMon process.
@@ -131,8 +209,9 @@ impl CaptureHandle {
             self.child
                 .wait()
                 .map_err(|e| BenchError::Spawn(e.to_string()))?;
+            let output_error = self.take_stdout_error();
             let _ = self.take_stderr();
-            Ok(())
+            output_error.map_or(Ok(()), |error| Err(BenchError::Spawn(error)))
         }
         #[cfg(not(windows))]
         {
@@ -168,9 +247,11 @@ impl CaptureHandle {
             match self.child.try_wait() {
                 Ok(Some(status)) => {
                     if status.success() {
+                        let output_error = self.take_stdout_error();
                         let _ = self.take_stderr();
-                        Ok(())
+                        output_error.map_or(Ok(()), |error| Err(BenchError::Spawn(error)))
                     } else {
+                        let _ = self.take_stdout_error();
                         let stderr = self.take_stderr();
                         Err(classify_presentmon_failure(status.code(), &stderr))
                     }
@@ -179,8 +260,9 @@ impl CaptureHandle {
                     // Still running — we are stopping it deliberately.
                     let _ = self.child.kill();
                     let _ = self.child.wait();
+                    let output_error = self.take_stdout_error();
                     let _ = self.take_stderr();
-                    Ok(())
+                    output_error.map_or(Ok(()), |error| Err(BenchError::Spawn(error)))
                 }
                 Err(e) => Err(BenchError::Spawn(e.to_string())),
             }
@@ -229,7 +311,6 @@ pub fn start_capture(cfg: &CaptureConfig) -> Result<CaptureHandle, BenchError> {
 
     #[cfg(windows)]
     {
-        use std::io::Read;
         use std::os::windows::process::CommandExt;
         use std::process::{Command, Stdio};
         use std::sync::{Arc, Mutex};
@@ -241,6 +322,18 @@ pub fn start_capture(cfg: &CaptureConfig) -> Result<CaptureHandle, BenchError> {
         // nothing — we already read its output through the pipes.
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+        if !is_supported_presentmon(&cfg.presentmon_path) {
+            return Err(BenchError::UntrustedPresentMon(cfg.presentmon_path.clone()));
+        }
+
+        let output_path = cfg.output_csv.clone();
+        let output_file = create_capture_file(&output_path).map_err(|error| {
+            BenchError::Spawn(format!(
+                "could not exclusively create capture CSV {}: {error}",
+                output_path.display()
+            ))
+        })?;
+
         let args = build_presentmon_args(cfg);
         let mut child = match Command::new(&cfg.presentmon_path)
             .args(&args)
@@ -251,26 +344,48 @@ pub fn start_capture(cfg: &CaptureConfig) -> Result<CaptureHandle, BenchError> {
         {
             Ok(child) => child,
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                return Err(BenchError::NeedsElevation)
+                drop(output_file);
+                let _ = std::fs::remove_file(&output_path);
+                return Err(BenchError::NeedsElevation);
             }
-            Err(e) => return Err(BenchError::Spawn(e.to_string())),
+            Err(e) => {
+                drop(output_file);
+                let _ = std::fs::remove_file(&output_path);
+                return Err(BenchError::Spawn(e.to_string()));
+            }
         };
 
-        // Drain stdout to a sink so a long capture cannot block on a full pipe.
-        if let Some(mut out) = child.stdout.take() {
+        // PresentMon streams the CSV over stdout (--output_stdout); copy it into
+        // output_csv ourselves. Unlike PresentMon's own --output_file (opened
+        // exclusively), our file is share-readable, so the live tailer can poll
+        // it mid-capture. Copying also keeps the pipe drained. If the file can't
+        // be written the pipe is still drained and the error is reported.
+        let stdout_writer = child.stdout.take().map(|mut out| {
             std::thread::spawn(move || {
-                let mut sink = Vec::new();
-                let _ = out.read_to_end(&mut sink);
-            });
-        }
+                let mut file = output_file;
+                match copy_bounded(&mut out, &mut file, MAX_CAPTURE_BYTES) {
+                    Ok(false) => Ok(()),
+                    Ok(true) => Err(format!(
+                        "capture output exceeded {} MiB and was stopped",
+                        MAX_CAPTURE_BYTES / 1024 / 1024
+                    )),
+                    Err(error) => Err(format!("could not write capture CSV: {error}")),
+                }
+            })
+        });
 
         // Drain stderr into a shared buffer for post-exit classification.
         let stderr_buf = Arc::new(Mutex::new(String::new()));
         let stderr_reader = child.stderr.take().map(|mut err| {
             let buf = stderr_buf.clone();
             std::thread::spawn(move || {
-                let mut s = String::new();
-                let _ = err.read_to_string(&mut s);
+                let mut bytes = Vec::with_capacity(MAX_STDERR_BYTES as usize);
+                let truncated =
+                    copy_bounded(&mut err, &mut bytes, MAX_STDERR_BYTES).unwrap_or(false);
+                let mut s = String::from_utf8_lossy(&bytes).into_owned();
+                if truncated {
+                    s.push_str("\n[stderr truncated]");
+                }
                 if let Ok(mut guard) = buf.lock() {
                     guard.push_str(&s);
                 }
@@ -281,6 +396,7 @@ pub fn start_capture(cfg: &CaptureConfig) -> Result<CaptureHandle, BenchError> {
             child,
             stderr_buf,
             stderr_reader,
+            stdout_writer,
         })
     }
     #[cfg(not(windows))]
@@ -349,8 +465,8 @@ mod tests {
             vec![
                 "--process_name",
                 "BlackDesert64.exe",
-                "--output_file",
-                "out.csv",
+                "--output_stdout",
+                "--no_console_stats",
                 "--terminate_on_proc_exit",
                 "--stop_existing_session",
             ]
@@ -358,14 +474,15 @@ mod tests {
     }
 
     #[test]
-    fn args_reflect_custom_process_and_path() {
+    fn args_reflect_custom_process_and_never_leak_csv_path() {
         let mut c = cfg();
         c.process_name = "Game.exe".to_string();
         c.output_csv = PathBuf::from("C:/tmp/frames.csv");
         let args = build_presentmon_args(&c);
         let joined = args.join(" ");
         assert!(joined.contains("Game.exe"));
-        assert!(joined.contains("frames.csv"));
+        // The CSV is written by us from PresentMon's stdout, never by PresentMon.
+        assert!(!joined.contains("frames.csv"));
     }
 
     #[test]
@@ -375,6 +492,19 @@ mod tests {
         assert!(matches!(
             start_capture(&c),
             Err(BenchError::PresentMonNotFound(_))
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn start_capture_refuses_an_existing_untrusted_executable() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"not PresentMon").unwrap();
+        let mut c = cfg();
+        c.presentmon_path = file.path().to_path_buf();
+        assert!(matches!(
+            start_capture(&c),
+            Err(BenchError::UntrustedPresentMon(_))
         ));
     }
 
@@ -424,6 +554,26 @@ mod tests {
             }
             other => panic!("expected PresentMonFailed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn bounded_copy_caps_output_and_drains_the_source() {
+        let input = vec![b'x'; 32];
+        let mut reader = std::io::Cursor::new(input);
+        let mut output = Vec::new();
+
+        assert!(copy_bounded(&mut reader, &mut output, 8).unwrap());
+        assert_eq!(output.len(), 8);
+        assert_eq!(reader.position(), 32);
+    }
+
+    #[test]
+    fn output_file_creation_never_overwrites_an_existing_path() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"sentinel").unwrap();
+
+        assert!(create_capture_file(file.path()).is_err());
+        assert_eq!(std::fs::read(file.path()).unwrap(), b"sentinel");
     }
 
     #[test]

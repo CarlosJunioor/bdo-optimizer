@@ -7,7 +7,7 @@
 //! single UAC prompt. On success the caller closes the current instance; if the
 //! user dismisses the prompt we stay open and show nothing scary.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use windows::core::PCWSTR;
 use windows::Win32::UI::Shell::ShellExecuteW;
@@ -47,6 +47,10 @@ pub fn relaunch_as_admin() -> RelaunchOutcome {
 }
 
 fn relaunch_path_as_admin(exe: &Path) -> RelaunchOutcome {
+    let exe = match validated_relaunch_target(exe) {
+        Ok(exe) => exe,
+        Err(error) => return RelaunchOutcome::Failed(error),
+    };
     let verb_w = to_wide("runas");
     let file_w = to_wide(&exe.to_string_lossy());
 
@@ -70,5 +74,41 @@ fn relaunch_path_as_admin(exe: &Path) -> RelaunchOutcome {
         RelaunchOutcome::Cancelled
     } else {
         RelaunchOutcome::Failed(format!("ShellExecuteW(runas) failed (code {code})"))
+    }
+}
+
+fn validated_relaunch_target(exe: &Path) -> Result<PathBuf, String> {
+    let exe = exe
+        .canonicalize()
+        .map_err(|error| format!("could not canonicalize current exe: {error}"))?;
+    let metadata = exe
+        .metadata()
+        .map_err(|error| format!("could not inspect current exe: {error}"))?;
+    if !metadata.is_file() {
+        return Err("current executable path is not a regular file".to_string());
+    }
+    Ok(exe)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relaunch_target_must_be_a_regular_file() {
+        let dir =
+            std::env::temp_dir().join(format!("bdo-relaunch-target-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(validated_relaunch_target(&dir).is_err());
+
+        let exe = dir.join("bdo-optimizer.exe");
+        std::fs::write(&exe, b"test").unwrap();
+        assert_eq!(
+            validated_relaunch_target(&exe).unwrap(),
+            exe.canonicalize().unwrap()
+        );
+
+        std::fs::remove_file(exe).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 }
