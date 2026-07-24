@@ -104,6 +104,8 @@ pub struct BenchmarkState {
     pub label: String,
     /// True once the user has hand-edited the label (stops auto-updates).
     pub label_edited: bool,
+    /// Whether the next run is a normal-launch baseline rather than an affinity run.
+    pub baseline_capture: bool,
     /// Saved sessions, newest first.
     pub sessions: Vec<Session>,
     /// Selection flags, parallel to `sessions`.
@@ -154,6 +156,7 @@ impl BenchmarkState {
         Self {
             label: String::new(),
             label_edited: false,
+            baseline_capture: true,
             sessions,
             selected,
             store_dir,
@@ -376,9 +379,9 @@ impl eframe::App for App {
                             .color(egui::Color32::from_rgb(104, 200, 255)),
                     );
                     ui.separator();
-                    ui.selectable_value(&mut self.tab, Tab::Hardware, "Hardware");
-                    ui.selectable_value(&mut self.tab, Tab::Optimize, "Optimize");
-                    ui.selectable_value(&mut self.tab, Tab::Benchmark, "Benchmark");
+                    ui.selectable_value(&mut self.tab, Tab::Hardware, "1  Inspect");
+                    ui.selectable_value(&mut self.tab, Tab::Optimize, "2  Apply");
+                    ui.selectable_value(&mut self.tab, Tab::Benchmark, "3  Measure");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))

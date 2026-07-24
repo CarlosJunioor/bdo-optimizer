@@ -8,7 +8,7 @@ use egui_plot::{Bar, BarChart, Legend, Line, Plot};
 
 use bdo_bench::{Metrics, SessionStore};
 
-use crate::app::{App, CaptureStatus};
+use crate::app::{App, CaptureStatus, VerifyOutcome};
 use crate::capture::{CaptureParams, CaptureWorker};
 use crate::{format, presentmon};
 
@@ -22,8 +22,14 @@ const COL_INTEGRAL: Color32 = Color32::from_rgb(0x9d, 0x7d, 0xff);
 
 impl App {
     pub(crate) fn benchmark_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Benchmark");
+        ui.heading("Measure the gain");
+        ui.label(
+            RichText::new("Capture one normal-launch baseline and one verified affinity run, then compare them below.")
+                .size(13.0)
+                .weak(),
+        );
 
+        self.poll_verification(ui.ctx());
         self.elevation_banner(ui);
         self.capture_section(ui);
         ui.add_space(10.0);
@@ -107,17 +113,101 @@ impl App {
 
     // ----------------------------------------------------------- Capture panel
     fn capture_section(&mut self, ui: &mut egui::Ui) {
-        // Keep the label auto-synced to the current mask until the user edits it.
+        ui.label(RichText::new("Capture a run").strong().size(20.0));
+        let capturing = self.benchmark.worker.is_some();
+        let previous_mode = self.benchmark.baseline_capture;
+        ui.add_enabled_ui(!capturing, |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(
+                    &mut self.benchmark.baseline_capture,
+                    true,
+                    "1  Baseline / normal launch",
+                );
+                ui.selectable_value(
+                    &mut self.benchmark.baseline_capture,
+                    false,
+                    "2  Optimized / affinity launch",
+                );
+            });
+        });
+        if previous_mode != self.benchmark.baseline_capture {
+            self.benchmark.label_edited = false;
+        }
+
+        // Keep the label auto-synced to the capture mode until the user edits it.
         if !self.benchmark.label_edited {
             let mask = self.optimize.mask_input.trim();
-            self.benchmark.label = if mask.is_empty() {
+            self.benchmark.label = if self.benchmark.baseline_capture {
+                "baseline".to_string()
+            } else if mask.is_empty() {
                 "capture".to_string()
             } else {
                 format!("mask {mask}")
             };
         }
 
-        let capturing = self.benchmark.worker.is_some();
+        let logical_cores = self
+            .detection
+            .as_ref()
+            .map(|detection| detection.cpu.logical_cores)
+            .unwrap_or(0);
+        let running_mask = running_mask(self.optimize.verify.as_ref());
+        let baseline_ready = is_full_affinity(running_mask, logical_cores);
+
+        if self.benchmark.baseline_capture {
+            if baseline_ready {
+                ui.label(
+                    RichText::new("Full CPU affinity detected. This normal-launch run is ready to capture as the rollback baseline.")
+                        .size(12.0)
+                        .color(OK_GREEN),
+                );
+            } else if let Some(mask) = running_mask {
+                ui.label(
+                    RichText::new(format!("Restricted running mask 0x{mask:x} detected. Close BDO and relaunch normally before capturing the baseline."))
+                        .size(12.0)
+                        .color(WARN),
+                );
+            } else {
+                ui.label(
+                    RichText::new("Launch BDO normally first. Capture unlocks after full CPU affinity is verified read-only.")
+                        .size(12.0)
+                        .weak(),
+                );
+            }
+        } else {
+            let mask = self.optimize.mask_input.trim();
+            ui.label(
+                RichText::new(if mask.is_empty() {
+                    "Choose an affinity mask on Apply before capturing the optimized run."
+                        .to_string()
+                } else {
+                    format!(
+                        "Launch from the optimized shortcut. This run is saved as mask 0x{mask}."
+                    )
+                })
+                .size(12.0)
+                .color(if mask.is_empty() {
+                    WARN
+                } else {
+                    ui.visuals().weak_text_color()
+                }),
+            );
+            match &self.optimize.verify {
+                Some(VerifyOutcome::Match { mask }) => {
+                    ui.label(
+                        RichText::new(format!("Verified running mask: 0x{mask:x}"))
+                            .color(OK_GREEN)
+                            .strong(),
+                    );
+                }
+                _ => {
+                    ui.label(
+                        RichText::new("Pending verification — launch through Apply and confirm the running mask before measuring.")
+                            .color(WARN),
+                    );
+                }
+            }
+        }
 
         ui.horizontal(|ui| {
             ui.label("Label:");
@@ -145,9 +235,20 @@ impl App {
                 return;
             }
 
-            let can_start = !capturing && self.benchmark.presentmon.is_some();
+            let verified = matches!(&self.optimize.verify, Some(VerifyOutcome::Match { .. }));
+            let mode_ready = if self.benchmark.baseline_capture {
+                baseline_ready
+            } else {
+                verified
+            };
+            let can_start = !capturing && self.benchmark.presentmon.is_some() && mode_ready;
+            let start_label = if self.benchmark.baseline_capture {
+                "Start baseline capture"
+            } else {
+                "Start optimized capture"
+            };
             if ui
-                .add_enabled(can_start, egui::Button::new("▶ Start"))
+                .add_enabled(can_start, egui::Button::new(start_label))
                 .on_hover_text("Arms PresentMon; capture begins when BlackDesert64.exe appears.")
                 .clicked()
             {
@@ -337,17 +438,34 @@ impl App {
         let Some(presentmon) = self.benchmark.presentmon.clone() else {
             return;
         };
+        self.refresh_verification();
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis())
             .unwrap_or(0);
         let output_csv = std::env::temp_dir().join(format!("bdo_capture_{stamp}.csv"));
 
-        let mask = self.optimize.mask_input.trim();
-        let mask_hex = if mask.is_empty() {
-            None
-        } else {
-            Some(mask.to_string())
+        let verified_mask = match &self.optimize.verify {
+            Some(VerifyOutcome::Match { mask }) => Some(*mask),
+            _ => None,
+        };
+        let logical_cores = self
+            .detection
+            .as_ref()
+            .map(|detection| detection.cpu.logical_cores)
+            .unwrap_or(0);
+        let baseline_ready =
+            is_full_affinity(running_mask(self.optimize.verify.as_ref()), logical_cores);
+        let Ok(mask_hex) = capture_mask(
+            self.benchmark.baseline_capture,
+            baseline_ready,
+            verified_mask,
+        ) else {
+            self.benchmark.status = CaptureStatus::Error(
+                "Verify a normal full-affinity baseline or the selected optimized mask before capturing."
+                    .into(),
+            );
+            return;
         };
 
         let params = CaptureParams {
@@ -397,7 +515,7 @@ impl App {
             }
         });
         ui.label(
-            RichText::new("Select exactly two sessions—normally one run for each affinity mask.")
+            RichText::new("Select exactly one Baseline and one optimized mask run.")
                 .size(12.0)
                 .weak(),
         );
@@ -453,7 +571,7 @@ impl App {
                                     .affinity_mask
                                     .as_deref()
                                     .map(|mask| format!("0x{mask}"))
-                                    .unwrap_or_else(|| "—".to_string()),
+                                    .unwrap_or_else(|| "Baseline".to_string()),
                             )
                             .monospace()
                             .color(COL_AVG),
@@ -514,7 +632,11 @@ impl App {
 
     // -------------------------------------------------------- Comparison chart
     fn comparison_section(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("A/B comparison").strong().size(24.0));
+        ui.label(
+            RichText::new("Compare baseline vs optimized")
+                .strong()
+                .size(24.0),
+        );
         ui.label(
             RichText::new("The delta is B minus A. Higher FPS is better.")
                 .size(12.0)
@@ -543,14 +665,29 @@ impl App {
             return;
         }
 
-        let (session_a, metrics_a) = &picked[0];
-        let (session_b, metrics_b) = &picked[1];
+        let baseline = picked
+            .iter()
+            .find(|(session, _)| session.affinity_mask.is_none());
+        let optimized = picked
+            .iter()
+            .find(|(session, _)| session.affinity_mask.is_some());
+        let (Some((session_a, metrics_a)), Some((session_b, metrics_b))) = (baseline, optimized)
+        else {
+            ui.label(
+                RichText::new(
+                    "Choose one Baseline and one optimized mask run to calculate a valid gain.",
+                )
+                .italics()
+                .color(WARN),
+            );
+            return;
+        };
         let mask = |session: &bdo_bench::Session| {
             session
                 .affinity_mask
                 .as_deref()
                 .map(|value| format!("0x{value}"))
-                .unwrap_or_else(|| "No mask".to_string())
+                .unwrap_or_else(|| "Baseline".to_string())
         };
 
         ui.add_space(10.0);
@@ -709,13 +846,57 @@ fn comparison_delta(a: f64, b: f64) -> (f64, Option<f64>) {
     (delta, (a.abs() > f64::EPSILON).then_some(delta / a * 100.0))
 }
 
+fn running_mask(outcome: Option<&VerifyOutcome>) -> Option<u64> {
+    match outcome {
+        Some(VerifyOutcome::Match { mask }) => Some(*mask),
+        Some(VerifyOutcome::Mismatch { actual, .. }) => Some(*actual),
+        _ => None,
+    }
+}
+
+fn is_full_affinity(mask: Option<u64>, logical_cores: usize) -> bool {
+    let full_mask = match logical_cores {
+        0 => return false,
+        1..=63 => (1_u64 << logical_cores) - 1,
+        _ => u64::MAX,
+    };
+    mask == Some(full_mask)
+}
+
+fn capture_mask(
+    baseline: bool,
+    baseline_ready: bool,
+    verified_mask: Option<u64>,
+) -> Result<Option<String>, ()> {
+    if baseline {
+        baseline_ready.then_some(None).ok_or(())
+    } else {
+        verified_mask
+            .map(|mask| Some(format!("{mask:x}")))
+            .ok_or(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::comparison_delta;
+    use super::{capture_mask, comparison_delta, is_full_affinity};
 
     #[test]
     fn comparison_delta_is_b_minus_a_and_handles_zero_baseline() {
         assert_eq!(comparison_delta(100.0, 110.0), (10.0, Some(10.0)));
         assert_eq!(comparison_delta(0.0, 10.0), (10.0, None));
+    }
+
+    #[test]
+    fn baseline_never_stamps_an_affinity_mask() {
+        assert_eq!(capture_mask(true, true, Some(0x555)), Ok(None));
+        assert_eq!(capture_mask(true, false, None), Err(()));
+        assert_eq!(
+            capture_mask(false, false, Some(0x555)),
+            Ok(Some("555".to_string()))
+        );
+        assert_eq!(capture_mask(false, false, None), Err(()));
+        assert!(is_full_affinity(Some(0xfff), 12));
+        assert!(!is_full_affinity(Some(0x555), 12));
     }
 }

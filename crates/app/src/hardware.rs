@@ -4,7 +4,7 @@ use egui::{Color32, RichText};
 
 use bdo_hw::{vcache_ccd, GpuDeviceType, GpuVendor};
 
-use crate::app::App;
+use crate::app::{App, Tab};
 use crate::format;
 
 const ACCENT: Color32 = Color32::from_rgb(104, 200, 255);
@@ -88,7 +88,7 @@ impl App {
         });
 
         ui.add_space(14.0);
-        self.recommendation_panel(ui);
+        let continue_to_apply = self.recommendation_panel(ui);
         ui.add_space(14.0);
 
         ui.label(RichText::new("CPU cache topology").size(20.0).strong());
@@ -225,11 +225,18 @@ impl App {
                     });
             });
         }
+
+        if continue_to_apply {
+            self.tab = Tab::Optimize;
+        }
     }
 
-    fn recommendation_panel(&self, ui: &mut egui::Ui) {
-        let Some(det) = &self.detection else { return };
+    fn recommendation_panel(&self, ui: &mut egui::Ui) -> bool {
+        let Some(det) = &self.detection else {
+            return false;
+        };
         let recommendation = &det.recommendation;
+        let mut continue_to_apply = false;
         egui::Frame::new()
             .fill(Color32::from_rgb(14, 37, 53))
             .stroke(egui::Stroke::new(1.0, Color32::from_rgb(35, 117, 156)))
@@ -295,8 +302,12 @@ impl App {
                             .color(MUTED)
                             .size(12.0),
                     );
+                    if ui.button("Continue to Apply").clicked() {
+                        continue_to_apply = true;
+                    }
                 }
             });
+        continue_to_apply
     }
 }
 

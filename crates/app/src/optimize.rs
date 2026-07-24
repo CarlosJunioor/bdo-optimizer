@@ -3,9 +3,7 @@
 
 use egui::{Color32, RichText};
 
-use crate::app::App;
-#[cfg(windows)]
-use crate::app::VerifyOutcome;
+use crate::app::{App, Tab, VerifyOutcome};
 use crate::format;
 
 const OK_GREEN: Color32 = Color32::from_rgb(0x63, 0xd6, 0x88);
@@ -67,8 +65,34 @@ fn verification_due(last: Option<std::time::Instant>, now: std::time::Instant) -
 }
 
 impl App {
+    pub(crate) fn refresh_verification(&mut self) {
+        #[cfg(windows)]
+        {
+            self.optimize.verify = Some(win_actions::verify(&self.optimize.mask_input));
+            self.optimize.last_verify_at = Some(std::time::Instant::now());
+        }
+    }
+
+    pub(crate) fn poll_verification(&mut self, ctx: &egui::Context) {
+        #[cfg(windows)]
+        {
+            let now = std::time::Instant::now();
+            if verification_due(self.optimize.last_verify_at, now) {
+                self.refresh_verification();
+            }
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        }
+        #[cfg(not(windows))]
+        let _ = ctx;
+    }
+
     pub(crate) fn optimize_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Optimize");
+        ui.heading("Apply safely");
+        ui.label(
+            RichText::new("Use the detected recommendation, verify it in-game, and return to normal launch at any time.")
+                .size(13.0)
+                .weak(),
+        );
 
         if self.detection.is_none() {
             ui.add_space(12.0);
@@ -79,6 +103,8 @@ impl App {
             return;
         }
 
+        self.optimization_status(ui);
+        ui.add_space(10.0);
         self.game_path_section(ui);
         ui.add_space(10.0);
         ui.separator();
@@ -89,11 +115,57 @@ impl App {
         ui.add_space(10.0);
         ui.separator();
         self.verify_section(ui);
+        if matches!(&self.optimize.verify, Some(VerifyOutcome::Match { .. }))
+            && ui.button("Continue to Measure").clicked()
+        {
+            self.tab = Tab::Benchmark;
+        }
+    }
+
+    fn optimization_status(&self, ui: &mut egui::Ui) {
+        let (title, detail, color) = match &self.optimize.verify {
+            Some(VerifyOutcome::Match { .. }) => (
+                "VERIFIED",
+                "The running game matches the selected affinity mask.",
+                OK_GREEN,
+            ),
+            Some(VerifyOutcome::Mismatch { .. })
+            | Some(VerifyOutcome::BadExpected(_))
+            | Some(VerifyOutcome::Error(_)) => (
+                "NEEDS ATTENTION",
+                "The selected change is not verified. Review the details below before measuring.",
+                WARN,
+            ),
+            _ => (
+                "PENDING",
+                "Launch with the optimized shortcut or Launch Now; verification starts when BDO opens.",
+                Color32::from_rgb(104, 200, 255),
+            ),
+        };
+
+        egui::Frame::new()
+            .fill(Color32::from_rgb(16, 25, 39))
+            .stroke(egui::Stroke::new(1.0, color))
+            .corner_radius(8)
+            .inner_margin(egui::Margin::same(14))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(title).monospace().strong().color(color));
+                    ui.label(detail);
+                });
+                ui.label(
+                    RichText::new(
+                        "Rollback: close the game and launch BDO normally, or delete the optimized shortcut. No global driver or system settings are changed.",
+                    )
+                    .size(12.0)
+                    .weak(),
+                );
+            });
     }
 
     // --------------------------------------------------------------- Game path
     fn game_path_section(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Game install").strong().size(16.0));
+        ui.label(RichText::new("Find your BDO install").strong().size(16.0));
 
         if !cfg!(windows) {
             ui.label(
@@ -178,7 +250,11 @@ impl App {
 
     // --------------------------------------------------------------- Mask entry
     fn mask_section(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Affinity mask").strong().size(16.0));
+        ui.label(
+            RichText::new("Review the affinity mask")
+                .strong()
+                .size(16.0),
+        );
 
         let Some(detection) = &self.detection else {
             return;
@@ -222,57 +298,62 @@ impl App {
 
         let logical = detection.cpu.logical_cores;
         let rows = available_masks(recommendation, logical);
-        ui.label(
-            RichText::new(format!(
-                "{} supported BDO masks fit this CPU's {logical} logical processors.",
-                rows.len()
-            ))
-            .size(12.0)
-            .weak(),
-        );
-
-        egui::ScrollArea::vertical()
-            .id_salt("affinity_mask_table_scroll")
-            .max_height(260.0)
-            .show(ui, |ui| {
-                egui::Grid::new("affinity_mask_table")
-                    .num_columns(5)
-                    .striped(true)
-                    .spacing([16.0, 5.0])
-                    .show(ui, |ui| {
-                        for heading in ["", "Mask", "Logical cores", "CPU profile", ""] {
-                            ui.label(RichText::new(heading).strong());
-                        }
-                        ui.end_row();
-
-                        for (mask, profile, recommended) in rows {
-                            if recommended {
-                                ui.label(RichText::new("Recommended").color(OK_GREEN).strong());
-                            } else {
-                                ui.label("");
-                            }
-                            ui.monospace(format!("0x{mask}"));
-                            let cores = bdo_launch::parse_mask_hex(&mask)
-                                .map(bdo_launch::mask_to_cores)
-                                .unwrap_or_default();
-                            ui.label(format::cores(&cores));
-                            ui.label(profile);
-
-                            let selected = self.optimize.mask_input.eq_ignore_ascii_case(&mask);
-                            if ui
-                                .add_enabled(
-                                    !selected,
-                                    egui::Button::new(if selected { "Selected" } else { "Use" }),
-                                )
-                                .clicked()
-                            {
-                                self.optimize.mask_input = mask;
-                                self.optimize.last_verify_at = None;
+        egui::CollapsingHeader::new("Advanced: choose a different supported mask").show(ui, |ui| {
+            ui.label(
+                RichText::new(format!(
+                    "{} supported BDO masks fit this CPU's {logical} logical processors.",
+                    rows.len()
+                ))
+                .size(12.0)
+                .weak(),
+            );
+            egui::ScrollArea::vertical()
+                .id_salt("affinity_mask_table_scroll")
+                .max_height(260.0)
+                .show(ui, |ui| {
+                    egui::Grid::new("affinity_mask_table")
+                        .num_columns(5)
+                        .striped(true)
+                        .spacing([16.0, 5.0])
+                        .show(ui, |ui| {
+                            for heading in ["", "Mask", "Logical cores", "CPU profile", ""] {
+                                ui.label(RichText::new(heading).strong());
                             }
                             ui.end_row();
-                        }
-                    });
-            });
+
+                            for (mask, profile, recommended) in rows {
+                                if recommended {
+                                    ui.label(RichText::new("Recommended").color(OK_GREEN).strong());
+                                } else {
+                                    ui.label("");
+                                }
+                                ui.monospace(format!("0x{mask}"));
+                                let cores = bdo_launch::parse_mask_hex(&mask)
+                                    .map(bdo_launch::mask_to_cores)
+                                    .unwrap_or_default();
+                                ui.label(format::cores(&cores));
+                                ui.label(profile);
+
+                                let selected = self.optimize.mask_input.eq_ignore_ascii_case(&mask);
+                                if ui
+                                    .add_enabled(
+                                        !selected,
+                                        egui::Button::new(if selected {
+                                            "Selected"
+                                        } else {
+                                            "Use"
+                                        }),
+                                    )
+                                    .clicked()
+                                {
+                                    self.optimize.mask_input = mask;
+                                    self.optimize.last_verify_at = None;
+                                }
+                                ui.end_row();
+                            }
+                        });
+                });
+        });
 
         match bdo_launch::parse_mask_hex(&self.optimize.mask_input) {
             Ok(mask) => {
@@ -304,7 +385,7 @@ impl App {
 
     // ----------------------------------------------------------------- Actions
     fn actions_section(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Apply").strong().size(16.0));
+        ui.label(RichText::new("Apply for this launch").strong().size(16.0));
 
         if !cfg!(windows) {
             ui.label(
@@ -414,13 +495,7 @@ impl App {
 
         #[cfg(windows)]
         {
-            let now = std::time::Instant::now();
-            if verification_due(self.optimize.last_verify_at, now) {
-                self.optimize.verify = Some(win_actions::verify(&self.optimize.mask_input));
-                self.optimize.last_verify_at = Some(now);
-            }
-            ui.ctx()
-                .request_repaint_after(std::time::Duration::from_secs(1));
+            self.poll_verification(ui.ctx());
 
             if let Some(outcome) = &self.optimize.verify {
                 match outcome {
