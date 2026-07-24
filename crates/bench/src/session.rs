@@ -16,6 +16,17 @@ use time::OffsetDateTime;
 use crate::error::BenchError;
 use crate::metrics::Metrics;
 
+/// The intended role of a benchmark run in a trusted comparison.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionRole {
+    /// Legacy or incomplete session; excluded from trusted comparisons.
+    #[default]
+    Unknown,
+    Baseline,
+    Optimized,
+}
+
 /// One saved benchmark run: its raw frame times plus the metadata needed to compare
 /// runs (affinity mask, hardware, label, when).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -26,6 +37,15 @@ pub struct Session {
     pub label: String,
     /// The CPU affinity mask this run used, if any (hex string, e.g. `"555"`).
     pub affinity_mask: Option<String>,
+    /// Explicit comparison role. Missing in legacy JSON, which loads as `Unknown`.
+    #[serde(default)]
+    pub role: SessionRole,
+    /// Affinity mask intended when capture began.
+    #[serde(default)]
+    pub expected_affinity_mask: Option<String>,
+    /// Affinity mask read from the running process immediately before capture.
+    #[serde(default)]
+    pub observed_affinity_mask: Option<String>,
     /// CPU model string.
     pub cpu: String,
     /// GPU model string.
@@ -50,6 +70,9 @@ impl Session {
                 .unwrap_or_else(|_| "unknown".to_string()),
             label: label.into(),
             affinity_mask: None,
+            role: SessionRole::Unknown,
+            expected_affinity_mask: None,
+            observed_affinity_mask: None,
             cpu: cpu.into(),
             gpu: gpu.into(),
             frames_ms,
@@ -65,11 +88,33 @@ impl Session {
         Metrics::from_frame_times(&self.frames_ms)
     }
 
+    /// Whether the expected and read-only observed masks match.
+    pub fn affinity_verified(&self) -> bool {
+        match (
+            self.expected_affinity_mask.as_deref(),
+            self.observed_affinity_mask.as_deref(),
+        ) {
+            (Some(expected), Some(observed)) => {
+                matches!((parse_mask(expected), parse_mask(observed)), (Some(a), Some(b)) if a == b)
+            }
+            _ => false,
+        }
+    }
+
     /// Filename this session is stored under: `<timestamp>_<label>.json`, sanitised so
     /// it is a valid, collision-resistant filename on all platforms.
     pub fn file_stem(&self) -> String {
         format!("{}_{}", sanitize(&self.timestamp), sanitize(&self.label))
     }
+}
+
+fn parse_mask(mask: &str) -> Option<u64> {
+    let mask = mask.trim();
+    let mask = mask
+        .strip_prefix("0x")
+        .or_else(|| mask.strip_prefix("0X"))
+        .unwrap_or(mask);
+    u64::from_str_radix(mask, 16).ok()
 }
 
 /// A directory of saved [`Session`] JSON files.
@@ -192,6 +237,9 @@ mod tests {
             timestamp: "2026-07-22T14:03:11Z".to_string(),
             label: "affinity 555".to_string(),
             affinity_mask: Some("555".to_string()),
+            role: SessionRole::Optimized,
+            expected_affinity_mask: Some("555".to_string()),
+            observed_affinity_mask: Some("555".to_string()),
             cpu: "Ryzen 9 7900X3D".to_string(),
             gpu: "RTX 4080".to_string(),
             frames_ms: vec![16.6, 16.9, 17.0, 16.7],
@@ -270,6 +318,40 @@ mod tests {
         let s = Session::new("t", "cpu", "gpu", vec![16.0]);
         // Parses back as RFC3339.
         assert!(OffsetDateTime::parse(&s.timestamp, &Rfc3339).is_ok());
+        assert_eq!(s.role, SessionRole::Unknown);
+        assert!(!s.affinity_verified());
+    }
+
+    #[test]
+    fn explicit_role_and_matching_affinity_are_trusted() {
+        let mut s = Session::new("baseline", "cpu", "gpu", vec![16.0]);
+        s.role = SessionRole::Baseline;
+        s.expected_affinity_mask = Some("fff".to_string());
+        s.observed_affinity_mask = Some("fff".to_string());
+        assert!(s.affinity_verified());
+
+        s.observed_affinity_mask = Some("555".to_string());
+        assert!(!s.affinity_verified());
+
+        s.expected_affinity_mask = Some("invalid".to_string());
+        s.observed_affinity_mask = Some("also-invalid".to_string());
+        assert!(!s.affinity_verified());
+    }
+
+    #[test]
+    fn legacy_json_loads_as_untrusted_unknown_role() {
+        let legacy = r#"{
+            "timestamp":"2026-07-22T14:03:11Z",
+            "label":"old run",
+            "affinity_mask":"555",
+            "cpu":"cpu",
+            "gpu":"gpu",
+            "frames_ms":[16.0],
+            "presentmon_version":null
+        }"#;
+        let session: Session = serde_json::from_str(legacy).unwrap();
+        assert_eq!(session.role, SessionRole::Unknown);
+        assert!(!session.affinity_verified());
     }
 
     #[test]

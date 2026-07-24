@@ -34,6 +34,34 @@ use crate::error::BenchError;
 /// shaky, so [`Metrics::low_confidence`] is set for the UI to warn on.
 pub const LOW_CONFIDENCE_FRAMES: usize = 1000;
 
+/// A delta must clear both thresholds before the UI calls it a gain or regression.
+pub const MIN_MEANINGFUL_DELTA_FPS: f64 = 1.0;
+pub const MIN_MEANINGFUL_DELTA_PERCENT: f64 = 1.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GainVerdict {
+    Inconclusive,
+    Improvement,
+    Regression,
+}
+
+/// Classify a benchmark delta conservatively; short runs and tiny deltas are noise.
+pub fn gain_verdict(baseline: f64, optimized: f64, low_confidence: bool) -> GainVerdict {
+    if low_confidence || !baseline.is_finite() || !optimized.is_finite() || baseline <= f64::EPSILON
+    {
+        return GainVerdict::Inconclusive;
+    }
+    let delta = optimized - baseline;
+    let percent = delta / baseline * 100.0;
+    if delta.abs() < MIN_MEANINGFUL_DELTA_FPS || percent.abs() < MIN_MEANINGFUL_DELTA_PERCENT {
+        GainVerdict::Inconclusive
+    } else if delta > 0.0 {
+        GainVerdict::Improvement
+    } else {
+        GainVerdict::Regression
+    }
+}
+
 /// A full set of FPS metrics derived from one frame-time series.
 ///
 /// All FPS fields are in frames-per-second; [`Metrics::duration_seconds`] is the total
@@ -248,6 +276,14 @@ mod tests {
         let frames = vec![16.0; 500];
         let m = Metrics::from_frame_times(&frames).unwrap();
         assert!(m.low_confidence);
+    }
+
+    #[test]
+    fn tiny_or_low_confidence_gain_is_inconclusive() {
+        assert_eq!(gain_verdict(100.0, 100.5, false), GainVerdict::Inconclusive);
+        assert_eq!(gain_verdict(100.0, 103.0, true), GainVerdict::Inconclusive);
+        assert_eq!(gain_verdict(100.0, 103.0, false), GainVerdict::Improvement);
+        assert_eq!(gain_verdict(100.0, 97.0, false), GainVerdict::Regression);
     }
 
     #[test]

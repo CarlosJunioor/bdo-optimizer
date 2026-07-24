@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use bdo_bench::{
     is_process_running, parse_presentmon_csv, start_capture, BenchError, CaptureConfig, LiveReader,
-    Metrics, Session, SessionStore,
+    Metrics, Session, SessionRole, SessionStore,
 };
 
 /// The running game process name PresentMon targets.
@@ -103,7 +103,9 @@ pub struct CaptureParams {
     pub presentmon_path: PathBuf,
     pub output_csv: PathBuf,
     pub label: String,
-    pub mask_hex: Option<String>,
+    pub role: SessionRole,
+    pub expected_affinity_mask: String,
+    pub observed_affinity_mask: String,
     pub cpu: String,
     pub gpu: String,
     pub store_dir: PathBuf,
@@ -252,7 +254,10 @@ fn run(p: CaptureParams, stop: Arc<AtomicBool>, tx: Sender<CaptureMsg>, ctx: egu
 
     let count = frames.len();
     let mut session = Session::new(p.label, p.cpu, p.gpu, frames);
-    session.affinity_mask = p.mask_hex;
+    session.role = p.role;
+    session.expected_affinity_mask = Some(p.expected_affinity_mask.clone());
+    session.observed_affinity_mask = Some(p.observed_affinity_mask);
+    session.affinity_mask = (p.role == SessionRole::Optimized).then_some(p.expected_affinity_mask);
     session.presentmon_version = Some(PRESENTMON_VERSION.to_string());
 
     let store = SessionStore::new(p.store_dir);

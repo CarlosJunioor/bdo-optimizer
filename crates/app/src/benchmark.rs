@@ -6,7 +6,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use egui::{Color32, RichText};
 use egui_plot::{Bar, BarChart, Legend, Line, Plot};
 
-use bdo_bench::{Metrics, SessionStore};
+use bdo_bench::{
+    gain_verdict, GainVerdict, Metrics, SessionRole, SessionStore, MIN_MEANINGFUL_DELTA_FPS,
+    MIN_MEANINGFUL_DELTA_PERCENT,
+};
 
 use crate::app::{App, CaptureStatus, VerifyOutcome};
 use crate::capture::{CaptureParams, CaptureWorker};
@@ -445,21 +448,21 @@ impl App {
             .unwrap_or(0);
         let output_csv = std::env::temp_dir().join(format!("bdo_capture_{stamp}.csv"));
 
-        let verified_mask = match &self.optimize.verify {
-            Some(VerifyOutcome::Match { mask }) => Some(*mask),
-            _ => None,
-        };
         let logical_cores = self
             .detection
             .as_ref()
             .map(|detection| detection.cpu.logical_cores)
             .unwrap_or(0);
-        let baseline_ready =
-            is_full_affinity(running_mask(self.optimize.verify.as_ref()), logical_cores);
-        let Ok(mask_hex) = capture_mask(
+        let observed_mask = running_mask(self.optimize.verify.as_ref());
+        let expected_mask = if self.benchmark.baseline_capture {
+            full_affinity_mask(logical_cores)
+        } else {
+            bdo_launch::parse_mask_hex(&self.optimize.mask_input).ok()
+        };
+        let Ok(affinity) = capture_affinity(
             self.benchmark.baseline_capture,
-            baseline_ready,
-            verified_mask,
+            expected_mask,
+            observed_mask,
         ) else {
             self.benchmark.status = CaptureStatus::Error(
                 "Verify a normal full-affinity baseline or the selected optimized mask before capturing."
@@ -472,7 +475,9 @@ impl App {
             presentmon_path: presentmon,
             output_csv,
             label: self.benchmark.label.clone(),
-            mask_hex,
+            role: affinity.role,
+            expected_affinity_mask: affinity.expected,
+            observed_affinity_mask: affinity.observed,
             cpu: self.cpu_label(),
             gpu: self.gpu_label(),
             store_dir: self.benchmark.store_dir.clone(),
@@ -539,7 +544,14 @@ impl App {
                 .spacing([18.0, 8.0])
                 .show(ui, |ui| {
                     for heading in [
-                        "Compare", "Run", "Mask", "Average", "P1 low", "1% low", "Frames", "",
+                        "Compare",
+                        "Run",
+                        "Role / affinity",
+                        "Average",
+                        "P1 low",
+                        "1% low",
+                        "Frames",
+                        "",
                     ] {
                         ui.label(RichText::new(heading).strong());
                     }
@@ -553,10 +565,15 @@ impl App {
                         .count();
                     for (i, session) in self.benchmark.sessions.iter().enumerate() {
                         let metrics = session.metrics();
+                        let trusted = session.role != SessionRole::Unknown
+                            && session.affinity_verified();
                         if let Some(selected) = self.benchmark.selected.get_mut(i) {
                             ui.add_enabled(
-                                metrics.is_ok() && (*selected || picked < 2),
+                                metrics.is_ok() && trusted && (*selected || picked < 2),
                                 egui::Checkbox::new(selected, "Pick"),
+                            )
+                            .on_disabled_hover_text(
+                                "Legacy or unverified sessions cannot be used for a trusted comparison.",
                             );
                         } else {
                             ui.label("");
@@ -565,17 +582,27 @@ impl App {
                             ui.label(RichText::new(&session.label).strong());
                             ui.label(RichText::new(&session.timestamp).size(11.0).weak());
                         });
-                        ui.label(
-                            RichText::new(
-                                session
-                                    .affinity_mask
-                                    .as_deref()
-                                    .map(|mask| format!("0x{mask}"))
-                                    .unwrap_or_else(|| "Baseline".to_string()),
-                            )
-                            .monospace()
-                            .color(COL_AVG),
-                        );
+                        ui.vertical(|ui| {
+                            ui.label(
+                                RichText::new(match session.role {
+                                    SessionRole::Baseline => "Baseline",
+                                    SessionRole::Optimized => "Optimized",
+                                    SessionRole::Unknown => "Legacy / untrusted",
+                                })
+                                .strong()
+                                .color(if trusted { COL_AVG } else { WARN }),
+                            );
+                            ui.label(
+                                RichText::new(format!(
+                                    "expected {} · observed {}",
+                                    mask_text(session.expected_affinity_mask.as_deref()),
+                                    mask_text(session.observed_affinity_mask.as_deref()),
+                                ))
+                                .monospace()
+                                .size(11.0)
+                                .weak(),
+                            );
+                        });
 
                         if let Ok(metrics) = metrics {
                             ui.label(format::fps(metrics.avg_fps));
@@ -665,13 +692,8 @@ impl App {
             return;
         }
 
-        let baseline = picked
-            .iter()
-            .find(|(session, _)| session.affinity_mask.is_none());
-        let optimized = picked
-            .iter()
-            .find(|(session, _)| session.affinity_mask.is_some());
-        let (Some((session_a, metrics_a)), Some((session_b, metrics_b))) = (baseline, optimized)
+        let Some((baseline_index, optimized_index)) =
+            comparison_order(picked[0].0.role, picked[1].0.role)
         else {
             ui.label(
                 RichText::new(
@@ -682,13 +704,20 @@ impl App {
             );
             return;
         };
-        let mask = |session: &bdo_bench::Session| {
-            session
-                .affinity_mask
-                .as_deref()
-                .map(|value| format!("0x{value}"))
-                .unwrap_or_else(|| "Baseline".to_string())
-        };
+        let (session_a, metrics_a) = &picked[baseline_index];
+        let (session_b, metrics_b) = &picked[optimized_index];
+        if !session_a.affinity_verified() || !session_b.affinity_verified() {
+            ui.label(
+                RichText::new(
+                    "Both runs need matching expected and observed affinity before comparison.",
+                )
+                .italics()
+                .color(WARN),
+            );
+            return;
+        }
+        let mask =
+            |session: &bdo_bench::Session| mask_text(session.observed_affinity_mask.as_deref());
 
         ui.add_space(10.0);
         ui.columns(2, |columns| {
@@ -712,13 +741,15 @@ impl App {
             }
         });
 
-        if session_a.cpu != session_b.cpu || session_a.gpu != session_b.gpu {
+        let different_hardware = session_a.cpu != session_b.cpu || session_a.gpu != session_b.gpu;
+        if different_hardware {
             ui.label(
                 RichText::new("⚠ These runs were recorded on different hardware; the result is not a controlled mask comparison.")
                     .color(WARN),
             );
         }
-        if session_a.affinity_mask == session_b.affinity_mask {
+        let same_affinity = session_a.observed_affinity_mask == session_b.observed_affinity_mask;
+        if same_affinity {
             ui.label(
                 RichText::new("⚠ These runs use the same affinity mask; choose two different masks for an affinity A/B test.")
                     .color(WARN),
@@ -732,6 +763,13 @@ impl App {
                 .color(WARN),
             );
         }
+        ui.label(
+            RichText::new(format!(
+                "A delta must be at least {MIN_MEANINGFUL_DELTA_FPS:.0} FPS and {MIN_MEANINGFUL_DELTA_PERCENT:.0}% to be treated as conclusive."
+            ))
+            .size(12.0)
+            .weak(),
+        );
 
         ui.add_space(10.0);
         egui::Frame::new()
@@ -766,21 +804,30 @@ impl App {
                             ),
                         ] {
                             let (delta, percent) = comparison_delta(a, b);
+                            let verdict = gain_verdict(
+                                a,
+                                b,
+                                comparison_is_inconclusive(
+                                    metrics_a.low_confidence || metrics_b.low_confidence,
+                                    different_hardware,
+                                    same_affinity,
+                                ),
+                            );
                             let percent = percent
                                 .map(|value| format!(" · {value:+.1}%"))
                                 .unwrap_or_default();
-                            let color = if delta > 0.05 {
-                                OK_GREEN
-                            } else if delta < -0.05 {
-                                ERR
-                            } else {
-                                ui.visuals().weak_text_color()
+                            let (color, qualifier) = match verdict {
+                                GainVerdict::Improvement => (OK_GREEN, ""),
+                                GainVerdict::Regression => (ERR, ""),
+                                GainVerdict::Inconclusive => {
+                                    (ui.visuals().weak_text_color(), " · inconclusive")
+                                }
                             };
                             ui.label(label);
                             ui.label(RichText::new(format::fps(a)).monospace().size(16.0));
                             ui.label(RichText::new(format::fps(b)).monospace().size(16.0));
                             ui.label(
-                                RichText::new(format!("{delta:+.1}{percent}"))
+                                RichText::new(format!("{delta:+.1}{percent}{qualifier}"))
                                     .monospace()
                                     .strong()
                                     .color(color),
@@ -846,6 +893,27 @@ fn comparison_delta(a: f64, b: f64) -> (f64, Option<f64>) {
     (delta, (a.abs() > f64::EPSILON).then_some(delta / a * 100.0))
 }
 
+fn comparison_order(first: SessionRole, second: SessionRole) -> Option<(usize, usize)> {
+    match (first, second) {
+        (SessionRole::Baseline, SessionRole::Optimized) => Some((0, 1)),
+        (SessionRole::Optimized, SessionRole::Baseline) => Some((1, 0)),
+        _ => None,
+    }
+}
+
+fn comparison_is_inconclusive(
+    low_confidence: bool,
+    different_hardware: bool,
+    same_affinity: bool,
+) -> bool {
+    low_confidence || different_hardware || same_affinity
+}
+
+fn mask_text(mask: Option<&str>) -> String {
+    mask.map(|mask| format!("0x{mask}"))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 fn running_mask(outcome: Option<&VerifyOutcome>) -> Option<u64> {
     match outcome {
         Some(VerifyOutcome::Match { mask }) => Some(*mask),
@@ -855,31 +923,52 @@ fn running_mask(outcome: Option<&VerifyOutcome>) -> Option<u64> {
 }
 
 fn is_full_affinity(mask: Option<u64>, logical_cores: usize) -> bool {
-    let full_mask = match logical_cores {
-        0 => return false,
-        1..=63 => (1_u64 << logical_cores) - 1,
-        _ => u64::MAX,
-    };
-    mask == Some(full_mask)
+    mask == full_affinity_mask(logical_cores)
 }
 
-fn capture_mask(
-    baseline: bool,
-    baseline_ready: bool,
-    verified_mask: Option<u64>,
-) -> Result<Option<String>, ()> {
-    if baseline {
-        baseline_ready.then_some(None).ok_or(())
-    } else {
-        verified_mask
-            .map(|mask| Some(format!("{mask:x}")))
-            .ok_or(())
+fn full_affinity_mask(logical_cores: usize) -> Option<u64> {
+    match logical_cores {
+        0 => None,
+        1..=63 => Some((1_u64 << logical_cores) - 1),
+        _ => Some(u64::MAX),
     }
+}
+
+struct CaptureAffinity {
+    role: SessionRole,
+    expected: String,
+    observed: String,
+}
+
+fn capture_affinity(
+    baseline: bool,
+    expected: Option<u64>,
+    observed: Option<u64>,
+) -> Result<CaptureAffinity, ()> {
+    let (Some(expected), Some(observed)) = (expected, observed) else {
+        return Err(());
+    };
+    if expected != observed {
+        return Err(());
+    }
+    Ok(CaptureAffinity {
+        role: if baseline {
+            SessionRole::Baseline
+        } else {
+            SessionRole::Optimized
+        },
+        expected: format!("{expected:x}"),
+        observed: format!("{observed:x}"),
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{capture_mask, comparison_delta, is_full_affinity};
+    use super::{
+        capture_affinity, comparison_delta, comparison_is_inconclusive, comparison_order,
+        is_full_affinity,
+    };
+    use bdo_bench::SessionRole;
 
     #[test]
     fn comparison_delta_is_b_minus_a_and_handles_zero_baseline() {
@@ -888,14 +977,41 @@ mod tests {
     }
 
     #[test]
-    fn baseline_never_stamps_an_affinity_mask() {
-        assert_eq!(capture_mask(true, true, Some(0x555)), Ok(None));
-        assert_eq!(capture_mask(true, false, None), Err(()));
+    fn comparison_always_orders_baseline_before_optimized() {
         assert_eq!(
-            capture_mask(false, false, Some(0x555)),
-            Ok(Some("555".to_string()))
+            comparison_order(SessionRole::Baseline, SessionRole::Optimized),
+            Some((0, 1))
         );
-        assert_eq!(capture_mask(false, false, None), Err(()));
+        assert_eq!(
+            comparison_order(SessionRole::Optimized, SessionRole::Baseline),
+            Some((1, 0))
+        );
+        assert_eq!(
+            comparison_order(SessionRole::Baseline, SessionRole::Baseline),
+            None
+        );
+    }
+
+    #[test]
+    fn same_affinity_comparison_is_inconclusive() {
+        assert!(comparison_is_inconclusive(false, false, true));
+        assert!(!comparison_is_inconclusive(false, false, false));
+    }
+
+    #[test]
+    fn capture_affinity_requires_matching_role_provenance() {
+        let baseline = capture_affinity(true, Some(0xfff), Some(0xfff)).unwrap();
+        assert_eq!(baseline.role, SessionRole::Baseline);
+        assert_eq!(baseline.expected, "fff");
+        assert_eq!(baseline.observed, "fff");
+
+        let optimized = capture_affinity(false, Some(0x555), Some(0x555)).unwrap();
+        assert_eq!(optimized.role, SessionRole::Optimized);
+        assert_eq!(optimized.expected, "555");
+        assert_eq!(optimized.observed, "555");
+
+        assert!(capture_affinity(false, Some(0x555), Some(0x554)).is_err());
+        assert!(capture_affinity(true, Some(0xfff), None).is_err());
         assert!(is_full_affinity(Some(0xfff), 12));
         assert!(!is_full_affinity(Some(0x555), 12));
     }

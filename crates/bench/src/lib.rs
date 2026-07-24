@@ -40,5 +40,8 @@ pub use capture::{
 pub use csv_parse::parse_presentmon_csv;
 pub use error::BenchError;
 pub use live::{LiveReader, LiveStats, CURRENT_FPS_WINDOW};
-pub use metrics::{current_fps, Metrics, LOW_CONFIDENCE_FRAMES};
-pub use session::{Session, SessionStore};
+pub use metrics::{
+    current_fps, gain_verdict, GainVerdict, Metrics, LOW_CONFIDENCE_FRAMES,
+    MIN_MEANINGFUL_DELTA_FPS, MIN_MEANINGFUL_DELTA_PERCENT,
+};
+pub use session::{Session, SessionRole, SessionStore};
