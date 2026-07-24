@@ -1,4 +1,10 @@
-# BDO Optimizer — Implementation Plan
+# BDO Optimizer — Historical Implementation Plan
+
+> [!NOTE]
+> This document records the original implementation direction and is not the
+> current user guide or feature contract. Some screen names, planned features,
+> and open questions are now outdated. See [README.md](README.md) for current,
+> implementation-verified behavior.
 
 Open-source Rust GUI app that detects the user's hardware, applies the optimal Black Desert Online
 CPU-affinity configuration from ACanadianDude's performance guide, and benchmarks FPS locally to
