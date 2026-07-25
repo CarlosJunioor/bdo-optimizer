@@ -1,0 +1,85 @@
+name: Release
+
+# Push a tag to publish a downloadable build:
+#   git tag v0.1.0 && git push origin v0.1.0
+# Or run this workflow manually from the Actions tab to get a zip you can
+# download from the run's Artifacts (no release created).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Test
+        run: cargo test --workspace --release
+
+      - name: Build
+        run: cargo build --release -p bdo-optimizer
+
+      # PresentMon.exe MUST sit next to bdo-optimizer.exe — the app only looks
+      # beside itself (and at vendor/ in dev builds). A bare .exe download would
+      # start but fail every capture, so the artifact is always a zip.
+      - name: Stage package
+        shell: pwsh
+        run: |
+          $tag = if ($env:GITHUB_REF -like 'refs/tags/*') { $env:GITHUB_REF -replace 'refs/tags/','' }
+                 else { "dev-$($env:GITHUB_SHA.Substring(0,7))" }
+          $dir = "bdo-optimizer-$tag-windows-x64"
+          New-Item -ItemType Directory $dir | Out-Null
+          Copy-Item target\release\bdo-optimizer.exe $dir\
+          Copy-Item vendor\presentmon\PresentMon.exe $dir\
+          Copy-Item README.md, LICENSE $dir\
+          Copy-Item vendor\presentmon\LICENSE.txt $dir\PresentMon-LICENSE.txt
+          Copy-Item vendor\presentmon\VERSION.txt $dir\PresentMon-VERSION.txt
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+          $hash = (Get-FileHash "$dir.zip" -Algorithm SHA256).Hash
+          "$hash  $dir.zip" | Out-File -Encoding ascii "$dir.zip.sha256"
+          "TAG=$tag"        >> $env:GITHUB_ENV
+          "ZIP=$dir.zip"    >> $env:GITHUB_ENV
+          "SHA256=$hash"    >> $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP }}
+          path: ${{ env.ZIP }}
+
+      - name: Write release notes
+        shell: pwsh
+        run: |
+          @'
+          ## Download
+
+          Grab the `.zip` below, extract the folder anywhere, and run `bdo-optimizer.exe`.
+
+          Keep `bdo-optimizer.exe` and `PresentMon.exe` in the same folder — FPS capture
+          will not start if they are separated.
+
+          FPS capture needs **Run as administrator** (Windows ETW tracing). Hardware
+          inspection and viewing saved sessions do not.
+
+          Windows SmartScreen will warn on first run because the build is unsigned:
+          *More info* -> *Run anyway*. Verify the zip against `SHA256` below first if you
+          prefer — `Get-FileHash <zip> -Algorithm SHA256`.
+
+          SHA256: `__SHA256__`
+
+          Bundled PresentMon is Intel's MIT-licensed CLI; see `PresentMon-LICENSE.txt`.
+          '@ -replace '__SHA256__', $env:SHA256 | Out-File -Encoding utf8 notes.md
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$env:TAG" "$env:ZIP" "$env:ZIP.sha256"
+          --title "BDO Optimizer $env:TAG" --notes-file notes.md
