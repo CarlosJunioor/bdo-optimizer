@@ -75,7 +75,7 @@ pub(crate) fn parse_frame_time(field: &str) -> Option<f64> {
         return None;
     }
     match s.parse::<f64>() {
-        Ok(v) if v.is_finite() && v > 0.0 => Some(v),
+        Ok(v) if v.is_finite() && v > 0.0 && v <= crate::metrics::MAX_FRAME_TIME_MS => Some(v),
         _ => None,
     }
 }
@@ -113,7 +113,10 @@ pub fn parse_presentmon_csv(
         match rdr.read_record(&mut record) {
             Ok(true) => {}
             Ok(false) => break,
-            // Skip a malformed record instead of failing the whole parse.
+            // A parse-level error consumed the bad record, so skipping it makes
+            // progress. An IO error does *not* advance the reader, so `continue`
+            // would spin forever — stop and keep whatever we already parsed.
+            Err(e) if matches!(e.kind(), csv::ErrorKind::Io(_)) => break,
             Err(_) => continue,
         }
 
@@ -140,6 +143,42 @@ pub fn parse_presentmon_csv(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Yields one valid header + row, then fails every subsequent read. A csv
+    /// IO error does not consume a record, so a `continue` here would spin.
+    struct HeaderThenIoError {
+        sent: bool,
+    }
+
+    impl std::io::Read for HeaderThenIoError {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.sent {
+                return Err(std::io::Error::other("read failure mid-capture"));
+            }
+            self.sent = true;
+            let head = b"MsBetweenPresents\n16.6\n";
+            let n = head.len().min(buf.len());
+            buf[..n].copy_from_slice(&head[..n]);
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn io_error_terminates_instead_of_looping_forever() {
+        // Before the fix this never returned. Reaching the assert at all is the test.
+        let frames = parse_presentmon_csv(HeaderThenIoError { sent: false }, None).unwrap();
+        assert_eq!(frames, vec![16.6]);
+    }
+
+    #[test]
+    fn absurd_frame_time_is_rejected() {
+        // A corrupt row would otherwise overflow the session duration and panic
+        // the UI's Duration::from_secs_f64.
+        assert_eq!(parse_frame_time("1e+308"), None);
+        assert_eq!(parse_frame_time("60001"), None);
+        assert_eq!(parse_frame_time("60000"), Some(60_000.0));
+        assert_eq!(parse_frame_time("16.6"), Some(16.6));
+    }
 
     #[test]
     fn parses_2x_msbetweenpresents() {

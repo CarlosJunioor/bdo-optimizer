@@ -32,6 +32,11 @@ pub const PRESENTMON_VERSION: &str = "2.5.1";
 /// Poll cadence for the game-process / PresentMon-liveness check.
 const POLL: Duration = Duration::from_millis(500);
 
+/// How often the whole-session live metrics (average, lows) are recomputed.
+/// Deliberately slower than [`POLL`]: that work sorts every frame captured so
+/// far, and it runs on the machine currently being measured.
+const FULL_STATS_EVERY: Duration = Duration::from_secs(4);
+
 /// Live stats sampled from the growing capture CSV, sent to the UI ~2×/second so
 /// the Benchmark live panel and the always-on-top overlay can update while playing.
 ///
@@ -183,6 +188,8 @@ fn run(p: CaptureParams, stop: Arc<AtomicBool>, tx: Sender<CaptureMsg>, ctx: egu
 
     let mut start = None;
     let mut game_seen = false;
+    let mut last_full_stats: Option<Instant> = None;
+    let mut last_snapshot: Option<LiveSnapshot> = None;
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
@@ -202,16 +209,40 @@ fn run(p: CaptureParams, stop: Arc<AtomicBool>, tx: Sender<CaptureMsg>, ctx: egu
         let _ = live.poll();
         let frames = live.frames();
         if !frames.is_empty() {
-            if let Ok(m) = Metrics::from_frame_times(frames) {
-                let _ = tx.send(CaptureMsg::Live(LiveSnapshot {
-                    elapsed: elapsed.unwrap_or_default(),
-                    frames: frames.len(),
-                    current_fps: live.current_fps(),
-                    avg_fps: m.avg_fps,
-                    p1_low_fps: m.p1_low_fps,
-                    one_percent_low_integral_fps: m.one_percent_low_integral_fps,
-                    sparkline: recent_frame_times(frames, 10.0, 1200),
-                }));
+            // Metrics::from_frame_times sorts the entire accumulated series, so its
+            // cost grows with capture length. Doing that every poll burned a
+            // fluctuating slice of a core *while measuring* — which perturbs the
+            // very frame times being recorded, and unevenly between a short and a
+            // long run. The tail metrics only need to be roughly live, so they are
+            // recomputed on a slower cadence; the counters that are cheap refresh
+            // every poll.
+            //
+            // ponytail: still O(n log n) per recompute, just 8x rarer. If very long
+            // captures still show up in a profile, keep a running sum in LiveReader
+            // and window the tail metrics instead.
+            let now = Instant::now();
+            let due = last_full_stats.is_none_or(|at| now.duration_since(at) >= FULL_STATS_EVERY);
+            if due {
+                if let Ok(m) = Metrics::from_frame_times(frames) {
+                    last_full_stats = Some(now);
+                    last_snapshot = Some(LiveSnapshot {
+                        elapsed: elapsed.unwrap_or_default(),
+                        frames: frames.len(),
+                        current_fps: live.current_fps(),
+                        avg_fps: m.avg_fps,
+                        p1_low_fps: m.p1_low_fps,
+                        one_percent_low_integral_fps: m.one_percent_low_integral_fps,
+                        sparkline: recent_frame_times(frames, 10.0, 1200),
+                    });
+                }
+            } else if let Some(previous) = &mut last_snapshot {
+                previous.elapsed = elapsed.unwrap_or_default();
+                previous.frames = frames.len();
+                previous.current_fps = live.current_fps();
+                previous.sparkline = recent_frame_times(frames, 10.0, 1200);
+            }
+            if let Some(snapshot) = &last_snapshot {
+                let _ = tx.send(CaptureMsg::Live(snapshot.clone()));
             }
         }
         ctx.request_repaint();

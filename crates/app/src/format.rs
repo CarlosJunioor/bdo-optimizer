@@ -66,7 +66,10 @@ pub fn duration(d: Duration) -> String {
 
 /// Format a duration in seconds (session length) as `"1m 05s"` / `"45s"`.
 pub fn duration_secs(seconds: f64) -> String {
-    if !seconds.is_finite() || seconds < 0.0 {
+    // Duration::from_secs_f64 panics on overflow as well as on NaN/negative, and
+    // this runs inside the egui frame loop for every listed session — an absurd
+    // value from a corrupt session file would take the whole app down.
+    if !seconds.is_finite() || seconds < 0.0 || seconds >= u64::MAX as f64 {
         return "-".to_string();
     }
     duration(Duration::from_secs_f64(seconds))

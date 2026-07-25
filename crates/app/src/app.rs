@@ -7,7 +7,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bdo_bench::{Session, SessionStore};
+use bdo_bench::{Metrics, Session, SessionStore};
 
 use crate::capture::{CaptureMsg, CaptureWorker, LiveSnapshot};
 use crate::detect::{self, DetectResult};
@@ -110,6 +110,13 @@ pub struct BenchmarkState {
     pub sessions: Vec<Session>,
     /// Selection flags, parallel to `sessions`.
     pub selected: Vec<bool>,
+    /// Metrics per session, parallel to `sessions`, computed once on load.
+    ///
+    /// `Session::metrics()` clones and sorts the whole frame series, so calling
+    /// it from the render loop cost a full sort per session per repaint — with a
+    /// few long captures saved that saturates a core while the user is gaming.
+    /// Sessions are immutable once written, so this is computed on load only.
+    pub metrics: Vec<Option<Metrics>>,
     /// Directory the session store reads/writes.
     pub store_dir: PathBuf,
     /// Current capture state.
@@ -144,6 +151,7 @@ impl BenchmarkState {
             .unwrap_or_else(|_| PathBuf::from("sessions"));
         let sessions = SessionStore::new(&store_dir).list().unwrap_or_default();
         let selected = vec![false; sessions.len()];
+        let metrics = session_metrics(&sessions);
         // Check elevation once at startup so the Benchmark tab can warn up front
         // that a capture needs administrator rights (PresentMon's ETW session).
         #[cfg(windows)]
@@ -159,6 +167,7 @@ impl BenchmarkState {
             baseline_capture: true,
             sessions,
             selected,
+            metrics,
             store_dir,
             status: CaptureStatus::Idle,
             worker: None,
@@ -179,7 +188,14 @@ impl BenchmarkState {
             .list()
             .unwrap_or_default();
         self.selected = vec![false; self.sessions.len()];
+        self.metrics = session_metrics(&self.sessions);
     }
+}
+
+/// Compute metrics for each session once, keeping the result parallel to
+/// `sessions` so the render loop can index it instead of re-sorting frame data.
+fn session_metrics(sessions: &[Session]) -> Vec<Option<Metrics>> {
+    sessions.iter().map(|s| s.metrics().ok()).collect()
 }
 
 /// The whole application.

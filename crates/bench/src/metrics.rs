@@ -34,6 +34,12 @@ use crate::error::BenchError;
 /// shaky, so [`Metrics::low_confidence`] is set for the UI to warn on.
 pub const LOW_CONFIDENCE_FRAMES: usize = 1000;
 
+/// Upper bound on a single frame time (60 s). Anything above this is not a frame
+/// — it is a corrupt CSV row or a hand-edited session file. Such values are
+/// dropped rather than summed, because `Σt` feeds `Duration::from_secs_f64` in
+/// the UI, which panics on overflow.
+pub const MAX_FRAME_TIME_MS: f64 = 60_000.0;
+
 /// A delta must clear both thresholds before the UI calls it a gain or regression.
 pub const MIN_MEANINGFUL_DELTA_FPS: f64 = 1.0;
 pub const MIN_MEANINGFUL_DELTA_PERCENT: f64 = 1.0;
@@ -98,12 +104,13 @@ impl Metrics {
     /// or non-finite samples are ignored; if that leaves nothing usable the same
     /// error is returned.
     pub fn from_frame_times(frame_times_ms: &[f64]) -> Result<Metrics, BenchError> {
-        // Filter to strictly-positive, finite samples. A zero or negative frame time
-        // is physically meaningless and would blow up the reciprocals.
+        // Filter to strictly-positive, finite samples within a physically plausible
+        // range. A zero or negative frame time would blow up the reciprocals, and an
+        // absurdly large one would overflow the session duration.
         let mut times: Vec<f64> = frame_times_ms
             .iter()
             .copied()
-            .filter(|t| t.is_finite() && *t > 0.0)
+            .filter(|t| t.is_finite() && *t > 0.0 && *t <= MAX_FRAME_TIME_MS)
             .collect();
         if times.is_empty() {
             return Err(BenchError::EmptyInput);
@@ -368,6 +375,20 @@ mod tests {
         let m = Metrics::from_frame_times(&frames).unwrap();
         assert_eq!(m.frame_count, 4);
         assert!(approx(m.duration_seconds, 0.064, 1e-12));
+    }
+
+    #[test]
+    fn absurd_frame_times_cannot_overflow_the_duration() {
+        // A hand-edited session with 1e25 ms used to give duration_seconds = 1e22,
+        // which panics Duration::from_secs_f64 in the UI's session list.
+        let m = Metrics::from_frame_times(&[16.6, 1.0e25, 16.7]).unwrap();
+        assert_eq!(m.frame_count, 2);
+        assert!(m.duration_seconds < 1.0);
+        // Nothing usable left at all is still an error, not a bogus zero.
+        assert!(matches!(
+            Metrics::from_frame_times(&[1.0e25]),
+            Err(BenchError::EmptyInput)
+        ));
     }
 
     #[test]

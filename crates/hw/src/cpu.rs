@@ -110,7 +110,8 @@ pub fn vcache_ccd(domains: &[L3Domain]) -> Option<&L3Domain> {
 #[cfg(windows)]
 fn detect_caches() -> (Vec<L3Domain>, Vec<CacheInfo>) {
     use windows::Win32::System::SystemInformation::{
-        GetLogicalProcessorInformationEx, RelationCache, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+        GetLogicalProcessorInformationEx, RelationCache, CACHE_RELATIONSHIP,
+        LOGICAL_PROCESSOR_RELATIONSHIP, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
     };
 
     let mut domains = Vec::new();
@@ -124,24 +125,46 @@ fn detect_caches() -> (Vec<L3Domain>, Vec<CacheInfo>) {
             return (domains, Vec::new());
         }
 
-        let mut buffer = vec![0u8; len as usize];
+        // Back the buffer with u64: SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX needs
+        // 8-byte alignment and a Vec<u8> only guarantees 1.
+        let mut buffer: Vec<u64> = vec![0; (len as usize).div_ceil(8)];
         let ptr = buffer.as_mut_ptr() as *mut SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX;
         if GetLogicalProcessorInformationEx(RelationCache, Some(ptr), &mut len).is_err() {
             return (domains, Vec::new());
         }
 
-        // Records are variable-length; advance by each record's `Size`.
+        // Records are variable-length; advance by each record's `Size`. Every
+        // record begins with Relationship (u32) then Size (u32), and the union
+        // follows at HEADER.
+        //
+        // We read the Cache variant through `read_unaligned` rather than
+        // materialising a `&SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX`: a reference
+        // asserts the whole 80-byte struct is readable (the union is sized by its
+        // largest variant, GROUP_RELATIONSHIP), but real cache records are 56
+        // bytes, so the final record's reference would run past the buffer.
+        const HEADER: usize = 2 * std::mem::size_of::<u32>();
+        let min_record = HEADER + std::mem::size_of::<CACHE_RELATIONSHIP>();
+        let base = buffer.as_ptr() as *const u8;
+        let len = len as usize;
+
         let mut offset: usize = 0;
-        while offset + std::mem::size_of::<u32>() * 2 <= len as usize {
-            let record =
-                &*(buffer.as_ptr().add(offset) as *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX);
-            let size = record.Size as usize;
-            if size == 0 {
+        while offset + HEADER <= len {
+            let size = std::ptr::read_unaligned(
+                base.add(offset + std::mem::size_of::<u32>()) as *const u32
+            ) as usize;
+            // The record must lie wholly inside the buffer and be large enough to
+            // hold the variant we are about to read. Anything else (including the
+            // Size == 0 terminator) ends the walk.
+            if size < min_record || len - offset < size {
                 break;
             }
 
-            if record.Relationship == RelationCache {
-                let cache = &record.Anonymous.Cache;
+            let relationship =
+                std::ptr::read_unaligned(base.add(offset) as *const LOGICAL_PROCESSOR_RELATIONSHIP);
+            if relationship == RelationCache {
+                let cache = std::ptr::read_unaligned(
+                    base.add(offset + HEADER) as *const CACHE_RELATIONSHIP
+                );
                 let group = cache.Anonymous.GroupMask;
                 let base = group.Group as usize * 64;
                 let mask = group.Mask as u64;

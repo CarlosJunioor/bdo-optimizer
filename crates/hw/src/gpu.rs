@@ -53,13 +53,19 @@ pub struct GpuInfo {
     pub backend: String,
     /// Driver name and vendor-supplied version/details when available.
     pub driver: String,
+    /// Raw PCI device id. Identifies the physical adapter across backends, which
+    /// the reported name does not: the GL backend decorates it
+    /// (`"NVIDIA GeForce RTX 4090/PCIe/SSE2"`), so name-keyed dedup lists one
+    /// card twice, while two identical cards share a name and collapse into one.
+    /// Zero when the backend does not report it.
+    pub device_id: u32,
 }
 
 /// Enumerate the host GPUs across all available `wgpu` backends.
 ///
 /// The same physical GPU can surface under several backends (e.g. Vulkan and
-/// DX12); results are deduplicated by name, keeping the discrete variant when
-/// a name appears more than once. Discrete GPUs are returned first.
+/// DX12); results are deduplicated by `(vendor, device_id)`, keeping the discrete
+/// variant when a card appears more than once. Discrete GPUs are returned first.
 ///
 /// Never panics; returns an empty vector when no adapters are available.
 pub fn detect_gpus() -> Vec<GpuInfo> {
@@ -83,6 +89,7 @@ pub fn detect_gpus() -> Vec<GpuInfo> {
                     .filter(|part| !part.is_empty())
                     .collect::<Vec<_>>()
                     .join(" / "),
+                device_id: info.device,
             }
         })
         .collect::<Vec<_>>();
@@ -127,12 +134,24 @@ fn map_device_type(t: wgpu::DeviceType) -> GpuDeviceType {
     }
 }
 
-/// Deduplicate adapters by name (preferring the discrete variant) and sort so
-/// discrete GPUs come first. Pure function, exercised by unit tests.
+/// Deduplicate adapters by physical identity (preferring the discrete variant)
+/// and sort so discrete GPUs come first. Pure function, exercised by unit tests.
+///
+/// Keyed on `(vendor, device_id)` when the backend reports a device id, since the
+/// same card is named differently by different backends and two identical cards
+/// share one name. Falls back to the name when no device id is available.
 fn dedupe_and_sort(adapters: Vec<GpuInfo>) -> Vec<GpuInfo> {
+    fn same_adapter(a: &GpuInfo, b: &GpuInfo) -> bool {
+        if a.device_id != 0 && b.device_id != 0 {
+            a.vendor == b.vendor && a.device_id == b.device_id
+        } else {
+            a.name == b.name
+        }
+    }
+
     let mut deduped: Vec<GpuInfo> = Vec::new();
     for gpu in adapters {
-        if let Some(existing) = deduped.iter_mut().find(|g| g.name == gpu.name) {
+        if let Some(existing) = deduped.iter_mut().find(|g| same_adapter(g, &gpu)) {
             // Prefer the discrete classification if any backend reports it.
             if gpu.device_type == GpuDeviceType::Discrete
                 && existing.device_type != GpuDeviceType::Discrete
@@ -171,13 +190,60 @@ mod tests {
     }
 
     fn gpu(name: &str, vendor: GpuVendor, dt: GpuDeviceType) -> GpuInfo {
+        gpu_with_id(name, vendor, dt, 0)
+    }
+
+    fn gpu_with_id(name: &str, vendor: GpuVendor, dt: GpuDeviceType, device_id: u32) -> GpuInfo {
         GpuInfo {
             name: name.to_string(),
             vendor,
             device_type: dt,
             backend: "Test".to_string(),
             driver: "Test driver".to_string(),
+            device_id,
         }
+    }
+
+    #[test]
+    fn dedupe_matches_one_card_across_differently_named_backends() {
+        // The GL backend decorates the name; same vendor + device id = same card.
+        let input = vec![
+            gpu_with_id(
+                "RTX 4090",
+                GpuVendor::Nvidia,
+                GpuDeviceType::Discrete,
+                0x2684,
+            ),
+            gpu_with_id(
+                "NVIDIA GeForce RTX 4090/PCIe/SSE2",
+                GpuVendor::Nvidia,
+                GpuDeviceType::Other,
+                0x2684,
+            ),
+        ];
+        let out = dedupe_and_sort(input);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].device_type, GpuDeviceType::Discrete);
+    }
+
+    #[test]
+    fn dedupe_keeps_two_identical_cards_apart() {
+        // Two physical 4090s share a name but not a device id slot.
+        let input = vec![
+            gpu_with_id(
+                "RTX 4090",
+                GpuVendor::Nvidia,
+                GpuDeviceType::Discrete,
+                0x2684,
+            ),
+            gpu_with_id(
+                "RTX 4090",
+                GpuVendor::Nvidia,
+                GpuDeviceType::Discrete,
+                0x2685,
+            ),
+        ];
+        assert_eq!(dedupe_and_sort(input).len(), 2);
     }
 
     #[test]

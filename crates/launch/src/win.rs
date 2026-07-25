@@ -317,8 +317,10 @@ pub fn is_elevated() -> bool {
 /// COM is initialized per call (`CoInitializeEx`, apartment-threaded) and
 /// uninitialized before returning.
 pub fn create_shortcut(opts: ShortcutOptions) -> Result<PathBuf, LaunchError> {
-    // Validate the mask up front (parse only; the string is what goes in args).
-    let _ = crate::common::parse_mask_hex(&opts.mask_hex)?;
+    // Parse *and* canonicalise: `parse_mask_hex` accepts "0x555" and "  555 ",
+    // but `start /affinity` wants bare hex. Feeding it the raw text produced a
+    // shortcut whose hidden cmd window died silently.
+    let mask_hex = mask_to_hex(crate::common::parse_mask_hex(&opts.mask_hex)?);
     if !opts.launcher_path.exists() {
         return Err(LaunchError::PathNotFound(opts.launcher_path.clone()));
     }
@@ -341,13 +343,8 @@ pub fn create_shortcut(opts: ShortcutOptions) -> Result<PathBuf, LaunchError> {
     };
 
     let comspec = system_cmd()?;
-    let args = build_cmd_arguments(
-        &opts.mask_hex,
-        opts.steam,
-        &workdir.to_string_lossy(),
-        &filename,
-    );
-    let description = shortcut_description(&opts.mask_hex);
+    let args = build_cmd_arguments(&mask_hex, opts.steam, &workdir.to_string_lossy(), &filename);
+    let description = shortcut_description(&mask_hex);
     let icon = opts.launcher_path.to_string_lossy().to_string();
 
     unsafe {

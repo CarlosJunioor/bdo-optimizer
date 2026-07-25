@@ -162,18 +162,24 @@ pub fn render(ui: &mut egui::Ui, shared: &OverlayShared) {
         .corner_radius(10)
         .inner_margin(Margin::same(12));
 
+    // Drag the whole window by its background (borderless window has no titlebar).
+    // Interact over the full panel rect; a press-drag starts an OS window move.
+    //
+    // This MUST be registered before the panel contents. egui resolves a hit-test
+    // tie in favour of the last-registered widget, so with this after the panel
+    // the full-rect sensor swallowed clicks on the ✕ button underneath it and the
+    // close button never fired. Sensing drag only (not click) keeps clicks flowing
+    // to the widgets registered above it.
+    let full = ui.max_rect();
+    let bg = ui.interact(full, ui.id().with("overlay_drag"), Sense::drag());
+    if bg.drag_started() {
+        ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
+    }
+
     panel.show(ui, |ui| {
         ui.set_width(ui.available_width());
         draw_contents(ui, shared, &snap, affinity);
     });
-
-    // Drag the whole window by its background (borderless window has no titlebar).
-    // Interact over the full panel rect; a press-drag starts an OS window move.
-    let full = ui.max_rect();
-    let bg = ui.interact(full, ui.id().with("overlay_drag"), Sense::click_and_drag());
-    if bg.drag_started() {
-        ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
-    }
 
     // Keep the overlay ticking (~4 Hz) independent of the parent window.
     ui.ctx().request_repaint_after(Duration::from_millis(250));

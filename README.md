@@ -173,8 +173,9 @@ application-data location. Runs are newest-first and can be deleted from the
 session table.
 
 During capture, PresentMon CSV output is written to the operating system's
-temporary directory. The current implementation does not automatically remove
-those temporary CSV files. No benchmark data is uploaded.
+temporary directory and deleted when the capture worker finishes, on every exit
+path including errors. The saved session JSON keeps the raw frame times. No
+benchmark data is uploaded.
 
 ## Platform support
 

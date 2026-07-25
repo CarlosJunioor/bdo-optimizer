@@ -10,11 +10,14 @@
 use std::path::{Path, PathBuf};
 
 use windows::core::PCWSTR;
+use windows::Win32::Foundation::{GetLastError, ERROR_CANCELLED};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-/// `SE_ERR_ACCESSDENIED` — the value `ShellExecuteW` returns (as its `HINSTANCE`)
-/// when the user declines the UAC elevation prompt.
+/// `SE_ERR_ACCESSDENIED` — returned (as the `HINSTANCE`) both when the user
+/// declines the UAC prompt and on a genuine access denial (AppLocker/WDAC, an
+/// execute-denying ACL, elevation disabled by policy). `GetLastError` tells the
+/// two apart: `ERROR_CANCELLED` means the user dismissed the dialog.
 const SE_ERR_ACCESSDENIED: isize = 5;
 
 /// `ShellExecuteW` returns an `HINSTANCE` whose numeric value is `> 32` on
@@ -35,6 +38,12 @@ fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// NUL-terminated UTF-16 for a Windows path, without a lossy UTF-8 round trip.
+fn os_to_wide(s: &std::ffi::OsStr) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    s.encode_wide().chain(std::iter::once(0)).collect()
+}
+
 /// Relaunch this process elevated via `ShellExecuteW`/`runas`.
 ///
 /// Uses [`std::env::current_exe`] for the path to re-run. See [`RelaunchOutcome`]
@@ -52,7 +61,18 @@ fn relaunch_path_as_admin(exe: &Path) -> RelaunchOutcome {
         Err(error) => return RelaunchOutcome::Failed(error),
     };
     let verb_w = to_wide("runas");
-    let file_w = to_wide(&exe.to_string_lossy());
+    // Encode the path exactly rather than round-tripping through lossy UTF-8,
+    // which would rewrite an unpaired surrogate to U+FFFD and hand ShellExecuteW
+    // a different path than the one we validated.
+    let file_w = os_to_wide(exe.as_os_str());
+    // Pin the elevated child's working directory to the exe's own folder. With a
+    // null lpDirectory it inherits *our* CWD, and the current directory still
+    // precedes PATH in the DLL search order — so launching from a writable
+    // location (Downloads, a UNC share) would let a planted DLL load as admin.
+    let dir_w = exe.parent().map(|dir| os_to_wide(dir.as_os_str()));
+    let dir_ptr = dir_w
+        .as_ref()
+        .map_or(PCWSTR::null(), |d| PCWSTR(d.as_ptr()));
 
     // SAFETY: all pointers are to NUL-terminated wide buffers kept alive across
     // the call; ShellExecuteW does not retain them past return.
@@ -62,21 +82,39 @@ fn relaunch_path_as_admin(exe: &Path) -> RelaunchOutcome {
             PCWSTR(verb_w.as_ptr()),
             PCWSTR(file_w.as_ptr()),
             PCWSTR::null(),
-            PCWSTR::null(),
+            dir_ptr,
             SW_SHOWNORMAL,
         )
     };
 
     let code = hinst.0 as isize;
     if code > SHELL_EXECUTE_SUCCESS_THRESHOLD {
-        RelaunchOutcome::Launched
-    } else if code == SE_ERR_ACCESSDENIED {
-        RelaunchOutcome::Cancelled
-    } else {
-        RelaunchOutcome::Failed(format!("ShellExecuteW(runas) failed (code {code})"))
+        return RelaunchOutcome::Launched;
     }
+    if code == SE_ERR_ACCESSDENIED {
+        // SAFETY: reading the calling thread's last-error value; always sound.
+        if unsafe { GetLastError() } == ERROR_CANCELLED {
+            return RelaunchOutcome::Cancelled;
+        }
+        return RelaunchOutcome::Failed(
+            "Windows refused to start an elevated copy. Security policy \
+             (AppLocker/WDAC), file permissions, or a disabled UAC prompt can \
+             cause this."
+                .to_string(),
+        );
+    }
+    RelaunchOutcome::Failed(format!("ShellExecuteW(runas) failed (code {code})"))
 }
 
+/// Resolve the exe path to relaunch, rejecting the obvious nonsense cases.
+///
+/// This is a sanity check, **not** an integrity guarantee: `ShellExecuteW`
+/// re-resolves the path independently, so this is inherently TOCTOU, and nothing
+/// here verifies a signature or that the containing directory is not
+/// user-writable. A portable unsigned build living in a writable folder can be
+/// overwritten by any process running as the same user, and the UAC prompt will
+/// still show the expected name. Code signing plus an install location under
+/// `Program Files` is the real fix.
 fn validated_relaunch_target(exe: &Path) -> Result<PathBuf, String> {
     let exe = exe
         .canonicalize()

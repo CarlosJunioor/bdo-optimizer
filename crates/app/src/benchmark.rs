@@ -184,8 +184,13 @@ impl App {
                     "Choose an affinity mask on Apply before capturing the optimized run."
                         .to_string()
                 } else {
+                    // `mask` is raw user text, which may already carry a 0x
+                    // prefix; and the run is saved with the *observed* running
+                    // mask, not with what was typed here.
                     format!(
-                        "Launch from the optimized shortcut. This run is saved as mask 0x{mask}."
+                        "Launch from the optimized shortcut. Selected mask {}; the run is saved \
+                         with the mask actually observed on the running game.",
+                        mask_text(Some(mask.trim_start_matches("0x").trim_start_matches("0X")))
                     )
                 })
                 .size(12.0)
@@ -564,12 +569,14 @@ impl App {
                         .filter(|selected| **selected)
                         .count();
                     for (i, session) in self.benchmark.sessions.iter().enumerate() {
-                        let metrics = session.metrics();
+                        // Precomputed on load — recomputing here would re-sort the
+                        // whole frame series for every session, every repaint.
+                        let metrics = self.benchmark.metrics.get(i).cloned().flatten();
                         let trusted = session.role != SessionRole::Unknown
                             && session.affinity_verified();
                         if let Some(selected) = self.benchmark.selected.get_mut(i) {
                             ui.add_enabled(
-                                metrics.is_ok() && trusted && (*selected || picked < 2),
+                                metrics.is_some() && trusted && (*selected || picked < 2),
                                 egui::Checkbox::new(selected, "Pick"),
                             )
                             .on_disabled_hover_text(
@@ -604,7 +611,7 @@ impl App {
                             );
                         });
 
-                        if let Ok(metrics) = metrics {
+                        if let Some(metrics) = metrics {
                             ui.label(format::fps(metrics.avg_fps));
                             ui.label(format::fps(metrics.p1_low_fps));
                             ui.label(format::fps(metrics.one_percent_low_integral_fps));
@@ -670,13 +677,15 @@ impl App {
                 .weak(),
         );
 
+        // Same precomputed metrics as the table above — never recomputed per frame.
         let picked: Vec<(_, Metrics)> = self
             .benchmark
             .sessions
             .iter()
             .zip(self.benchmark.selected.iter())
-            .filter(|(_, sel)| **sel)
-            .filter_map(|(session, _)| session.metrics().ok().map(|metrics| (session, metrics)))
+            .zip(self.benchmark.metrics.iter())
+            .filter(|((_, sel), _)| **sel)
+            .filter_map(|((session, _), metrics)| metrics.clone().map(|metrics| (session, metrics)))
             .collect();
 
         if picked.len() < 2 {
@@ -748,11 +757,34 @@ impl App {
                     .color(WARN),
             );
         }
-        let same_affinity = session_a.observed_affinity_mask == session_b.observed_affinity_mask;
+        // Compare parsed masks, not raw text: "0xFFF" and "fff" are the same mask.
+        let parsed_mask = |session: &bdo_bench::Session| {
+            session
+                .observed_affinity_mask
+                .as_deref()
+                .and_then(|mask| bdo_launch::parse_mask_hex(mask).ok())
+        };
+        let same_affinity = match (parsed_mask(session_a), parsed_mask(session_b)) {
+            (Some(a), Some(b)) => a == b,
+            _ => session_a.observed_affinity_mask == session_b.observed_affinity_mask,
+        };
         if same_affinity {
             ui.label(
                 RichText::new("⚠ These runs use the same affinity mask; choose two different masks for an affinity A/B test.")
                     .color(WARN),
+            );
+        }
+        let duration_mismatch =
+            durations_mismatched(metrics_a.duration_seconds, metrics_b.duration_seconds);
+        if duration_mismatch {
+            ui.label(
+                RichText::new(format!(
+                    "⚠ These runs are {:.0}s and {:.0}s long — more than {MAX_DURATION_RATIO:.0}× apart. \
+                     Re-run the shorter one over the same route and duration; this delta reflects \
+                     different workloads, not the mask.",
+                    metrics_a.duration_seconds, metrics_b.duration_seconds
+                ))
+                .color(WARN),
             );
         }
         if metrics_a.low_confidence || metrics_b.low_confidence {
@@ -811,6 +843,7 @@ impl App {
                                     metrics_a.low_confidence || metrics_b.low_confidence,
                                     different_hardware,
                                     same_affinity,
+                                    duration_mismatch,
                                 ),
                             );
                             let percent = percent
@@ -901,12 +934,36 @@ fn comparison_order(first: SessionRole, second: SessionRole) -> Option<(usize, u
     }
 }
 
+/// Largest ratio between two runs' durations still treated as a fair comparison.
+///
+/// Frame-pacing metrics are only comparable across runs of similar length: a
+/// short run samples one scene, a long one averages over many. Two runs whose
+/// durations differ by more than this factor are compared on different workloads,
+/// not on different affinity masks.
+const MAX_DURATION_RATIO: f64 = 2.0;
+
+/// Whether two run durations are too far apart to compare (see
+/// [`MAX_DURATION_RATIO`]). Non-finite or non-positive durations count as
+/// mismatched, since nothing meaningful can be said about them.
+fn durations_mismatched(a_seconds: f64, b_seconds: f64) -> bool {
+    if !a_seconds.is_finite() || !b_seconds.is_finite() || a_seconds <= 0.0 || b_seconds <= 0.0 {
+        return true;
+    }
+    let (short, long) = if a_seconds < b_seconds {
+        (a_seconds, b_seconds)
+    } else {
+        (b_seconds, a_seconds)
+    };
+    long / short > MAX_DURATION_RATIO
+}
+
 fn comparison_is_inconclusive(
     low_confidence: bool,
     different_hardware: bool,
     same_affinity: bool,
+    duration_mismatch: bool,
 ) -> bool {
-    low_confidence || different_hardware || same_affinity
+    low_confidence || different_hardware || same_affinity || duration_mismatch
 }
 
 fn mask_text(mask: Option<&str>) -> String {
@@ -923,7 +980,13 @@ fn running_mask(outcome: Option<&VerifyOutcome>) -> Option<u64> {
 }
 
 fn is_full_affinity(mask: Option<u64>, logical_cores: usize) -> bool {
-    mask == full_affinity_mask(logical_cores)
+    // Both sides must be known. Comparing the Options directly made
+    // `is_full_affinity(None, 0)` true — no running game and no detected CPU
+    // read as "full affinity detected", which is the opposite of the truth.
+    match (mask, full_affinity_mask(logical_cores)) {
+        (Some(mask), Some(full)) => mask == full,
+        _ => false,
+    }
 }
 
 fn full_affinity_mask(logical_cores: usize) -> Option<u64> {
@@ -966,7 +1029,7 @@ fn capture_affinity(
 mod tests {
     use super::{
         capture_affinity, comparison_delta, comparison_is_inconclusive, comparison_order,
-        is_full_affinity,
+        durations_mismatched, is_full_affinity,
     };
     use bdo_bench::SessionRole;
 
@@ -994,8 +1057,36 @@ mod tests {
 
     #[test]
     fn same_affinity_comparison_is_inconclusive() {
-        assert!(comparison_is_inconclusive(false, false, true));
-        assert!(!comparison_is_inconclusive(false, false, false));
+        assert!(comparison_is_inconclusive(false, false, true, false));
+        assert!(!comparison_is_inconclusive(false, false, false, false));
+    }
+
+    #[test]
+    fn full_affinity_needs_both_sides_known() {
+        // Nothing running and no CPU detected yet must not read as "full affinity".
+        assert!(!is_full_affinity(None, 0));
+        assert!(!is_full_affinity(None, 16));
+        assert!(!is_full_affinity(Some(0xffff), 0));
+        // The real case still works.
+        assert!(is_full_affinity(Some(0xffff), 16));
+        assert!(!is_full_affinity(Some(0x5554), 16));
+    }
+
+    #[test]
+    fn mismatched_run_lengths_are_inconclusive() {
+        // A 25s baseline against a 30min run is a workload difference, not a
+        // mask difference — every other gate passes, so this one must not.
+        assert!(durations_mismatched(25.0, 1800.0));
+        assert!(comparison_is_inconclusive(false, false, false, true));
+        // Equal-ish runs stay comparable, in both orderings.
+        assert!(!durations_mismatched(300.0, 320.0));
+        assert!(!durations_mismatched(320.0, 300.0));
+        // Exactly at the ratio is still allowed; past it is not.
+        assert!(!durations_mismatched(100.0, 200.0));
+        assert!(durations_mismatched(100.0, 201.0));
+        // Degenerate durations cannot be compared.
+        assert!(durations_mismatched(0.0, 100.0));
+        assert!(durations_mismatched(f64::NAN, 100.0));
     }
 
     #[test]

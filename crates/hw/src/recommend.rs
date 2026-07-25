@@ -105,16 +105,23 @@ fn apply_x3d_topology(rec: &mut Recommendation, cpu: &CpuInfo) {
 
     match vcache_ccd(&cpu.l3_domains) {
         Some(ccd) => {
-            // Physical cores == even logical ids (SMT siblings are the odd
-            // neighbour). The even-filtered list is exactly the CCD's physical
-            // core count (6 on the 7900X3D, 8 on the 7950X3D), so no further
-            // cap is applied.
-            let mut cores: Vec<usize> = ccd
-                .logical_cores
-                .iter()
-                .copied()
-                .filter(|c| c % 2 == 0)
-                .collect();
+            // With SMT on, physical cores are the even logical ids (the sibling
+            // is the odd neighbour), so the even-filtered list is exactly the
+            // CCD's physical core count (6 on a 12-core X3D, 8 on a 16-core).
+            //
+            // With SMT disabled in BIOS every logical id already *is* a physical
+            // core, and filtering evens would pin BDO to half the V-Cache CCD —
+            // so take the CCD's cores as-is.
+            let smt = cpu.physical_cores > 0 && cpu.logical_cores == cpu.physical_cores * 2;
+            let mut cores: Vec<usize> = if smt {
+                ccd.logical_cores
+                    .iter()
+                    .copied()
+                    .filter(|c| c % 2 == 0)
+                    .collect()
+            } else {
+                ccd.logical_cores.clone()
+            };
             cores.sort_unstable();
 
             if let Ok(mask) = cores_to_mask(&cores) {
@@ -149,21 +156,23 @@ fn apply_x3d_topology(rec: &mut Recommendation, cpu: &CpuInfo) {
 /// Match an AMD Ryzen model string. Returns `(recommendation, is_dual_ccd_x3d)`.
 fn match_amd(m: &str, _cpu: &CpuInfo) -> (Recommendation, bool) {
     // --- Dual-CCD X3D parts: must land on the V-Cache CCD (topology cross-check) ---
-    if m.contains("7950X3D") {
+    // NOTE: the X3D arms must stay above their non-X3D counterparts — "9950X3D"
+    // also contains "9950X", so reordering these silently mis-recommends.
+    if m.contains("7950X3D") || m.contains("9950X3D") {
         return (
             Recommendation::from_mask(
                 "5555",
-                "Ryzen 9 7950X3D (dual-CCD X3D): pin BDO to the 8-core V-Cache CCD, one thread per physical core.",
+                "Ryzen 9 16-core dual-CCD X3D: pin BDO to the 8-core V-Cache CCD, one thread per physical core.",
                 &[],
             ),
             true,
         );
     }
-    if m.contains("7900X3D") {
+    if m.contains("7900X3D") || m.contains("9900X3D") {
         return (
             Recommendation::from_mask(
                 "555",
-                "Ryzen 9 7900X3D (dual-CCD X3D): pin BDO to the 6-core V-Cache CCD, one thread per physical core.",
+                "Ryzen 9 12-core dual-CCD X3D: pin BDO to the 6-core V-Cache CCD, one thread per physical core.",
                 &["554"],
             ),
             true,
@@ -171,7 +180,12 @@ fn match_amd(m: &str, _cpu: &CpuInfo) -> (Recommendation, bool) {
     }
 
     // --- Single-CCX 8-core parts (incl. single-CCD X3D) ---
-    if m.contains("5800X3D") || m.contains("7800X3D") || m.contains("5800X") || m.contains("7800X")
+    if m.contains("5800X3D")
+        || m.contains("7800X3D")
+        || m.contains("9800X3D")
+        || m.contains("5800X")
+        || m.contains("7800X")
+        || m.contains("9700X")
     {
         return (
             Recommendation::from_mask(
@@ -184,7 +198,7 @@ fn match_amd(m: &str, _cpu: &CpuInfo) -> (Recommendation, bool) {
     }
 
     // --- Ryzen 9 non-X3D, 16-core / 2 CCD ---
-    if m.contains("3950X") || m.contains("5950X") || m.contains("7950X") {
+    if m.contains("3950X") || m.contains("5950X") || m.contains("7950X") || m.contains("9950X") {
         return (
             Recommendation::from_mask(
                 "5550000",
@@ -196,7 +210,7 @@ fn match_amd(m: &str, _cpu: &CpuInfo) -> (Recommendation, bool) {
     }
 
     // --- Ryzen 9 non-X3D, 12-core / 2 CCD ---
-    if m.contains("3900") || m.contains("5900X") || m.contains("7900X") {
+    if m.contains("3900") || m.contains("5900X") || m.contains("7900X") || m.contains("9900X") {
         return (
             Recommendation::from_mask(
                 "555000",
@@ -232,7 +246,7 @@ fn match_amd(m: &str, _cpu: &CpuInfo) -> (Recommendation, bool) {
     }
 
     // --- Ryzen 5 6-core, modern (Zen2+) ---
-    if m.contains("3600") || m.contains("5600") || m.contains("7600") {
+    if m.contains("3600") || m.contains("5600") || m.contains("7600") || m.contains("9600") {
         return (
             Recommendation::from_mask("555", "Ryzen 5 6-core: one thread per physical core.", &[]),
             false,
@@ -373,6 +387,33 @@ mod tests {
         assert_eq!(rec.cores, vec![0, 2, 4, 6, 8, 10, 12, 14]);
         // No l3 domains -> not checked.
         assert_eq!(rec.topology_confirmed, None);
+    }
+
+    #[test]
+    fn matches_zen5_x3d_and_non_x3d_parts() {
+        // Zen 5 must resolve, not fall through to "no known profile".
+        let z = |model: &str, p: usize, l: usize| {
+            recommend(&cpu(model, p, l)).mask_hex.unwrap_or_default()
+        };
+        assert_eq!(z("AMD Ryzen 7 9800X3D 8-Core Processor", 8, 16), "5554");
+        assert_eq!(z("AMD Ryzen 9 9950X3D 16-Core Processor", 16, 32), "5555");
+        assert_eq!(z("AMD Ryzen 9 9900X3D 12-Core Processor", 12, 24), "555");
+        assert_eq!(z("AMD Ryzen 7 9700X 8-Core Processor", 8, 16), "5554");
+        assert_eq!(z("AMD Ryzen 5 9600X 6-Core Processor", 6, 12), "555");
+        // The X3D arms must win over their non-X3D substring counterparts.
+        assert_eq!(z("AMD Ryzen 9 9950X 16-Core Processor", 16, 32), "5550000");
+        assert_eq!(z("AMD Ryzen 9 9900X 12-Core Processor", 12, 24), "555000");
+    }
+
+    #[test]
+    fn x3d_topology_keeps_all_cores_when_smt_is_disabled() {
+        // SMT off: 16 physical == 16 logical, V-Cache CCD holds cores 0..7.
+        // Filtering evens here would pin BDO to half the CCD.
+        let mut c = cpu("AMD Ryzen 9 7950X3D 16-Core Processor", 16, 16);
+        c.l3_domains = vec![dom(96, (0..8).collect()), dom(32, (8..16).collect())];
+        let rec = recommend(&c);
+        assert_eq!(rec.cores, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(rec.mask_hex.as_deref(), Some("FF"));
     }
 
     #[test]
