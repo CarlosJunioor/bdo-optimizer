@@ -44,6 +44,7 @@ directories = "6.0.0"
 version = "0.62.2"
 features = [
     "Win32_Foundation",
+    "Win32_Storage_FileSystem",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ]

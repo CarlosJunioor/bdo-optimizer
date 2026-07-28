@@ -731,10 +731,10 @@ impl App {
         let files = found.files.clone();
         ui.horizontal(|ui| {
             if ui.button("Set PostFilter & Tessellation to 0").clicked() {
-                self.run_gameconfig(&files, "apply");
+                self.run_gameconfig(&root, &files, "apply");
             }
             if ui.button("Restore from backup").clicked() {
-                self.run_gameconfig(&files, "restore");
+                self.run_gameconfig(&root, &files, "restore");
             }
         });
 
@@ -788,7 +788,12 @@ impl App {
 
     /// Run a config-file action, refusing while BDO is running (the game
     /// rewrites these files on exit, so an edit would be lost or race).
-    fn run_gameconfig(&mut self, files: &[std::path::PathBuf], action: &'static str) {
+    fn run_gameconfig(
+        &mut self,
+        root: &std::path::Path,
+        files: &[std::path::PathBuf],
+        action: &'static str,
+    ) {
         self.gameconfig.blocked = None;
         // Stale results from an earlier click must not survive next to a fresh
         // warning — they would read as if this click had succeeded.
@@ -807,9 +812,9 @@ impl App {
         // The guard is re-checked before each file, so a launch mid-batch stops
         // the run instead of writing behind the game's back.
         self.gameconfig.outcomes = if action == "apply" {
-            crate::gameconfig::apply_files(files, &game_absent)
+            crate::gameconfig::apply_files(root, files, &game_absent)
         } else {
-            crate::gameconfig::restore_files(files, &game_absent)
+            crate::gameconfig::restore_files(root, files, &game_absent)
         };
         if self
             .gameconfig

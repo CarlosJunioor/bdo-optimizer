@@ -10,15 +10,18 @@
 //! * Anything the parsers do not fully understand is left **verbatim** and not
 //!   counted: a malformed line or an unterminated XML attribute never causes a
 //!   rewrite, so a half-written file cannot be corrupted further.
-//! * Live files and backups are written through a temp sibling plus rename, so
-//!   a crash mid-write cannot leave a truncated config or a truncated backup.
+//! * Live files and backups are written through an exclusively-created temp
+//!   sibling plus an atomic replace that preserves the destination's ACL, so a
+//!   crash mid-write cannot leave a truncated config or a truncated backup.
 //! * Before a file is first modified its original bytes go to
 //!   `<name>.bdo-optimizer.bak`; **Restore** copies those back, and can also
 //!   recreate a live file the game (or the user) deleted.
-//! * Discovered paths are canonicalized and required to stay under the config
-//!   root, so a directory junction under `UserCache` cannot redirect a write.
+//! * Paths are canonicalized and required to stay under the config root both
+//!   at discovery *and* immediately before each write, so a directory junction
+//!   swapped in afterwards cannot redirect one.
 //! * Every file is processed only while `BlackDesert64.exe` is absent — the
-//!   caller's guard is re-checked before each file, not once per batch.
+//!   caller's guard is re-checked before each file, and once it trips the rest
+//!   of the batch is skipped for good.
 
 use std::path::{Path, PathBuf};
 
@@ -49,26 +52,27 @@ pub struct Discovery {
 /// still returned, so **Restore** can put a deleted config back.
 pub fn discover(root: &Path) -> Discovery {
     let mut found = Discovery::default();
-    let consider = |path: PathBuf, found: &mut Discovery| {
-        let live = path.is_file();
-        let recoverable = backup_path(&path).is_file();
-        if (live || recoverable) && is_within(root, &path) && !found.files.contains(&path) {
-            found.files.push(path);
-        }
-    };
 
-    consider(root.join("GameOption.txt"), &mut found);
+    consider(root, root.join("GameOption.txt"), &mut found);
     let user_cache = root.join("UserCache");
-    consider(user_cache.join("gamevariable.xml"), &mut found);
+    consider(root, user_cache.join("gamevariable.xml"), &mut found);
 
     match std::fs::read_dir(&user_cache) {
         Ok(entries) => {
             for entry in entries {
                 match entry {
-                    Ok(entry) if entry.path().is_dir() => {
-                        consider(entry.path().join("gamevariable.xml"), &mut found);
-                    }
-                    Ok(_) => {}
+                    Ok(entry) => match entry.file_type() {
+                        Ok(kind) if kind.is_dir() => {
+                            consider(root, entry.path().join("gamevariable.xml"), &mut found);
+                        }
+                        Ok(_) => {}
+                        // A directory we cannot even classify must be reported;
+                        // treating the error as "not a directory" would hide a
+                        // whole account's config behind a clean-looking scan.
+                        Err(e) => found
+                            .unreadable
+                            .push(format!("{}: {e}", entry.path().display())),
+                    },
                     Err(e) => found
                         .unreadable
                         .push(format!("{}: {e}", user_cache.display())),
@@ -81,6 +85,27 @@ pub fn discover(root: &Path) -> Discovery {
             .push(format!("{}: {e}", user_cache.display())),
     }
     found
+}
+
+fn consider(root: &Path, path: PathBuf, found: &mut Discovery) {
+    let live = is_readable_file(&path, found);
+    let recoverable = is_readable_file(&backup_path(&path), found);
+    if (live || recoverable) && is_within(root, &path) && !found.files.contains(&path) {
+        found.files.push(path);
+    }
+}
+
+/// Whether `path` is a regular file, recording *why* when the answer could not
+/// be determined. A permission error must not silently read as "absent".
+fn is_readable_file(path: &Path, found: &mut Discovery) -> bool {
+    match std::fs::metadata(path) {
+        Ok(m) => m.is_file(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            found.unreadable.push(format!("{}: {e}", path.display()));
+            false
+        }
+    }
 }
 
 /// True when `path` really lives under `root` after resolving symlinks and
@@ -250,26 +275,48 @@ pub enum FileChange {
     Skipped,
 }
 
-/// Back up (first time only) and patch every file.
+/// Run `act` over every path, stopping for good the first time `safe` says the
+/// environment changed.
 ///
-/// `safe` is re-checked before each file so a batch stops as soon as the
-/// environment changes (e.g. BDO launching mid-run); remaining files report
-/// [`FileChange::Skipped`] rather than being written behind the game's back.
-pub fn apply_files(paths: &[PathBuf], safe: &dyn Fn() -> bool) -> Vec<FileOutcome> {
+/// The stop is **latched**: once unsafe, every remaining file reports
+/// [`FileChange::Skipped`] even if the condition flickers back. Re-checking
+/// independently would let a run the UI describes as "stopped early" keep
+/// writing files afterwards.
+fn run_over(
+    root: &Path,
+    paths: &[PathBuf],
+    safe: &dyn Fn() -> bool,
+    act: impl Fn(&Path, &Path) -> Result<FileChange, String>,
+) -> Vec<FileOutcome> {
+    let mut stopped = false;
     paths
         .iter()
-        .map(|path| FileOutcome {
-            path: path.clone(),
-            result: if safe() {
-                apply_one(path)
-            } else {
-                Ok(FileChange::Skipped)
-            },
+        .map(|path| {
+            if !stopped && !safe() {
+                stopped = true;
+            }
+            FileOutcome {
+                path: path.clone(),
+                result: if stopped {
+                    Ok(FileChange::Skipped)
+                } else {
+                    act(root, path)
+                },
+            }
         })
         .collect()
 }
 
-fn apply_one(path: &Path) -> Result<FileChange, String> {
+/// Back up (first time only) and patch every file.
+pub fn apply_files(root: &Path, paths: &[PathBuf], safe: &dyn Fn() -> bool) -> Vec<FileOutcome> {
+    run_over(root, paths, safe, apply_one)
+}
+
+fn apply_one(root: &Path, path: &Path) -> Result<FileChange, String> {
+    // Re-checked here, not just at discovery: a junction swapped in afterwards
+    // would otherwise redirect this write outside the config root — with
+    // administrator rights when the app was relaunched elevated.
+    guard_within(root, path)?;
     let bytes = std::fs::read(path).map_err(|e| format!("read failed: {e}"))?;
     let text = String::from_utf8(bytes).map_err(|_| "unexpected non-UTF-8 content".to_string())?;
     let is_xml = path
@@ -298,21 +345,12 @@ fn apply_one(path: &Path) -> Result<FileChange, String> {
 }
 
 /// Copy each file's backup over the live file, recreating it if it is gone.
-pub fn restore_files(paths: &[PathBuf], safe: &dyn Fn() -> bool) -> Vec<FileOutcome> {
-    paths
-        .iter()
-        .map(|path| FileOutcome {
-            path: path.clone(),
-            result: if safe() {
-                restore_one(path)
-            } else {
-                Ok(FileChange::Skipped)
-            },
-        })
-        .collect()
+pub fn restore_files(root: &Path, paths: &[PathBuf], safe: &dyn Fn() -> bool) -> Vec<FileOutcome> {
+    run_over(root, paths, safe, restore_one)
 }
 
-fn restore_one(path: &Path) -> Result<FileChange, String> {
+fn restore_one(root: &Path, path: &Path) -> Result<FileChange, String> {
+    guard_within(root, path)?;
     let backup = backup_path(path);
     let usable = std::fs::metadata(&backup).is_ok_and(|m| m.is_file() && m.len() > 0);
     if !usable {
@@ -323,8 +361,17 @@ fn restore_one(path: &Path) -> Result<FileChange, String> {
     Ok(FileChange::Restored)
 }
 
-/// Write via a temp sibling + rename so the destination is never observed
-/// half-written: readers see either the old bytes or the new ones.
+/// Reject a path that no longer resolves inside the config root.
+fn guard_within(root: &Path, path: &Path) -> Result<(), String> {
+    if is_within(root, path) {
+        Ok(())
+    } else {
+        Err("resolves outside the BDO config folder — refusing to touch it".to_string())
+    }
+}
+
+/// Write via a temp sibling + atomic replace so the destination is never
+/// observed half-written: readers see either the old bytes or the new ones.
 fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     write_atomic_bytes(path, contents.as_bytes())
 }
@@ -332,22 +379,90 @@ fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
 fn write_atomic_bytes(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".{}.tmp", std::process::id()));
-    let tmp = path.with_file_name(name);
-
-    let mut file = std::fs::File::create(&tmp)?;
+    let (mut file, tmp) = create_temp_sibling(path)?;
     let write = file
         .write_all(contents)
-        // Flush to disk before the rename; otherwise a crash can leave the
+        // Flush to disk before the replace; otherwise a crash can leave the
         // renamed file present but empty.
         .and_then(|()| file.sync_all());
     drop(file);
-    if let Err(e) = write.and_then(|()| std::fs::rename(&tmp, path)) {
+    if let Err(e) = write.and_then(|()| replace_file(&tmp, path)) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
     Ok(())
+}
+
+/// Create an exclusively-owned temp file next to `path`.
+///
+/// `create_new` is the important part: it fails when the name already exists,
+/// so a pre-positioned file or reparse point cannot be followed and truncated.
+/// The name also varies per attempt, so a squatter cannot camp one guess.
+fn create_temp_sibling(path: &Path) -> std::io::Result<(std::fs::File, PathBuf)> {
+    let pid = std::process::id();
+    for attempt in 0..64u32 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(attempt);
+        let mut name = path.file_name().unwrap_or_default().to_os_string();
+        name.push(format!(".{pid}-{nanos}-{attempt}.tmp"));
+        let candidate = path.with_file_name(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((file, candidate)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::other(
+        "could not create a temporary file next to the config",
+    ))
+}
+
+/// Atomically put `tmp` in place of `dest`.
+///
+/// On Windows this prefers `ReplaceFileW`, which keeps the *destination's*
+/// security descriptor and attributes. A plain rename would silently hand the
+/// config the temp file's inherited ACL instead, discarding permissions the
+/// user (or the game) set on it. Falls back to `rename` when the destination
+/// does not exist yet — restore recreating a deleted file — or when the API
+/// declines.
+fn replace_file(tmp: &Path, dest: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    if dest.exists() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::{ReplaceFileW, REPLACE_FILE_FLAGS};
+
+        let wide = |p: &Path| -> Vec<u16> {
+            p.as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect()
+        };
+        let dest_w = wide(dest);
+        let tmp_w = wide(tmp);
+        // SAFETY: both buffers are NUL-terminated and outlive the call; the
+        // optional backup/reserved parameters are null.
+        let replaced = unsafe {
+            ReplaceFileW(
+                PCWSTR(dest_w.as_ptr()),
+                PCWSTR(tmp_w.as_ptr()),
+                PCWSTR::null(),
+                REPLACE_FILE_FLAGS(0),
+                None,
+                None,
+            )
+        };
+        if replaced.is_ok() {
+            return Ok(());
+        }
+    }
+    std::fs::rename(tmp, dest)
 }
 
 fn backup_path(path: &Path) -> PathBuf {
@@ -470,7 +585,7 @@ mod tests {
         let dir = temp_dir("norecognize");
         let file = dir.join("GameOption.txt");
         std::fs::write(&file, "version = 1002\r\n").unwrap();
-        let out = apply_files(&[file], always_safe());
+        let out = apply_files(&dir, &[file], always_safe());
         assert_eq!(
             out[0].result.as_ref().unwrap(),
             &FileChange::NothingRecognized
@@ -486,20 +601,20 @@ mod tests {
         std::fs::write(&file, GAME_OPTION).unwrap();
         let paths = vec![file.clone()];
 
-        let applied = apply_files(&paths, always_safe());
+        let applied = apply_files(&dir, &paths, always_safe());
         assert_eq!(applied[0].result.as_ref().unwrap(), &FileChange::Patched(2));
         let backup = dir.join(format!("GameOption.txt{BACKUP_SUFFIX}"));
         assert_eq!(std::fs::read_to_string(&backup).unwrap(), GAME_OPTION);
 
         // A second apply is a no-op and must not clobber the backup.
-        let again = apply_files(&paths, always_safe());
+        let again = apply_files(&dir, &paths, always_safe());
         assert_eq!(
             again[0].result.as_ref().unwrap(),
             &FileChange::AlreadyOptimized
         );
         assert_eq!(std::fs::read_to_string(&backup).unwrap(), GAME_OPTION);
 
-        let restored = restore_files(&paths, always_safe());
+        let restored = restore_files(&dir, &paths, always_safe());
         assert_eq!(restored[0].result.as_ref().unwrap(), &FileChange::Restored);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), GAME_OPTION);
 
@@ -516,7 +631,7 @@ mod tests {
         std::fs::write(&backup, "").unwrap();
 
         let paths = vec![file.clone()];
-        apply_files(&paths, always_safe());
+        apply_files(&dir, &paths, always_safe());
         assert_eq!(std::fs::read_to_string(&backup).unwrap(), GAME_OPTION);
 
         std::fs::remove_dir_all(dir).unwrap();
@@ -537,7 +652,7 @@ mod tests {
         let discovered = discover(&dir);
         assert!(discovered.files.contains(&root_files));
 
-        let restored = restore_files(&discovered.files, always_safe());
+        let restored = restore_files(&dir, &discovered.files, always_safe());
         assert_eq!(restored[0].result.as_ref().unwrap(), &FileChange::Restored);
         assert_eq!(std::fs::read_to_string(&root_files).unwrap(), GAME_OPTION);
 
@@ -549,7 +664,7 @@ mod tests {
         let dir = temp_dir("nobak");
         let file = dir.join("GameOption.txt");
         std::fs::write(&file, GAME_OPTION).unwrap();
-        let out = restore_files(std::slice::from_ref(&file), always_safe());
+        let out = restore_files(&dir, std::slice::from_ref(&file), always_safe());
         assert_eq!(out[0].result.as_ref().unwrap(), &FileChange::NoBackup);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), GAME_OPTION);
         std::fs::remove_dir_all(dir).unwrap();
@@ -560,9 +675,69 @@ mod tests {
         let dir = temp_dir("guard");
         let file = dir.join("GameOption.txt");
         std::fs::write(&file, GAME_OPTION).unwrap();
-        let out = apply_files(std::slice::from_ref(&file), &|| false);
+        let out = apply_files(&dir, std::slice::from_ref(&file), &|| false);
         assert_eq!(out[0].result.as_ref().unwrap(), &FileChange::Skipped);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), GAME_OPTION);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stop_is_latched_once_the_guard_trips() {
+        // A flickering guard must not let later files be written after the UI
+        // has already reported that the run stopped early.
+        let dir = temp_dir("latch");
+        let mut paths = Vec::new();
+        for i in 0..3 {
+            let file = dir.join(format!("GameOption{i}.txt"));
+            std::fs::write(&file, GAME_OPTION).unwrap();
+            paths.push(file);
+        }
+        let calls = std::cell::Cell::new(0);
+        let flickering = || {
+            calls.set(calls.get() + 1);
+            calls.get() != 2 // safe, unsafe, safe…
+        };
+        let out = apply_files(&dir, &paths, &flickering);
+        assert_eq!(out[0].result.as_ref().unwrap(), &FileChange::Patched(2));
+        assert_eq!(out[1].result.as_ref().unwrap(), &FileChange::Skipped);
+        assert_eq!(out[2].result.as_ref().unwrap(), &FileChange::Skipped);
+        // The third file must still hold its original bytes.
+        assert_eq!(std::fs::read_to_string(&paths[2]).unwrap(), GAME_OPTION);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn writes_outside_the_root_are_refused() {
+        let root = temp_dir("rootguard");
+        let outside = temp_dir("outside");
+        let stray = outside.join("GameOption.txt");
+        std::fs::write(&stray, GAME_OPTION).unwrap();
+
+        let out = apply_files(&root, std::slice::from_ref(&stray), always_safe());
+        assert!(out[0].result.is_err(), "{:?}", out[0].result);
+        assert_eq!(std::fs::read_to_string(&stray).unwrap(), GAME_OPTION);
+
+        let out = restore_files(&root, std::slice::from_ref(&stray), always_safe());
+        assert!(out[0].result.is_err());
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn atomic_write_leaves_no_temp_files_behind() {
+        let dir = temp_dir("notemp");
+        let file = dir.join("GameOption.txt");
+        std::fs::write(&file, GAME_OPTION).unwrap();
+        apply_files(&dir, std::slice::from_ref(&file), always_safe());
+
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -618,12 +793,12 @@ mod tests {
             "no config files under {}",
             root.display()
         );
-        for outcome in apply_files(&found.files, always_safe()) {
+        for outcome in apply_files(&root, &found.files, always_safe()) {
             println!("{} -> {:?}", outcome.path.display(), outcome.result);
             outcome.result.expect("patch failed");
         }
         // Idempotence on the real data: a second apply changes nothing.
-        for outcome in apply_files(&found.files, always_safe()) {
+        for outcome in apply_files(&root, &found.files, always_safe()) {
             let change = outcome.result.expect("second apply failed");
             assert!(
                 matches!(

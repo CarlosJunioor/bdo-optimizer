@@ -316,11 +316,15 @@ pub mod worker {
         //    child for it to re-open.
         let job_dir = create_private_dir()?;
         let nip = job_dir.join("profile.nip");
-        let write = std::fs::write(&nip, super::utf16le_bytes(&super::nip_xml(settings)))
-            .map_err(|e| format!("could not write {}: {e}", nip.display()));
-        let import = write.and_then(|()| {
+        let import = write_payload(&nip, settings).and_then(|payload| {
+            // Hold the payload open with FILE_SHARE_READ for the whole import.
+            // Writing then closing it would leave a window in which another
+            // process could swap the file the elevated child re-opens by path;
+            // this handle lets the child read it and nobody rewrite it.
             let nip_arg = nip.to_string_lossy().into_owned();
-            run_inspector(exe, &["-mergeImport", "-silentImport", &nip_arg])
+            let result = run_inspector(exe, &["-mergeImport", "-silentImport", &nip_arg]);
+            drop(payload);
+            result
         });
         let _ = std::fs::remove_dir_all(&job_dir);
         import?;
@@ -328,21 +332,27 @@ pub mod worker {
         // 2. The silent import reports nothing, so verify through an export.
         let before: HashSet<PathBuf> = export_files(&exe_dir).into_iter().collect();
         run_inspector(exe, &["-exportCustomized"])?;
-        let mut created: Vec<PathBuf> = export_files(&exe_dir)
+        let created: Vec<PathBuf> = export_files(&exe_dir)
             .into_iter()
             .filter(|p| !before.contains(p))
             .collect();
-        // `read_dir` order is unspecified; the newest file is the one this run
-        // just produced. Only that file is consumed and deleted, so a concurrent
-        // manual export is never swallowed.
-        created.sort_by_key(|p| {
-            std::fs::metadata(p)
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-        });
-        let export = created
-            .last()
-            .ok_or_else(|| "verification export produced no file".to_string())?;
+        // The export lands next to the executable under a timestamped name we
+        // do not choose, so the only sound attribution is "exactly one new file
+        // appeared". Picking the newest of several would happily verify — and
+        // delete — an export another process made; refusing is the honest
+        // answer, and in practice there is always exactly one.
+        let export = match created.as_slice() {
+            [only] => only,
+            [] => return Err("verification export produced no file".to_string()),
+            many => {
+                return Err(format!(
+                    "{} new Profile Inspector exports appeared at once, so this run's own \
+                     export could not be identified. Close any other Profile Inspector \
+                     window and try again.",
+                    many.len()
+                ))
+            }
+        };
         let bytes = std::fs::read(export)
             .map_err(|e| format!("could not read {}: {e}", export.display()))?;
         let _ = std::fs::remove_file(export);
@@ -366,6 +376,14 @@ pub mod worker {
                 kept.display()
             ))
         }
+    }
+
+    /// Write the import payload and return a handle that keeps it unmodifiable
+    /// (read-shared only) for as long as it is held.
+    fn write_payload(nip: &Path, settings: &[(u32, u32)]) -> Result<std::fs::File, String> {
+        std::fs::write(nip, super::utf16le_bytes(&super::nip_xml(settings)))
+            .map_err(|e| format!("could not write {}: {e}", nip.display()))?;
+        super::open_locked(nip).map_err(|e| format!("could not lock {}: {e}", nip.display()))
     }
 
     /// Create a fresh, exclusively-owned directory under the temp dir.
