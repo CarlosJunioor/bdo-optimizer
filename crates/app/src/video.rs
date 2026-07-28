@@ -250,7 +250,6 @@ pub fn expected_locations() -> [String; 2] {
 /// helpers above (unit-testable everywhere).
 #[cfg(windows)]
 pub mod worker {
-    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc::{channel, Receiver};
     use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -330,45 +329,26 @@ pub mod worker {
         import?;
 
         // 2. The silent import reports nothing, so verify through an export.
-        // Fingerprint what is already there, then look for what changed.
         //
-        // The export name carries only a second-resolution timestamp, so a
-        // quick second run overwrites the previous name instead of adding one.
-        // Matching on "new pathname" alone would miss that and cry failure
-        // after a successful apply. Comparing each file against *its own*
-        // earlier size and mtime avoids that without assuming anything about
-        // wall-clock direction or timestamp granularity: an untouched file
-        // compares equal, and a rewritten one cannot.
-        let before = export_fingerprints(&exe_dir);
+        // The export lands beside the executable under a timestamped name we do
+        // not choose, and that name has only second resolution — so *inferring*
+        // which file is ours is unreliable in both directions: a quick retry
+        // overwrites the previous name (looks like nothing happened), while a
+        // stale export left by someone else looks like ours. Rather than guess,
+        // move any existing exports aside first. Whatever is present afterwards
+        // was produced by this run, and the guard puts the originals back on
+        // every exit path, so nobody else's file is consumed or deleted.
+        let stash = stash_exports(&exe_dir)?;
         run_inspector(exe, &["-exportCustomized"])?;
-        let present = export_files(&exe_dir);
-        let changed: Vec<PathBuf> = present
-            .iter()
-            .filter(|p| before.get(*p) != Some(&fingerprint(p)))
-            .cloned()
-            .collect();
-        // A same-name overwrite can leave size and timestamp identical when the
-        // filesystem's write-time resolution is coarse (FAT rounds to two
-        // seconds), so "nothing changed" is not proof nothing was written. When
-        // exactly one export exists it is unambiguous regardless: use it.
-        let created: Vec<PathBuf> = if changed.is_empty() && present.len() == 1 {
-            present.clone()
-        } else {
-            changed
-        };
-        // The export lands next to the executable under a timestamped name we
-        // do not choose, so the only sound attribution is "exactly one new file
-        // appeared". Picking the newest of several would happily verify — and
-        // delete — an export another process made; refusing is the honest
-        // answer, and in practice there is always exactly one.
+        let created = export_files(&exe_dir);
         let export = match created.as_slice() {
             [only] => only,
             [] => return Err("verification export produced no file".to_string()),
             many => {
                 return Err(format!(
-                    "{} new Profile Inspector exports appeared at once, so this run's own \
-                     export could not be identified. Close any other Profile Inspector \
-                     window and try again.",
+                    "Profile Inspector produced {} exports at once, so this run's own export \
+                     could not be identified. Close any other Profile Inspector window and \
+                     try again.",
                     many.len()
                 ))
             }
@@ -376,6 +356,7 @@ pub mod worker {
         let bytes = std::fs::read(export)
             .map_err(|e| format!("could not read {}: {e}", export.display()))?;
         let _ = std::fs::remove_file(export);
+        drop(stash);
 
         if super::export_confirms(&super::decode_export(&bytes), settings) {
             Ok(format!(
@@ -474,21 +455,39 @@ pub mod worker {
         Err("could not create a private temp directory".to_string())
     }
 
-    /// Size and modification time of one file, or `None` if it cannot be read.
-    fn fingerprint(path: &Path) -> Option<(u64, std::time::SystemTime)> {
-        let meta = std::fs::metadata(path).ok()?;
-        Some((meta.len(), meta.modified().ok()?))
+    /// Pre-existing exports moved out of the way, restored when dropped.
+    ///
+    /// This is what makes export attribution exact instead of inferred: with
+    /// the directory cleared of other exports, anything present afterwards came
+    /// from this run. The originals are renamed, never copied or deleted, and
+    /// come back on every exit path including errors and panics.
+    struct StashedExports(Vec<(PathBuf, PathBuf)>);
+
+    impl Drop for StashedExports {
+        fn drop(&mut self) {
+            for (stashed, original) in self.0.drain(..) {
+                let _ = std::fs::rename(stashed, original);
+            }
+        }
     }
 
-    /// Fingerprint every export file currently beside the inspector.
-    fn export_fingerprints(dir: &Path) -> HashMap<PathBuf, Option<(u64, std::time::SystemTime)>> {
-        export_files(dir)
-            .into_iter()
-            .map(|p| {
-                let f = fingerprint(&p);
-                (p, f)
-            })
-            .collect()
+    /// Move every existing export aside. The stash name deliberately does not
+    /// end in `.nip`, so [`export_files`] cannot see the stashed copies.
+    fn stash_exports(dir: &Path) -> Result<StashedExports, String> {
+        let mut moved = StashedExports(Vec::new());
+        for original in export_files(dir) {
+            let mut name = original.file_name().unwrap_or_default().to_os_string();
+            name.push(format!(".bdo-optimizer-stash-{}", std::process::id()));
+            let stashed = original.with_file_name(name);
+            std::fs::rename(&original, &stashed).map_err(|e| {
+                format!(
+                    "could not move the existing export {} aside: {e}",
+                    original.display()
+                )
+            })?;
+            moved.0.push((stashed, original));
+        }
+        Ok(moved)
     }
 
     /// Every `CustomProfiles_*.nip` currently next to the inspector executable.
@@ -589,6 +588,35 @@ pub mod worker {
             assert!(writer.is_err(), "payload must not be writable while held");
 
             drop(held);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        /// Someone else's export must be invisible while ours is identified,
+        /// and must come back afterwards — never consumed or deleted.
+        #[test]
+        fn stashing_hides_then_restores_existing_exports() {
+            let dir = create_private_dir().expect("dir");
+            let theirs = dir.join("CustomProfiles_2020-01-01_00-00-00.nip");
+            std::fs::write(&theirs, "someone else's export").unwrap();
+
+            {
+                let _stash = stash_exports(&dir).expect("stash");
+                assert!(
+                    export_files(&dir).is_empty(),
+                    "a stashed export must not look like this run's output"
+                );
+                // Whatever appears now is unambiguously ours.
+                let ours = dir.join("CustomProfiles_2026-07-28_12-00-00.nip");
+                std::fs::write(&ours, "ours").unwrap();
+                assert_eq!(export_files(&dir), vec![ours.clone()]);
+                std::fs::remove_file(&ours).unwrap();
+            }
+
+            assert_eq!(
+                std::fs::read_to_string(&theirs).unwrap(),
+                "someone else's export",
+                "the pre-existing export must be restored untouched"
+            );
             let _ = std::fs::remove_dir_all(dir);
         }
 
