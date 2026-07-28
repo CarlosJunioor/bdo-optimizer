@@ -341,10 +341,21 @@ pub mod worker {
         // compares equal, and a rewritten one cannot.
         let before = export_fingerprints(&exe_dir);
         run_inspector(exe, &["-exportCustomized"])?;
-        let created: Vec<PathBuf> = export_files(&exe_dir)
-            .into_iter()
-            .filter(|p| before.get(p) != Some(&fingerprint(p)))
+        let present = export_files(&exe_dir);
+        let changed: Vec<PathBuf> = present
+            .iter()
+            .filter(|p| before.get(*p) != Some(&fingerprint(p)))
+            .cloned()
             .collect();
+        // A same-name overwrite can leave size and timestamp identical when the
+        // filesystem's write-time resolution is coarse (FAT rounds to two
+        // seconds), so "nothing changed" is not proof nothing was written. When
+        // exactly one export exists it is unambiguous regardless: use it.
+        let created: Vec<PathBuf> = if changed.is_empty() && present.len() == 1 {
+            present.clone()
+        } else {
+            changed
+        };
         // The export lands next to the executable under a timestamped name we
         // do not choose, so the only sound attribution is "exactly one new file
         // appeared". Picking the newest of several would happily verify — and

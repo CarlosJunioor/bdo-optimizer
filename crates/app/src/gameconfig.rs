@@ -389,14 +389,14 @@ fn apply_one(root: &Path, path: &Path) -> Result<FileChange, String> {
         // way back.
         Err(e) => return Err(format!("could not inspect the backup: {e}")),
     }
-    // Whatever route got us here, refuse to touch the live file unless a
-    // readable, non-empty restore point is actually present.
-    let usable = std::fs::metadata(&backup)
-        .map(|m| m.is_file() && m.len() > 0)
-        .unwrap_or(false);
-    if !usable {
+    // Whatever route got us here, refuse to touch the live file unless the
+    // restore point can actually be *read back*. Metadata alone is not enough:
+    // an ACL-restricted file, or an offline OneDrive placeholder whose contents
+    // are not local, reports a healthy size and then fails at restore time —
+    // exactly when it is needed and too late to matter.
+    if !backup_is_readable(&backup) {
         return Err(format!(
-            "no usable backup at {} — refusing to modify the config",
+            "the backup at {} could not be read back — refusing to modify the config",
             backup.display()
         ));
     }
@@ -623,6 +623,26 @@ fn write_atomic_bytes(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 struct Replace {
     error: std::io::Error,
     consumed: bool,
+}
+
+/// Whether the backup is genuinely usable: present, non-empty, and readable.
+///
+/// Reads a byte rather than trusting `metadata`, so a file whose bytes are not
+/// actually retrievable cannot pass as a restore point.
+fn backup_is_readable(backup: &Path) -> bool {
+    use std::io::Read;
+
+    let Ok(meta) = std::fs::metadata(backup) else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() == 0 {
+        return false;
+    }
+    let Ok(mut file) = std::fs::File::open(backup) else {
+        return false;
+    };
+    let mut byte = [0u8; 1];
+    matches!(file.read(&mut byte), Ok(1))
 }
 
 /// Write `contents` to `path` only if nothing is there, leaving any existing
@@ -1103,6 +1123,26 @@ mod tests {
             GAME_OPTION,
             "the live file must be untouched when no backup could be made"
         );
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_backup_does_not_pass_as_a_restore_point() {
+        let dir = temp_dir("unreadablebak");
+        let backup = dir.join("x.bak");
+        // Present and non-empty by metadata, but a directory cannot be read as
+        // a file — standing in for any backup whose bytes are not retrievable.
+        std::fs::write(&backup, "content").unwrap();
+        assert!(backup_is_readable(&backup));
+
+        std::fs::remove_file(&backup).unwrap();
+        std::fs::create_dir(&backup).unwrap();
+        assert!(!backup_is_readable(&backup));
+
+        let empty = dir.join("empty.bak");
+        std::fs::write(&empty, "").unwrap();
+        assert!(!backup_is_readable(&empty));
 
         std::fs::remove_dir_all(dir).unwrap();
     }
