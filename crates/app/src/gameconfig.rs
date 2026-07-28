@@ -380,7 +380,25 @@ fn apply_one(root: &Path, path: &Path) -> Result<FileChange, String> {
         // Nothing there: create, never replace. A backup that appears in the
         // gap is an *older* copy of the file and therefore the better restore
         // point, so losing that race must not overwrite it.
-        Err(_) => write_new_only(&backup, &text).map_err(|e| format!("backup failed: {e}"))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            write_new_only(&backup, &text).map_err(|e| format!("backup failed: {e}"))?
+        }
+        // A permission or transient error is *not* "missing". Treating it as
+        // missing would fall through to a create that accepts a collision as
+        // success, and the live file would then be modified with no verified
+        // way back.
+        Err(e) => return Err(format!("could not inspect the backup: {e}")),
+    }
+    // Whatever route got us here, refuse to touch the live file unless a
+    // readable, non-empty restore point is actually present.
+    let usable = std::fs::metadata(&backup)
+        .map(|m| m.is_file() && m.len() > 0)
+        .unwrap_or(false);
+    if !usable {
+        return Err(format!(
+            "no usable backup at {} — refusing to modify the config",
+            backup.display()
+        ));
     }
     write_atomic(path, &patched).map_err(|e| format!("write failed: {e}"))?;
     Ok(FileChange::Patched(stats.changed))
@@ -543,9 +561,18 @@ fn pin_dir(dir: &Path) -> Result<std::fs::File, String> {
             .open(dir)
             .map_err(|e| format!("could not pin {}: {e}", dir.display()))?;
 
-        if is_name_surrogate(&handle)
-            .map_err(|e| format!("could not classify {}: {e}", dir.display()))?
-        {
+        let surrogate = match is_name_surrogate(&handle) {
+            Ok(answer) => answer,
+            // A filesystem that does not implement the query (some remote or
+            // third-party ones) still needs an answer. Falling back to the
+            // path-based check is weaker — it is a second lookup — but a hard
+            // failure would make the feature unusable there for no safety gain.
+            Err(_) => std::fs::symlink_metadata(dir)
+                .map_err(|e| format!("could not inspect {}: {e}", dir.display()))?
+                .file_type()
+                .is_symlink(),
+        };
+        if surrogate {
             return Err(format!(
                 "{} is a link — refusing to write through it",
                 dir.display()
@@ -1055,6 +1082,27 @@ mod tests {
         let fresh = dir.join("fresh.bak");
         write_new_only(&fresh, "written").unwrap();
         assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "written");
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_directory_where_the_backup_belongs_blocks_the_patch() {
+        // Stands in for any case where the backup cannot be established: the
+        // live file must be left alone rather than modified with no way back.
+        let dir = temp_dir("nobackuppossible");
+        let file = dir.join("GameOption.txt");
+        std::fs::write(&file, GAME_OPTION).unwrap();
+        // A directory at the backup's exact path cannot be written as a file.
+        std::fs::create_dir(dir.join(format!("GameOption.txt{BACKUP_SUFFIX}"))).unwrap();
+
+        let out = apply_files(&dir, std::slice::from_ref(&file), always_safe());
+        assert!(out[0].result.is_err(), "{:?}", out[0].result);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            GAME_OPTION,
+            "the live file must be untouched when no backup could be made"
+        );
 
         std::fs::remove_dir_all(dir).unwrap();
     }

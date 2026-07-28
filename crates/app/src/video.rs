@@ -250,7 +250,7 @@ pub fn expected_locations() -> [String; 2] {
 /// helpers above (unit-testable everywhere).
 #[cfg(windows)]
 pub mod worker {
-    use std::collections::HashSet;
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc::{channel, Receiver};
     use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -330,17 +330,20 @@ pub mod worker {
         import?;
 
         // 2. The silent import reports nothing, so verify through an export.
-        let before: HashSet<PathBuf> = export_files(&exe_dir).into_iter().collect();
+        // Fingerprint what is already there, then look for what changed.
+        //
+        // The export name carries only a second-resolution timestamp, so a
+        // quick second run overwrites the previous name instead of adding one.
+        // Matching on "new pathname" alone would miss that and cry failure
+        // after a successful apply. Comparing each file against *its own*
+        // earlier size and mtime avoids that without assuming anything about
+        // wall-clock direction or timestamp granularity: an untouched file
+        // compares equal, and a rewritten one cannot.
+        let before = export_fingerprints(&exe_dir);
         run_inspector(exe, &["-exportCustomized"])?;
-        // Attribution is by pathname alone. Timestamps were tried and dropped:
-        // they depend on clock direction and filesystem granularity, and a
-        // wrong-but-plausible match is worse here than a clear failure. If a
-        // stale export from the same wall-clock second already occupies the
-        // name, this run reports "no file" and the user retries — failing
-        // closed, never verifying against a file that is not ours.
         let created: Vec<PathBuf> = export_files(&exe_dir)
             .into_iter()
-            .filter(|p| !before.contains(p))
+            .filter(|p| before.get(p) != Some(&fingerprint(p)))
             .collect();
         // The export lands next to the executable under a timestamped name we
         // do not choose, so the only sound attribution is "exactly one new file
@@ -458,6 +461,23 @@ pub mod worker {
             }
         }
         Err("could not create a private temp directory".to_string())
+    }
+
+    /// Size and modification time of one file, or `None` if it cannot be read.
+    fn fingerprint(path: &Path) -> Option<(u64, std::time::SystemTime)> {
+        let meta = std::fs::metadata(path).ok()?;
+        Some((meta.len(), meta.modified().ok()?))
+    }
+
+    /// Fingerprint every export file currently beside the inspector.
+    fn export_fingerprints(dir: &Path) -> HashMap<PathBuf, Option<(u64, std::time::SystemTime)>> {
+        export_files(dir)
+            .into_iter()
+            .map(|p| {
+                let f = fingerprint(&p);
+                (p, f)
+            })
+            .collect()
     }
 
     /// Every `CustomProfiles_*.nip` currently next to the inspector executable.
