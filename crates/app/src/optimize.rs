@@ -696,16 +696,19 @@ impl App {
             return;
         };
         let found = crate::gameconfig::discover(&root);
-        // A directory we could not read means the sweep is incomplete — say so
-        // rather than letting a reduced file count read as "all done".
-        for problem in &found.unreadable {
+        // Anything the scan could not account for means the sweep is
+        // incomplete — say so rather than letting a reduced file count read as
+        // "all done". Each entry already describes itself; wrapping them in a
+        // "directory" sentence would mislabel per-file problems.
+        if !found.unreadable.is_empty() {
             ui.label(
-                RichText::new(format!(
-                    "Could not read {problem} — files under it were not included."
-                ))
-                .color(WARN)
-                .size(12.0),
+                RichText::new("Some paths were skipped, so this sweep is incomplete:")
+                    .color(WARN)
+                    .size(12.0),
             );
+            for problem in &found.unreadable {
+                ui.label(RichText::new(format!("• {problem}")).color(WARN).size(12.0));
+            }
         }
         if found.files.is_empty() {
             ui.label(

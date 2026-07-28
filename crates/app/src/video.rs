@@ -378,12 +378,28 @@ pub mod worker {
         }
     }
 
-    /// Write the import payload and return a handle that keeps it unmodifiable
-    /// (read-shared only) for as long as it is held.
+    /// Create the import payload and return the handle it was written through.
+    ///
+    /// Creation, writing, and locking are one handle: writing the file, closing
+    /// it, and reopening it would leave a window in which another process could
+    /// swap the contents the elevated child later reads. `create_new` also means
+    /// a pre-positioned file or link at this name is never followed, and the
+    /// share mode (read only) keeps the bytes fixed while the child reads them.
     fn write_payload(nip: &Path, settings: &[(u32, u32)]) -> Result<std::fs::File, String> {
-        std::fs::write(nip, super::utf16le_bytes(&super::nip_xml(settings)))
+        use std::io::Write;
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(nip)
+            .map_err(|e| format!("could not create {}: {e}", nip.display()))?;
+        file.write_all(&super::utf16le_bytes(&super::nip_xml(settings)))
+            .and_then(|()| file.flush())
             .map_err(|e| format!("could not write {}: {e}", nip.display()))?;
-        super::open_locked(nip).map_err(|e| format!("could not lock {}: {e}", nip.display()))
+        Ok(file)
     }
 
     /// Create a fresh, exclusively-owned directory under the temp dir.

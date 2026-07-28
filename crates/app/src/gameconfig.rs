@@ -62,8 +62,16 @@ pub fn discover(root: &Path) -> Discovery {
             for entry in entries {
                 match entry {
                     Ok(entry) => match entry.file_type() {
-                        Ok(kind) if kind.is_dir() => {
-                            consider(root, entry.path().join("gamevariable.xml"), &mut found);
+                        // `file_type` does not follow links, so a linked account
+                        // directory needs the following `metadata` call. Letting
+                        // it through is safe: `consider` still requires the path
+                        // to resolve inside the config root.
+                        Ok(kind) if kind.is_dir() || kind.is_symlink() => {
+                            let is_dir = kind.is_dir()
+                                || std::fs::metadata(entry.path()).is_ok_and(|m| m.is_dir());
+                            if is_dir {
+                                consider(root, entry.path().join("gamevariable.xml"), &mut found);
+                            }
                         }
                         Ok(_) => {}
                         // A directory we cannot even classify must be reported;
@@ -90,19 +98,46 @@ pub fn discover(root: &Path) -> Discovery {
 fn consider(root: &Path, path: PathBuf, found: &mut Discovery) {
     let live = is_readable_file(&path, found);
     let recoverable = is_readable_file(&backup_path(&path), found);
-    if (live || recoverable) && is_within(root, &path) && !found.files.contains(&path) {
+    if !(live || recoverable) {
+        return;
+    }
+    // A candidate that exists but resolves outside the root is *skipped on
+    // purpose* — say so, rather than letting it vanish from a clean-looking
+    // scan the way an ordinary absent file does.
+    if !is_within(root, &path) {
+        found.unreadable.push(format!(
+            "{} resolves outside {} — skipped",
+            path.display(),
+            root.display()
+        ));
+        return;
+    }
+    if !found.files.contains(&path) {
         found.files.push(path);
     }
 }
 
-/// Whether `path` is a regular file, recording *why* when the answer could not
-/// be determined. A permission error must not silently read as "absent".
+/// Whether `path` is a regular file we can actually read, recording *why* when
+/// the answer could not be determined. A permission error must not silently
+/// read as "absent" — and attribute access does not imply data access, so the
+/// file is opened rather than merely stat'd.
 fn is_readable_file(path: &Path, found: &mut Discovery) -> bool {
     match std::fs::metadata(path) {
-        Ok(m) => m.is_file(),
+        Ok(m) if !m.is_file() => false,
+        Ok(_) => match std::fs::File::open(path) {
+            Ok(_) => true,
+            Err(e) => {
+                found
+                    .unreadable
+                    .push(format!("{} could not be opened: {e}", path.display()));
+                false
+            }
+        },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         Err(e) => {
-            found.unreadable.push(format!("{}: {e}", path.display()));
+            found
+                .unreadable
+                .push(format!("{} could not be inspected: {e}", path.display()));
             false
         }
     }
@@ -313,10 +348,8 @@ pub fn apply_files(root: &Path, paths: &[PathBuf], safe: &dyn Fn() -> bool) -> V
 }
 
 fn apply_one(root: &Path, path: &Path) -> Result<FileChange, String> {
-    // Re-checked here, not just at discovery: a junction swapped in afterwards
-    // would otherwise redirect this write outside the config root — with
-    // administrator rights when the app was relaunched elevated.
-    guard_within(root, path)?;
+    // Held for the whole operation, not just re-checked once: see `pin_and_verify`.
+    let _pinned = pin_and_verify(root, path)?;
     let bytes = std::fs::read(path).map_err(|e| format!("read failed: {e}"))?;
     let text = String::from_utf8(bytes).map_err(|_| "unexpected non-UTF-8 content".to_string())?;
     let is_xml = path
@@ -350,7 +383,7 @@ pub fn restore_files(root: &Path, paths: &[PathBuf], safe: &dyn Fn() -> bool) ->
 }
 
 fn restore_one(root: &Path, path: &Path) -> Result<FileChange, String> {
-    guard_within(root, path)?;
+    let _pinned = pin_and_verify(root, path)?;
     let backup = backup_path(path);
     let usable = std::fs::metadata(&backup).is_ok_and(|m| m.is_file() && m.len() > 0);
     if !usable {
@@ -361,13 +394,48 @@ fn restore_one(root: &Path, path: &Path) -> Result<FileChange, String> {
     Ok(FileChange::Restored)
 }
 
-/// Reject a path that no longer resolves inside the config root.
-fn guard_within(root: &Path, path: &Path) -> Result<(), String> {
-    if is_within(root, path) {
-        Ok(())
-    } else {
-        Err("resolves outside the BDO config folder — refusing to touch it".to_string())
+/// Pin the containing directory, then verify containment — in that order.
+///
+/// Checking a pathname and then acting on it is inherently racy: the directory
+/// can be swapped for a junction in between, and every later pathname operation
+/// (read, backup, replace) would follow the new target. Holding an open handle
+/// on the directory with a share mode that omits `FILE_SHARE_DELETE` means it
+/// cannot be renamed or deleted while we work, so the identity we validated is
+/// the identity we act on. The returned guard must be kept alive for the whole
+/// operation.
+#[must_use = "dropping the guard releases the directory pin"]
+struct DirGuard(#[allow(dead_code)] Option<std::fs::File>);
+
+fn pin_and_verify(root: &Path, path: &Path) -> Result<DirGuard, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "path has no parent directory".to_string())?;
+
+    #[cfg(windows)]
+    let handle = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        Some(
+            std::fs::OpenOptions::new()
+                .access_mode(FILE_READ_ATTRIBUTES)
+                // Deliberately omits FILE_SHARE_DELETE: that is what blocks the
+                // rename/delete a junction swap would need.
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(parent)
+                .map_err(|e| format!("could not pin {}: {e}", parent.display()))?,
+        )
+    };
+    #[cfg(not(windows))]
+    let handle = None;
+
+    if !is_within(root, path) {
+        return Err("resolves outside the BDO config folder — refusing to touch it".to_string());
     }
+    Ok(DirGuard(handle))
 }
 
 /// Write via a temp sibling + atomic replace so the destination is never
@@ -386,11 +454,29 @@ fn write_atomic_bytes(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         // renamed file present but empty.
         .and_then(|()| file.sync_all());
     drop(file);
-    if let Err(e) = write.and_then(|()| replace_file(&tmp, path)) {
+
+    if let Err(e) = write {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    Ok(())
+    match replace_file(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(Replace { error, consumed }) => {
+            // Only clean up when the replacement is known to be untouched. If
+            // the API may already have moved it into place, deleting it here
+            // could destroy the only copy of the destination's contents.
+            if !consumed {
+                let _ = std::fs::remove_file(&tmp);
+            }
+            Err(error)
+        }
+    }
+}
+
+/// A failed replace, and whether the temp file may already have been consumed.
+struct Replace {
+    error: std::io::Error,
+    consumed: bool,
 }
 
 /// Create an exclusively-owned temp file next to `path`.
@@ -425,44 +511,82 @@ fn create_temp_sibling(path: &Path) -> std::io::Result<(std::fs::File, PathBuf)>
 
 /// Atomically put `tmp` in place of `dest`.
 ///
-/// On Windows this prefers `ReplaceFileW`, which keeps the *destination's*
-/// security descriptor and attributes. A plain rename would silently hand the
-/// config the temp file's inherited ACL instead, discarding permissions the
-/// user (or the game) set on it. Falls back to `rename` when the destination
-/// does not exist yet — restore recreating a deleted file — or when the API
-/// declines.
-fn replace_file(tmp: &Path, dest: &Path) -> std::io::Result<()> {
+/// On Windows this uses `ReplaceFileW` with no flags, which keeps the
+/// *destination's* security descriptor and attributes. A plain rename would
+/// hand the config the temp file's inherited ACL instead, discarding
+/// permissions the user set on it — so rename is used only where it cannot
+/// cause that loss:
+///
+/// * the destination does not exist yet (restore recreating a deleted file),
+///   where there is no ACL to preserve; or
+/// * the filesystem does not implement `ReplaceFileW` at all, where preserving
+///   the ACL is not achievable by any path.
+///
+/// Every other failure is reported instead of being papered over with a rename.
+fn replace_file(tmp: &Path, dest: &Path) -> Result<(), Replace> {
     #[cfg(windows)]
-    if dest.exists() {
-        use std::os::windows::ffi::OsStrExt;
-        use windows::core::PCWSTR;
-        use windows::Win32::Storage::FileSystem::{ReplaceFileW, REPLACE_FILE_FLAGS};
+    return replace_file_windows(tmp, dest);
+    #[cfg(not(windows))]
+    std::fs::rename(tmp, dest).map_err(|error| Replace {
+        error,
+        consumed: false,
+    })
+}
 
-        let wide = |p: &Path| -> Vec<u16> {
-            p.as_os_str()
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect()
-        };
-        let dest_w = wide(dest);
-        let tmp_w = wide(tmp);
-        // SAFETY: both buffers are NUL-terminated and outlive the call; the
-        // optional backup/reserved parameters are null.
-        let replaced = unsafe {
-            ReplaceFileW(
-                PCWSTR(dest_w.as_ptr()),
-                PCWSTR(tmp_w.as_ptr()),
-                PCWSTR::null(),
-                REPLACE_FILE_FLAGS(0),
-                None,
-                None,
-            )
-        };
-        if replaced.is_ok() {
-            return Ok(());
+#[cfg(windows)]
+fn replace_file_windows(tmp: &Path, dest: &Path) -> Result<(), Replace> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{
+        ERROR_FILE_NOT_FOUND, ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED, ERROR_PATH_NOT_FOUND,
+    };
+    use windows::Win32::Storage::FileSystem::{ReplaceFileW, REPLACE_FILE_FLAGS};
+
+    let wide = |p: &Path| -> Vec<u16> {
+        p.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    };
+    let dest_w = wide(dest);
+    let tmp_w = wide(tmp);
+    // SAFETY: both buffers are NUL-terminated and outlive the call; the
+    // optional backup/reserved parameters are null.
+    let replaced = unsafe {
+        ReplaceFileW(
+            PCWSTR(dest_w.as_ptr()),
+            PCWSTR(tmp_w.as_ptr()),
+            PCWSTR::null(),
+            REPLACE_FILE_FLAGS(0),
+            None,
+            None,
+        )
+    };
+    match replaced {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let code = e.code().0 as u32 & 0xFFFF;
+            let missing_dest = code == ERROR_FILE_NOT_FOUND.0 || code == ERROR_PATH_NOT_FOUND.0;
+            let unsupported = code == ERROR_NOT_SUPPORTED.0 || code == ERROR_INVALID_FUNCTION.0;
+            if missing_dest || unsupported {
+                return std::fs::rename(tmp, dest).map_err(|error| Replace {
+                    error,
+                    consumed: false,
+                });
+            }
+            // Windows documents partial-failure states in which the replacement
+            // has already been moved, so the caller must not assume `tmp` is
+            // still a disposable scratch file.
+            Err(Replace {
+                error: std::io::Error::other(format!(
+                    "could not replace {}: {e} (a replacement may remain at {})",
+                    dest.display(),
+                    tmp.display()
+                )),
+                consumed: true,
+            })
         }
     }
-    std::fs::rename(tmp, dest)
 }
 
 fn backup_path(path: &Path) -> PathBuf {
@@ -722,6 +846,39 @@ mod tests {
 
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn out_of_root_candidates_are_reported_not_silently_dropped() {
+        let root = temp_dir("reportskip");
+        let outside = temp_dir("reportskip-out");
+        let stray = outside.join("GameOption.txt");
+        std::fs::write(&stray, GAME_OPTION).unwrap();
+
+        let mut found = Discovery::default();
+        consider(&root, stray.clone(), &mut found);
+        assert!(found.files.is_empty());
+        assert_eq!(found.unreadable.len(), 1, "{:?}", found.unreadable);
+        assert!(found.unreadable[0].contains("resolves outside"));
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn apply_preserves_content_when_replace_succeeds() {
+        // Guards the ReplaceFileW path end to end: the destination keeps its
+        // identity and receives exactly the patched bytes.
+        let dir = temp_dir("replace");
+        let file = dir.join("GameOption.txt");
+        std::fs::write(&file, GAME_OPTION).unwrap();
+        let (expected, _) = patch_game_option(GAME_OPTION);
+
+        let out = apply_files(&dir, std::slice::from_ref(&file), always_safe());
+        assert_eq!(out[0].result.as_ref().unwrap(), &FileChange::Patched(2));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), expected);
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
