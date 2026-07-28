@@ -463,10 +463,63 @@ pub mod worker {
     /// come back on every exit path including errors and panics.
     struct StashedExports(Vec<(PathBuf, PathBuf)>);
 
+    /// Marker embedded in a stashed file's name, followed by the owning pid.
+    const STASH_MARKER: &str = ".bdo-optimizer-stash-";
+
     impl Drop for StashedExports {
         fn drop(&mut self) {
             for (stashed, original) in self.0.drain(..) {
-                let _ = std::fs::rename(stashed, original);
+                // A transient lock on the directory can make the rename fail,
+                // and a Drop cannot report that — so retry briefly rather than
+                // discarding the error outright. If it still fails the file
+                // keeps its self-describing stash name and the next run's
+                // `recover_orphaned_stashes` puts it back.
+                for attempt in 0..5 {
+                    if std::fs::rename(&stashed, &original).is_ok() {
+                        break;
+                    }
+                    if attempt < 4 {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Put back any exports a previous run stashed and never restored.
+    ///
+    /// Without this, a crash (or a failed restore) between stashing and
+    /// restoring would hide the user's exports permanently: the stash name does
+    /// not end in `.nip`, so nothing would ever look at them again.
+    ///
+    /// ponytail: stashes belonging to *this* process are skipped, since a live
+    /// guard owns those. A second copy of the app running concurrently could
+    /// have its stash restored mid-run; that yields a fail-closed "more than one
+    /// export" error for that run, never data loss.
+    fn recover_orphaned_stashes(dir: &Path) {
+        let own_suffix = format!("{STASH_MARKER}{}", std::process::id());
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for path in entries.flatten().map(|e| e.path()) {
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name.ends_with(&own_suffix) {
+                continue;
+            }
+            let Some(marker_at) = name.rfind(STASH_MARKER) else {
+                continue;
+            };
+            let original_name = &name[..marker_at];
+            if !(original_name.starts_with("CustomProfiles_") && original_name.ends_with(".nip")) {
+                continue;
+            }
+            let original = path.with_file_name(original_name);
+            // Only restore into a free name: if the original is back, this stash
+            // is a duplicate and overwriting would destroy the live copy.
+            if !original.exists() {
+                let _ = std::fs::rename(&path, &original);
             }
         }
     }
@@ -474,11 +527,18 @@ pub mod worker {
     /// Move every existing export aside. The stash name deliberately does not
     /// end in `.nip`, so [`export_files`] cannot see the stashed copies.
     fn stash_exports(dir: &Path) -> Result<StashedExports, String> {
+        // Clean up after any earlier run that died mid-stash before deciding
+        // what is "already there".
+        recover_orphaned_stashes(dir);
+
         let mut moved = StashedExports(Vec::new());
         for original in export_files(dir) {
             let mut name = original.file_name().unwrap_or_default().to_os_string();
-            name.push(format!(".bdo-optimizer-stash-{}", std::process::id()));
+            name.push(format!("{STASH_MARKER}{}", std::process::id()));
             let stashed = original.with_file_name(name);
+            // `moved` already owns the earlier renames, so an error here still
+            // unwinds them through its Drop — the directory never keeps a
+            // half-stashed state.
             std::fs::rename(&original, &stashed).map_err(|e| {
                 format!(
                     "could not move the existing export {} aside: {e}",
@@ -617,6 +677,48 @@ pub mod worker {
                 "someone else's export",
                 "the pre-existing export must be restored untouched"
             );
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        /// A stash orphaned by a crashed run must be put back, not left hidden
+        /// forever under a name nothing looks at.
+        #[test]
+        fn an_orphaned_stash_is_recovered_by_the_next_run() {
+            let dir = create_private_dir().expect("dir");
+            let original_name = "CustomProfiles_2020-01-01_00-00-00.nip";
+            // Pid 1 stands in for a previous, now-dead run.
+            let orphan = dir.join(format!("{original_name}{STASH_MARKER}1"));
+            std::fs::write(&orphan, "stranded export").unwrap();
+            assert!(export_files(&dir).is_empty(), "precondition: hidden");
+
+            recover_orphaned_stashes(&dir);
+
+            let restored = dir.join(original_name);
+            assert_eq!(export_files(&dir), vec![restored.clone()]);
+            assert_eq!(
+                std::fs::read_to_string(&restored).unwrap(),
+                "stranded export"
+            );
+            assert!(!orphan.exists());
+
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        /// Recovery must never overwrite a live file with a stale stash.
+        #[test]
+        fn recovery_leaves_a_stash_alone_when_the_original_is_back() {
+            let dir = create_private_dir().expect("dir");
+            let original_name = "CustomProfiles_2020-01-01_00-00-00.nip";
+            let live = dir.join(original_name);
+            std::fs::write(&live, "the live copy").unwrap();
+            let orphan = dir.join(format!("{original_name}{STASH_MARKER}1"));
+            std::fs::write(&orphan, "the stale stash").unwrap();
+
+            recover_orphaned_stashes(&dir);
+
+            assert_eq!(std::fs::read_to_string(&live).unwrap(), "the live copy");
+            assert!(orphan.exists(), "the stash must be left, not destroyed");
+
             let _ = std::fs::remove_dir_all(dir);
         }
 
