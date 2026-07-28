@@ -348,8 +348,10 @@ pub fn apply_files(root: &Path, paths: &[PathBuf], safe: &dyn Fn() -> bool) -> V
 }
 
 fn apply_one(root: &Path, path: &Path) -> Result<FileChange, String> {
-    // Held for the whole operation, not just re-checked once: see `pin_and_verify`.
-    let _pinned = pin_and_verify(root, path)?;
+    // Every operation below uses `path` — the *canonical* path returned here —
+    // while the guard keeps its whole directory chain pinned. See `DirGuard`.
+    let (_pinned, path) = pin_and_verify(root, path)?;
+    let path = path.as_path();
     let bytes = std::fs::read(path).map_err(|e| format!("read failed: {e}"))?;
     let text = String::from_utf8(bytes).map_err(|_| "unexpected non-UTF-8 content".to_string())?;
     let is_xml = path
@@ -383,7 +385,8 @@ pub fn restore_files(root: &Path, paths: &[PathBuf], safe: &dyn Fn() -> bool) ->
 }
 
 fn restore_one(root: &Path, path: &Path) -> Result<FileChange, String> {
-    let _pinned = pin_and_verify(root, path)?;
+    let (_pinned, path) = pin_and_verify(root, path)?;
+    let path = path.as_path();
     let backup = backup_path(path);
     let usable = std::fs::metadata(&backup).is_ok_and(|m| m.is_file() && m.len() > 0);
     if !usable {
@@ -394,48 +397,94 @@ fn restore_one(root: &Path, path: &Path) -> Result<FileChange, String> {
     Ok(FileChange::Restored)
 }
 
-/// Pin the containing directory, then verify containment — in that order.
+/// Handles held open for the duration of one file operation.
 ///
-/// Checking a pathname and then acting on it is inherently racy: the directory
-/// can be swapped for a junction in between, and every later pathname operation
-/// (read, backup, replace) would follow the new target. Holding an open handle
-/// on the directory with a share mode that omits `FILE_SHARE_DELETE` means it
-/// cannot be renamed or deleted while we work, so the identity we validated is
-/// the identity we act on. The returned guard must be kept alive for the whole
-/// operation.
-#[must_use = "dropping the guard releases the directory pin"]
-struct DirGuard(#[allow(dead_code)] Option<std::fs::File>);
+/// Validating a pathname and then acting on that pathname is inherently racy:
+/// any directory along it can be swapped for a junction in between, and every
+/// later operation would follow the new target. Two things together close that:
+///
+/// 1. **Act on the canonical path.** [`pin_and_verify`] returns the resolved
+///    path, so the caller never re-traverses the caller-supplied name.
+/// 2. **Pin every directory on it.** Each component from the config root down
+///    to the file's parent is opened and held with a share mode of
+///    `FILE_SHARE_READ` alone — no write, no delete — so while the operation
+///    runs none of them can be renamed, deleted, or have a reparse point set on
+///    it. Each is also opened *without* following reparse points and rejected
+///    if it is one, so the chain contains no link that could be retargeted.
+#[must_use = "dropping the guard releases the directory pins"]
+struct DirGuard(#[allow(dead_code)] Vec<std::fs::File>);
 
-fn pin_and_verify(root: &Path, path: &Path) -> Result<DirGuard, String> {
+/// Pin the directory chain and return the canonical path to operate on.
+fn pin_and_verify(root: &Path, path: &Path) -> Result<(DirGuard, PathBuf), String> {
+    let root = root
+        .canonicalize()
+        .map_err(|e| format!("config folder unavailable: {e}"))?;
     let parent = path
         .parent()
-        .ok_or_else(|| "path has no parent directory".to_string())?;
+        .ok_or_else(|| "path has no parent directory".to_string())?
+        .canonicalize()
+        .map_err(|e| format!("containing folder unavailable: {e}"))?;
+    if !parent.starts_with(&root) {
+        return Err("resolves outside the BDO config folder — refusing to touch it".to_string());
+    }
+    let name = path
+        .file_name()
+        .ok_or_else(|| "path has no file name".to_string())?;
+    // The file itself may not exist yet (restore recreating it), so the target
+    // is built from the canonical parent rather than canonicalized directly.
+    let target = parent.join(name);
 
+    let mut handles = Vec::new();
+    let mut current = root.clone();
+    handles.push(pin_dir(&current)?);
+    for component in parent
+        .strip_prefix(&root)
+        .map_err(|_| "containing folder is not under the config folder".to_string())?
+        .components()
+    {
+        current = current.join(component);
+        handles.push(pin_dir(&current)?);
+    }
+    Ok((DirGuard(handles), target))
+}
+
+/// Open one directory so it cannot be renamed, deleted, or relinked, rejecting
+/// it outright if it is a reparse point.
+fn pin_dir(dir: &Path) -> Result<std::fs::File, String> {
     #[cfg(windows)]
-    let handle = {
+    {
+        use std::os::windows::fs::MetadataExt;
         use std::os::windows::fs::OpenOptionsExt;
         const FILE_READ_ATTRIBUTES: u32 = 0x0080;
         const FILE_SHARE_READ: u32 = 0x0000_0001;
-        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-        Some(
-            std::fs::OpenOptions::new()
-                .access_mode(FILE_READ_ATTRIBUTES)
-                // Deliberately omits FILE_SHARE_DELETE: that is what blocks the
-                // rename/delete a junction swap would need.
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-                .open(parent)
-                .map_err(|e| format!("could not pin {}: {e}", parent.display()))?,
-        )
-    };
-    #[cfg(not(windows))]
-    let handle = None;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 
-    if !is_within(root, path) {
-        return Err("resolves outside the BDO config folder — refusing to touch it".to_string());
+        let handle = std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            // Read sharing only: denying write and delete sharing is what stops
+            // a rename, a delete, or a reparse point being set while we work.
+            .share_mode(FILE_SHARE_READ)
+            // Open the link itself rather than its target, so the check below
+            // can actually see a reparse point instead of silently following it.
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(dir)
+            .map_err(|e| format!("could not pin {}: {e}", dir.display()))?;
+        let attrs = handle
+            .metadata()
+            .map_err(|e| format!("could not inspect {}: {e}", dir.display()))?
+            .file_attributes();
+        if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(format!(
+                "{} is a link — refusing to write through it",
+                dir.display()
+            ));
+        }
+        Ok(handle)
     }
-    Ok(DirGuard(handle))
+    #[cfg(not(windows))]
+    std::fs::File::open(dir).map_err(|e| format!("could not open {}: {e}", dir.display()))
 }
 
 /// Write via a temp sibling + atomic replace so the destination is never
@@ -517,10 +566,8 @@ fn create_temp_sibling(path: &Path) -> std::io::Result<(std::fs::File, PathBuf)>
 /// permissions the user set on it — so rename is used only where it cannot
 /// cause that loss:
 ///
-/// * the destination does not exist yet (restore recreating a deleted file),
-///   where there is no ACL to preserve; or
-/// * the filesystem does not implement `ReplaceFileW` at all, where preserving
-///   the ACL is not achievable by any path.
+/// the destination does not exist yet (restore recreating a deleted file),
+/// where there is no ACL to preserve and nothing can be lost.
 ///
 /// Every other failure is reported instead of being papered over with a rename.
 fn replace_file(tmp: &Path, dest: &Path) -> Result<(), Replace> {
@@ -545,9 +592,7 @@ fn win32_code(e: &windows::core::Error) -> Option<u32> {
 fn replace_file_windows(tmp: &Path, dest: &Path) -> Result<(), Replace> {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{
-        ERROR_FILE_NOT_FOUND, ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED, ERROR_PATH_NOT_FOUND,
-    };
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
     use windows::Win32::Storage::FileSystem::{ReplaceFileW, REPLACE_FILE_FLAGS};
 
     let wide = |p: &Path| -> Vec<u16> {
@@ -579,11 +624,14 @@ fn replace_file_windows(tmp: &Path, dest: &Path) -> Result<(), Replace> {
             // misread as "destination missing" and silently fall back to a
             // rename that discards the destination's ACL.
             let code = win32_code(&e);
+            // Only a missing destination falls back to rename: there is no ACL
+            // to preserve, so nothing is lost. A filesystem that cannot do
+            // ReplaceFileW at all used to fall back too, but that quietly did
+            // the very ACL substitution this function exists to avoid — it is
+            // now reported instead.
             let missing_dest =
                 code == Some(ERROR_FILE_NOT_FOUND.0) || code == Some(ERROR_PATH_NOT_FOUND.0);
-            let unsupported =
-                code == Some(ERROR_NOT_SUPPORTED.0) || code == Some(ERROR_INVALID_FUNCTION.0);
-            if missing_dest || unsupported {
+            if missing_dest {
                 return std::fs::rename(tmp, dest).map_err(|error| Replace {
                     error,
                     consumed: false,
@@ -894,6 +942,80 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file).unwrap(), expected);
 
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pin_returns_the_canonical_target_not_the_supplied_name() {
+        let dir = temp_dir("canon");
+        let nested = dir.join("UserCache");
+        std::fs::create_dir_all(&nested).unwrap();
+        let file = nested.join("gamevariable.xml");
+        std::fs::write(&file, "<x/>").unwrap();
+
+        // A path with a redundant traversal must come back fully resolved, so
+        // later operations never re-walk the caller's spelling of it.
+        let noisy = nested.join("..").join("UserCache").join("gamevariable.xml");
+        let Ok((_guard, target)) = pin_and_verify(&dir, &noisy) else {
+            panic!("pin_and_verify rejected a legitimate path");
+        };
+        assert_eq!(target, file.canonicalize().unwrap());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn junctions_resolve_inside_the_root_and_are_refused_outside_it() {
+        // Creating a junction needs no privileges, unlike a file symlink.
+        fn junction(link: &Path, target: &Path) -> bool {
+            std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+
+        let root = temp_dir("junction");
+        let real = root.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("gamevariable.xml"), "<x/>").unwrap();
+        let outside = temp_dir("junction-out");
+        std::fs::write(outside.join("gamevariable.xml"), "<x/>").unwrap();
+
+        let inside_link = root.join("inside");
+        let escape_link = root.join("escape");
+        if !junction(&inside_link, &real) || !junction(&escape_link, &outside) {
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&outside);
+            return; // junctions unavailable here; nothing to assert
+        }
+
+        // Pointing back inside the root: allowed, but resolved to the real
+        // directory so nothing is written through the link itself.
+        match pin_and_verify(&root, &inside_link.join("gamevariable.xml")) {
+            Ok((_g, target)) => assert_eq!(
+                target,
+                real.join("gamevariable.xml").canonicalize().unwrap()
+            ),
+            Err(e) => panic!("a junction inside the root was refused: {e}"),
+        }
+
+        // Pointing out of the root: refused.
+        match pin_and_verify(&root, &escape_link.join("gamevariable.xml")) {
+            Err(e) => assert!(e.contains("outside"), "unexpected error: {e}"),
+            Ok(_) => panic!("a junction escaping the root was accepted"),
+        }
+
+        for link in [&inside_link, &escape_link] {
+            let _ = std::process::Command::new("cmd")
+                .args(["/C", "rmdir"])
+                .arg(link)
+                .output();
+        }
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
     }
 
     #[test]
