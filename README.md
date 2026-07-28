@@ -31,6 +31,9 @@ The affinity recommendations are based on
   the per-game "Black Desert" profile through the bundled NVIDIA Profile
   Inspector and verifies the result against the driver database. Nothing global
   changes, and one click restores driver defaults.
+- **Applies the guide's config-file tweaks (optional):** sets PostFilter and
+  Tessellation to 0 in `GameOption.txt` and every UserCache `gamevariable.xml`,
+  backing each file up first, with a one-click restore.
 - **Shows its version:** the current package version appears in the app header.
 
 ## Requirements
@@ -142,6 +145,24 @@ How it works and why it is safe:
 - AMD users: the equivalent tweaks (Radeon Enhanced Sync on, Wait for Vertical
   Refresh off) have no safe automation API — set them in AMD Software manually.
 
+## Game config files (optional)
+
+**2 Apply** also offers the guide's config-file edits: `postFilter = 0`
+(disables the forced post-process sharpening) and `Tessellation = 0` in
+`Documents\Black Desert\GameOption.txt`, and every matching
+`<PostFilter>`/`<Tessellation>` entry in the UserCache `gamevariable.xml`
+files.
+
+- The first time a file is changed, its original is copied to
+  `<name>.bdo-optimizer.bak` next to it; **Restore from backup** copies the
+  originals back. Later applies never overwrite the backup, so the restore
+  point is always the pre-optimizer state.
+- Only those specific values change — every other byte of the files is
+  preserved.
+- The buttons refuse to run while BDO is open, because the game rewrites these
+  files on exit and would undo (or race) the edit. Close the game, apply, then
+  launch.
+
 ## Repeatable benchmark method
 
 Use the same graphics settings, resolution, scene, camera path, character, and
@@ -188,6 +209,7 @@ representative pairs rather than relying on one unusually good run.
 | Verify affinity | Read-only process query | Reads the current mask; never sets it |
 | Capture FPS | Administrator | PresentMon uses external Windows ETW tracing |
 | Apply/restore NVIDIA profile | Administrator | Profile Inspector writes only the per-game driver profile; no game access |
+| Apply/restore game config files | Standard user | Edits `Documents\Black Desert` files with backups; refuses while BDO runs |
 | Show overlay | Same app session | Separate always-on-top native window; no injection or graphics hook |
 
 The FPS overlay can appear over windowed and borderless-windowed BDO. It cannot

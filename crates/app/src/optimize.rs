@@ -118,6 +118,9 @@ impl App {
         ui.add_space(10.0);
         ui.separator();
         self.nvidia_section(ui);
+        ui.add_space(10.0);
+        ui.separator();
+        self.gameconfig_section(ui);
         if matches!(&self.optimize.verify, Some(VerifyOutcome::Match { .. }))
             && ui.button("Continue to Measure").clicked()
         {
@@ -655,6 +658,119 @@ impl App {
                 };
             }
         }
+    }
+
+    // ------------------------------------------------------- Game config files
+    /// The guide's `GameOption.txt` / `gamevariable.xml` edits (PostFilter and
+    /// Tessellation off), with one-time backups and a restore button.
+    fn gameconfig_section(&mut self, ui: &mut egui::Ui) {
+        if !cfg!(windows) {
+            return;
+        }
+        ui.label(
+            RichText::new("Game config files (guide settings)")
+                .strong()
+                .size(16.0),
+        );
+        ui.label(
+            RichText::new(
+                "Sets PostFilter (forced sharpening) and Tessellation to 0 in GameOption.txt and \
+                 every UserCache gamevariable.xml, exactly as the guide describes. The original \
+                 of each file is backed up next to it the first time it is changed.",
+            )
+            .size(12.0)
+            .weak(),
+        );
+
+        let Some(root) = crate::gameconfig::config_root() else {
+            ui.label(RichText::new("Documents folder not found.").color(WARN));
+            return;
+        };
+        let files = crate::gameconfig::find_config_files(&root);
+        if files.is_empty() {
+            ui.label(
+                RichText::new(format!(
+                    "No BDO config files found under {}. Start the game once so it creates them.",
+                    root.display()
+                ))
+                .weak()
+                .size(12.0),
+            );
+            return;
+        }
+        ui.label(
+            RichText::new(format!(
+                "{} file(s) found under {}",
+                files.len(),
+                root.display()
+            ))
+            .size(12.0)
+            .weak(),
+        );
+
+        ui.horizontal(|ui| {
+            if ui.button("Set PostFilter & Tessellation to 0").clicked() {
+                self.run_gameconfig(&files, "apply");
+            }
+            if ui.button("Restore from backup").clicked() {
+                self.run_gameconfig(&files, "restore");
+            }
+        });
+
+        if let Some(msg) = &self.gameconfig.blocked {
+            ui.label(RichText::new(msg.as_str()).color(WARN).strong());
+        }
+        if let Some(action) = self.gameconfig.last_action {
+            for outcome in &self.gameconfig.outcomes {
+                let name = outcome
+                    .path
+                    .strip_prefix(&root)
+                    .unwrap_or(&outcome.path)
+                    .display();
+                match (&outcome.result, action) {
+                    (Ok(0), "apply") => {
+                        ui.label(RichText::new(format!("• {name}: already optimized")).size(12.0))
+                    }
+                    (Ok(n), "apply") => ui.label(
+                        RichText::new(format!("✔ {name}: {n} value(s) set to guide defaults"))
+                            .color(OK_GREEN)
+                            .size(12.0),
+                    ),
+                    (Ok(0), _) => ui
+                        .label(RichText::new(format!("• {name}: no backup to restore")).size(12.0)),
+                    (Ok(_), _) => ui.label(
+                        RichText::new(format!("✔ {name}: restored original"))
+                            .color(OK_GREEN)
+                            .size(12.0),
+                    ),
+                    (Err(e), _) => ui.label(
+                        RichText::new(format!("✘ {name}: {e}"))
+                            .color(ERR)
+                            .size(12.0),
+                    ),
+                };
+            }
+        }
+    }
+
+    /// Run a config-file action, refusing while BDO is running (the game
+    /// rewrites these files on exit, so an edit would be lost or race).
+    fn run_gameconfig(&mut self, files: &[std::path::PathBuf], action: &'static str) {
+        self.gameconfig.blocked = None;
+        if bdo_bench::is_process_running(bdo_launch::GAME_EXE).is_some() {
+            self.gameconfig.blocked = Some(
+                "BDO is running — close the game first. It rewrites these files on exit, \
+                 which would undo the change."
+                    .to_string(),
+            );
+            return;
+        }
+        self.gameconfig.outcomes = if action == "apply" {
+            crate::gameconfig::apply_files(files)
+        } else {
+            crate::gameconfig::restore_files(files)
+        };
+        self.gameconfig.last_action = Some(action);
     }
 
     // ------------------------------------------------------------------ Verify

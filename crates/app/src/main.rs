@@ -15,6 +15,7 @@ mod benchmark;
 mod capture;
 mod detect;
 mod format;
+mod gameconfig;
 mod hardware;
 mod optimize;
 mod overlay;

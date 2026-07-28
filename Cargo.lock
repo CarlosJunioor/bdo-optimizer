@@ -436,6 +436,7 @@ dependencies = [
  "bdo-bench",
  "bdo-hw",
  "bdo-launch",
+ "directories",
  "eframe",
  "egui",
  "egui_plot",

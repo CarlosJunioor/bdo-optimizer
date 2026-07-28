@@ -86,6 +86,17 @@ pub struct VideoState {
     pub last: Option<Result<String, String>>,
 }
 
+/// State for the game-config-files section of the Optimize tab.
+#[derive(Default)]
+pub struct GameConfigState {
+    /// Which action produced `outcomes` ("apply" or "restore").
+    pub last_action: Option<&'static str>,
+    /// Per-file results of the last action.
+    pub outcomes: Vec<crate::gameconfig::FileOutcome>,
+    /// Set when the last click was refused because BDO was running.
+    pub blocked: Option<String>,
+}
+
 /// Outcome of a read-only affinity verification.
 ///
 /// Only constructed/read on Windows (the verify action is Windows-only); the
@@ -225,6 +236,7 @@ pub struct App {
     pub detection: Option<DetectResult>,
     pub optimize: OptimizeState,
     pub video: VideoState,
+    pub gameconfig: GameConfigState,
     pub benchmark: BenchmarkState,
 }
 
@@ -239,6 +251,7 @@ impl App {
             detection: None,
             optimize: OptimizeState::default(),
             video: VideoState::default(),
+            gameconfig: GameConfigState::default(),
             benchmark: BenchmarkState::new(),
         }
     }
