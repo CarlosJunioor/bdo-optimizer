@@ -32,7 +32,7 @@ The affinity recommendations are based on
   Inspector and verifies the result against the driver database. Nothing global
   changes, and one click restores driver defaults.
 - **Applies the guide's config-file tweaks (optional):** sets PostFilter and
-  Tessellation to 0 in `GameOption.txt` and every UserCache `gamevariable.xml`,
+  Tessellation off in `GameOption.txt` and every UserCache `gamevariable.xml`,
   backing each file up first, with a one-click restore.
 - **Shows its version:** the current package version appears in the app header.
 
@@ -147,11 +147,16 @@ How it works and why it is safe:
 
 ## Game config files (optional)
 
-**2 Apply** also offers the guide's config-file edits: `postFilter = 0`
-(disables the forced post-process sharpening) and `Tessellation = 0` in
-`Documents\Black Desert\GameOption.txt`, and every matching
-`<PostFilter>`/`<Tessellation>` entry in the UserCache `gamevariable.xml`
-files.
+**2 Apply** also offers the guide's config-file edits, which disable the forced
+post-process sharpening and (on High presets and above) tessellation:
+
+- `Documents\Black Desert\GameOption.txt` — `postFilter = 0` and
+  `Tessellation = 0`.
+- Every UserCache `gamevariable.xml` — each `<PostFilter Value="0"/>` and
+  `<Tessellation Value="false"/>` entry. The XML files use `true`/`false`
+  where the text file uses `1`/`0`; each is written in its own format.
+
+Notes:
 
 - The first time a file is changed, its original is copied to
   `<name>.bdo-optimizer.bak` next to it; **Restore from backup** copies the
@@ -162,6 +167,9 @@ files.
 - The buttons refuse to run while BDO is open, because the game rewrites these
   files on exit and would undo (or race) the edit. Close the game, apply, then
   launch.
+- **Turning on the in-game Display Filter setting undoes these edits.** The
+  guide is explicit about this. If sharpening comes back, check that setting
+  before re-applying.
 
 ## Repeatable benchmark method
 

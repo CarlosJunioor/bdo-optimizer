@@ -683,12 +683,22 @@ impl App {
         );
         ui.label(
             RichText::new(
-                "Sets PostFilter (forced sharpening) and Tessellation to 0 in GameOption.txt and \
+                "Turns off PostFilter (forced sharpening) and Tessellation in GameOption.txt and \
                  every UserCache gamevariable.xml, exactly as the guide describes. The original \
                  of each file is backed up next to it the first time it is changed.",
             )
             .size(12.0)
             .weak(),
+        );
+        // The guide calls this out explicitly, and it is the one way these edits
+        // silently revert — worth saying where the button is, not just in a
+        // readme the user will not have open while playing.
+        ui.label(
+            RichText::new(
+                "Note: switching on the in-game Display Filter setting undoes these edits.",
+            )
+            .size(12.0)
+            .color(WARN),
         );
 
         let Some(root) = crate::gameconfig::config_root() else {
