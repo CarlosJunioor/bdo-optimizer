@@ -533,6 +533,14 @@ fn replace_file(tmp: &Path, dest: &Path) -> Result<(), Replace> {
     })
 }
 
+/// The Win32 error code carried by a `FACILITY_WIN32` HRESULT, if it is one.
+#[cfg(windows)]
+fn win32_code(e: &windows::core::Error) -> Option<u32> {
+    let hr = e.code().0 as u32;
+    // HRESULT_FROM_WIN32(x) == 0x8007_0000 | (x & 0xFFFF)
+    (hr & 0xFFFF_0000 == 0x8007_0000).then_some(hr & 0xFFFF)
+}
+
 #[cfg(windows)]
 fn replace_file_windows(tmp: &Path, dest: &Path) -> Result<(), Replace> {
     use std::os::windows::ffi::OsStrExt;
@@ -565,9 +573,16 @@ fn replace_file_windows(tmp: &Path, dest: &Path) -> Result<(), Replace> {
     match replaced {
         Ok(()) => Ok(()),
         Err(e) => {
-            let code = e.code().0 as u32 & 0xFFFF;
-            let missing_dest = code == ERROR_FILE_NOT_FOUND.0 || code == ERROR_PATH_NOT_FOUND.0;
-            let unsupported = code == ERROR_NOT_SUPPORTED.0 || code == ERROR_INVALID_FUNCTION.0;
+            // Only a FACILITY_WIN32 HRESULT (0x8007xxxx) carries a Win32 error
+            // code in its low word. Masking unconditionally would let an
+            // unrelated HRESULT whose low bits happen to equal 1/2/3/50 be
+            // misread as "destination missing" and silently fall back to a
+            // rename that discards the destination's ACL.
+            let code = win32_code(&e);
+            let missing_dest =
+                code == Some(ERROR_FILE_NOT_FOUND.0) || code == Some(ERROR_PATH_NOT_FOUND.0);
+            let unsupported =
+                code == Some(ERROR_NOT_SUPPORTED.0) || code == Some(ERROR_INVALID_FUNCTION.0);
             if missing_dest || unsupported {
                 return std::fs::rename(tmp, dest).map_err(|error| Replace {
                     error,
