@@ -433,6 +433,11 @@ fn pin_and_verify(root: &Path, path: &Path) -> Result<(DirGuard, PathBuf), Strin
     // The file itself may not exist yet (restore recreating it), so the target
     // is built from the canonical parent rather than canonicalized directly.
     let target = parent.join(name);
+    // The parent chain being clean is not enough: the leaf can be a link of its
+    // own, and reads/writes on the pathname would follow it straight out of the
+    // root. The backup is checked too, since restore reads through it.
+    reject_leaf_link(&target)?;
+    reject_leaf_link(&backup_path(&target))?;
 
     let mut handles = Vec::new();
     let mut current = root.clone();
@@ -448,40 +453,53 @@ fn pin_and_verify(root: &Path, path: &Path) -> Result<(DirGuard, PathBuf), Strin
     Ok((DirGuard(handles), target))
 }
 
+/// Refuse a leaf that is itself a symlink, so no read or write follows it out
+/// of the pinned directory. A file that does not exist is fine.
+fn reject_leaf_link(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(format!(
+            "{} is a link — refusing to read or write through it",
+            path.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("could not inspect {}: {e}", path.display())),
+    }
+}
+
 /// Open one directory so it cannot be renamed, deleted, or relinked, rejecting
-/// it outright if it is a reparse point.
+/// it outright if it is a link.
 fn pin_dir(dir: &Path) -> Result<std::fs::File, String> {
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
         use std::os::windows::fs::OpenOptionsExt;
         const FILE_READ_ATTRIBUTES: u32 = 0x0080;
         const FILE_SHARE_READ: u32 = 0x0000_0001;
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 
-        let handle = std::fs::OpenOptions::new()
-            .access_mode(FILE_READ_ATTRIBUTES)
-            // Read sharing only: denying write and delete sharing is what stops
-            // a rename, a delete, or a reparse point being set while we work.
-            .share_mode(FILE_SHARE_READ)
-            // Open the link itself rather than its target, so the check below
-            // can actually see a reparse point instead of silently following it.
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(dir)
-            .map_err(|e| format!("could not pin {}: {e}", dir.display()))?;
-        let attrs = handle
-            .metadata()
+        // Reject only *name-surrogate* reparse points — symlinks and junctions,
+        // the ones that redirect a path. `is_symlink` is precisely that test.
+        // Checking the raw FILE_ATTRIBUTE_REPARSE_POINT bit instead would also
+        // reject OneDrive Files On-Demand folders, which are reparse points too
+        // and are how a great many people's Documents folder is stored.
+        if std::fs::symlink_metadata(dir)
             .map_err(|e| format!("could not inspect {}: {e}", dir.display()))?
-            .file_attributes();
-        if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            .file_type()
+            .is_symlink()
+        {
             return Err(format!(
                 "{} is a link — refusing to write through it",
                 dir.display()
             ));
         }
-        Ok(handle)
+        std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            // Read sharing only: denying write and delete sharing is what stops
+            // a rename, a delete, or a reparse point being set while we work.
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir)
+            .map_err(|e| format!("could not pin {}: {e}", dir.display()))
     }
     #[cfg(not(windows))]
     std::fs::File::open(dir).map_err(|e| format!("could not open {}: {e}", dir.display()))
@@ -580,6 +598,56 @@ fn replace_file(tmp: &Path, dest: &Path) -> Result<(), Replace> {
     })
 }
 
+/// Move `tmp` to `dest` **without** overwriting anything that appeared there.
+///
+/// `std::fs::rename` always replaces the destination, so using it after a
+/// "destination missing" result would silently clobber — and strip the ACL
+/// from — a file created in the gap between the two calls. `MoveFileExW`
+/// without `MOVEFILE_REPLACE_EXISTING` fails instead, and that case loops back
+/// to the replace path where the ACL is preserved.
+#[cfg(windows)]
+fn move_without_replacing(tmp: &Path, dest: &Path) -> Result<(), Replace> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
+    use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVE_FILE_FLAGS};
+
+    let wide = |p: &Path| -> Vec<u16> {
+        p.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    };
+    let tmp_w = wide(tmp);
+    let dest_w = wide(dest);
+    // SAFETY: both buffers are NUL-terminated and outlive the call.
+    let moved = unsafe {
+        MoveFileExW(
+            PCWSTR(tmp_w.as_ptr()),
+            PCWSTR(dest_w.as_ptr()),
+            MOVE_FILE_FLAGS(0),
+        )
+    };
+    match moved {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let code = win32_code(&e);
+            if code == Some(ERROR_ALREADY_EXISTS.0) || code == Some(ERROR_FILE_EXISTS.0) {
+                // Someone created the destination in the gap; go back through
+                // the ACL-preserving path rather than clobbering it.
+                return replace_file_windows(tmp, dest);
+            }
+            Err(Replace {
+                error: std::io::Error::other(format!(
+                    "could not move into {}: {e}",
+                    dest.display()
+                )),
+                consumed: false,
+            })
+        }
+    }
+}
+
 /// The Win32 error code carried by a `FACILITY_WIN32` HRESULT, if it is one.
 #[cfg(windows)]
 fn win32_code(e: &windows::core::Error) -> Option<u32> {
@@ -632,21 +700,33 @@ fn replace_file_windows(tmp: &Path, dest: &Path) -> Result<(), Replace> {
             let missing_dest =
                 code == Some(ERROR_FILE_NOT_FOUND.0) || code == Some(ERROR_PATH_NOT_FOUND.0);
             if missing_dest {
-                return std::fs::rename(tmp, dest).map_err(|error| Replace {
-                    error,
-                    consumed: false,
-                });
+                return move_without_replacing(tmp, dest);
             }
-            // Windows documents partial-failure states in which the replacement
-            // has already been moved, so the caller must not assume `tmp` is
-            // still a disposable scratch file.
+            // Only these three leave the two names in a half-moved state, so
+            // only these make the temp file something other than disposable
+            // scratch. Marking *every* failure as consumed would leak a .tmp
+            // sibling after ordinary failures like a sharing violation, which
+            // leave both names untouched.
+            const ERROR_UNABLE_TO_REMOVE_REPLACED: u32 = 1175;
+            const ERROR_UNABLE_TO_MOVE_REPLACEMENT: u32 = 1176;
+            const ERROR_UNABLE_TO_MOVE_REPLACEMENT_2: u32 = 1177;
+            let consumed = matches!(
+                code,
+                Some(ERROR_UNABLE_TO_REMOVE_REPLACED)
+                    | Some(ERROR_UNABLE_TO_MOVE_REPLACEMENT)
+                    | Some(ERROR_UNABLE_TO_MOVE_REPLACEMENT_2)
+            );
+            let detail = if consumed {
+                format!(" (a replacement may remain at {})", tmp.display())
+            } else {
+                String::new()
+            };
             Err(Replace {
                 error: std::io::Error::other(format!(
-                    "could not replace {}: {e} (a replacement may remain at {})",
-                    dest.display(),
-                    tmp.display()
+                    "could not replace {}: {e}{detail}",
+                    dest.display()
                 )),
-                consumed: true,
+                consumed,
             })
         }
     }

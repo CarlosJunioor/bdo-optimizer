@@ -331,10 +331,20 @@ pub mod worker {
 
         // 2. The silent import reports nothing, so verify through an export.
         let before: HashSet<PathBuf> = export_files(&exe_dir).into_iter().collect();
+        let started = std::time::SystemTime::now();
         run_inspector(exe, &["-exportCustomized"])?;
+        // The export name carries only a second-resolution timestamp, so a run
+        // in the same second as an earlier one reuses the pathname. Matching on
+        // "new name" alone would then see nothing and report a false failure;
+        // a freshly written mtime identifies the reused name as ours.
         let created: Vec<PathBuf> = export_files(&exe_dir)
             .into_iter()
-            .filter(|p| !before.contains(p))
+            .filter(|p| {
+                !before.contains(p)
+                    || std::fs::metadata(p)
+                        .and_then(|m| m.modified())
+                        .is_ok_and(|m| m >= started)
+            })
             .collect();
         // The export lands next to the executable under a timestamped name we
         // do not choose, so the only sound attribution is "exactly one new file
@@ -365,41 +375,71 @@ pub mod worker {
             ))
         } else {
             // Keep the evidence: without it a verification failure cannot be
-            // debugged, because the export is deleted above.
+            // debugged, because the export is deleted above. Only claim it was
+            // kept if writing it actually worked.
             let kept = std::env::temp_dir().join("bdo-optimizer-verify-failed.nip");
-            let _ = std::fs::write(&kept, &bytes);
+            let where_kept = match std::fs::write(&kept, &bytes) {
+                Ok(()) => format!(" (Export kept at {})", kept.display()),
+                Err(e) => format!(" (The export could not be saved for inspection: {e})"),
+            };
             Err(format!(
                 "Import ran but the driver database does not show the expected \
                  values on the \"{}\" profile. Open NVIDIA Profile Inspector \
-                 manually to check for a renamed profile. (Export kept at {})",
-                super::PROFILE_NAME,
-                kept.display()
+                 manually to check for a renamed profile.{where_kept}",
+                super::PROFILE_NAME
             ))
         }
     }
 
-    /// Create the import payload and return the handle it was written through.
+    /// Create the import payload and return a **read** handle to hold while the
+    /// child runs.
     ///
-    /// Creation, writing, and locking are one handle: writing the file, closing
-    /// it, and reopening it would leave a window in which another process could
-    /// swap the contents the elevated child later reads. `create_new` also means
-    /// a pre-positioned file or link at this name is never followed, and the
-    /// share mode (read only) keeps the bytes fixed while the child reads them.
+    /// The handle must be read-only. Windows grants a second open only if each
+    /// side's access is permitted by the other's share mode, so retaining a
+    /// *write* handle — even one sharing reads — makes the inspector's ordinary
+    /// read open fail with a sharing violation. A read handle shared for reading
+    /// lets the child read while still blocking any writer.
+    ///
+    /// Writing happens first through a `create_new` handle that shares nothing,
+    /// so a pre-positioned file at this name is never followed. The reopened
+    /// bytes are compared against what was written, which closes the brief
+    /// close-then-reopen window: a swap in between fails the comparison instead
+    /// of being imported.
     fn write_payload(nip: &Path, settings: &[(u32, u32)]) -> Result<std::fs::File, String> {
-        use std::io::Write;
+        use std::io::{Read, Write};
         use std::os::windows::fs::OpenOptionsExt;
         const FILE_SHARE_READ: u32 = 0x0000_0001;
 
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let expected = super::utf16le_bytes(&super::nip_xml(settings));
+        {
+            let mut writer = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .share_mode(0) // exclusive while the bytes are being written
+                .open(nip)
+                .map_err(|e| format!("could not create {}: {e}", nip.display()))?;
+            writer
+                .write_all(&expected)
+                .and_then(|()| writer.sync_all())
+                .map_err(|e| format!("could not write {}: {e}", nip.display()))?;
+        }
+
+        let mut reader = std::fs::OpenOptions::new()
+            .read(true)
             .share_mode(FILE_SHARE_READ)
             .open(nip)
-            .map_err(|e| format!("could not create {}: {e}", nip.display()))?;
-        file.write_all(&super::utf16le_bytes(&super::nip_xml(settings)))
-            .and_then(|()| file.flush())
-            .map_err(|e| format!("could not write {}: {e}", nip.display()))?;
-        Ok(file)
+            .map_err(|e| format!("could not reopen {}: {e}", nip.display()))?;
+        let mut actual = Vec::with_capacity(expected.len());
+        reader
+            .read_to_end(&mut actual)
+            .map_err(|e| format!("could not verify {}: {e}", nip.display()))?;
+        if actual != expected {
+            return Err(format!(
+                "{} changed after it was written — refusing to import it",
+                nip.display()
+            ));
+        }
+        Ok(reader)
     }
 
     /// Create a fresh, exclusively-owned directory under the temp dir.
@@ -438,6 +478,58 @@ pub mod worker {
                     .is_some_and(|n| n.starts_with("CustomProfiles_") && n.ends_with(".nip"))
             })
             .collect()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The payload handle is held across the child run, so a reader must
+        /// still be able to open the file. A retained *write* handle makes the
+        /// inspector's ordinary read open fail with a sharing violation and
+        /// breaks the whole feature — this reproduces that without needing the
+        /// driver, elevation, or a UAC prompt.
+        #[test]
+        fn a_reader_can_open_the_payload_while_it_is_held() {
+            use std::io::Read;
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_SHARE_READ: u32 = 0x0000_0001;
+
+            let dir = create_private_dir().expect("private dir");
+            let nip = dir.join("profile.nip");
+            let settings = super::super::guide_settings(8, true);
+            let held = write_payload(&nip, &settings).expect("payload");
+
+            // Mirrors how a .NET reader opens a file: read access, shared for
+            // reading only.
+            let mut reader = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ)
+                .open(&nip)
+                .expect("a reader must be able to open the held payload");
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).expect("read payload");
+            assert_eq!(
+                bytes,
+                super::super::utf16le_bytes(&super::super::nip_xml(&settings))
+            );
+
+            // And a writer must still be locked out while we hold it.
+            let writer = std::fs::OpenOptions::new().write(true).open(&nip);
+            assert!(writer.is_err(), "payload must not be writable while held");
+
+            drop(held);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn private_dirs_are_unique_per_call() {
+            let a = create_private_dir().expect("a");
+            let b = create_private_dir().expect("b");
+            assert_ne!(a, b);
+            let _ = std::fs::remove_dir_all(a);
+            let _ = std::fs::remove_dir_all(b);
+        }
     }
 
     /// Spawn the inspector without a console window and wait for it to exit.
