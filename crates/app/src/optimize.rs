@@ -105,6 +105,9 @@ impl App {
 
         self.optimization_status(ui);
         ui.add_space(10.0);
+        self.one_click_section(ui);
+        ui.add_space(10.0);
+        ui.separator();
         self.game_path_section(ui);
         ui.add_space(10.0);
         ui.separator();
@@ -167,6 +170,209 @@ impl App {
                     .weak(),
                 );
             });
+    }
+
+    // --------------------------------------------------------------- One click
+    /// One button for every guide setting that is safe to apply unattended.
+    ///
+    /// Deliberately excludes anything needing a reboot, anything system-wide
+    /// rather than BDO-scoped, and anything the guide only recommends
+    /// conditionally. Those stay as their own buttons further down, so a user
+    /// who wants them chooses them knowingly.
+    fn one_click_section(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Apply everything safe").strong().size(16.0));
+        ui.label(
+            RichText::new(
+                "Applies the guide settings that are reversible, need no reboot, and only affect \
+                 Black Desert: the config-file tweaks and Windows' windowed-game optimizations. \
+                 Driver settings, memory compression, and HAGS stay on their own buttons because \
+                 they need administrator rights, a reboot, or affect every application.",
+            )
+            .size(12.0)
+            .weak(),
+        );
+
+        if !cfg!(windows) {
+            ui.label(RichText::new("Windows only.").color(WARN));
+            return;
+        }
+
+        ui.horizontal(|ui| {
+            if ui
+                .button(RichText::new("⚡ Apply everything safe").strong())
+                .on_hover_text("Close Black Desert first — it rewrites its config files on exit.")
+                .clicked()
+            {
+                self.run_one_click();
+            }
+            if ui
+                .button("Undo all of it")
+                .on_hover_text(
+                    "Restores the config files from their backups and puts the Windows setting \
+                     back exactly as it was.",
+                )
+                .clicked()
+            {
+                self.undo_one_click();
+            }
+        });
+
+        if !self.oneclick.ran {
+            return;
+        }
+        for (step, outcome) in &self.oneclick.steps {
+            match outcome {
+                Ok(detail) => ui.label(
+                    RichText::new(format!("✔ {step}: {detail}"))
+                        .color(OK_GREEN)
+                        .size(12.0),
+                ),
+                Err(e) => ui.label(
+                    RichText::new(format!("✘ {step}: {e}"))
+                        .color(ERR)
+                        .size(12.0),
+                ),
+            };
+        }
+    }
+
+    /// Run the safe steps in order, recording each outcome separately so a
+    /// failure in one never reads as a failure of the whole thing.
+    fn run_one_click(&mut self) {
+        self.oneclick.steps.clear();
+        self.oneclick.ran = true;
+
+        #[cfg(windows)]
+        {
+            self.one_click_config_files();
+            self.one_click_windowed_optimizations();
+        }
+    }
+
+    /// Reverse everything [`Self::run_one_click`] applied.
+    fn undo_one_click(&mut self) {
+        self.oneclick.steps.clear();
+        self.oneclick.ran = true;
+
+        #[cfg(windows)]
+        {
+            const STEP: &str = "Game config files";
+            let game_absent = || bdo_bench::is_process_running(bdo_launch::GAME_EXE).is_none();
+            match crate::gameconfig::config_root() {
+                Some(root) if !game_absent() => {
+                    let _ = root;
+                    self.oneclick.steps.push((
+                        STEP.into(),
+                        Err("Black Desert is running — close it and click again".into()),
+                    ));
+                }
+                Some(root) => {
+                    let found = crate::gameconfig::discover(&root);
+                    let outcomes =
+                        crate::gameconfig::restore_files(&root, &found.files, &game_absent);
+                    let restored = outcomes
+                        .iter()
+                        .filter(|o| matches!(o.result, Ok(crate::gameconfig::FileChange::Restored)))
+                        .count();
+                    let failures: Vec<String> = outcomes
+                        .iter()
+                        .filter_map(|o| o.result.as_ref().err().cloned())
+                        .collect();
+                    if failures.is_empty() {
+                        self.oneclick
+                            .steps
+                            .push((STEP.into(), Ok(format!("{restored} file(s) restored"))));
+                    } else {
+                        self.oneclick
+                            .steps
+                            .push((STEP.into(), Err(failures.join("; "))));
+                    }
+                    self.gameconfig.outcomes = outcomes;
+                    self.gameconfig.last_action = Some("restore");
+                }
+                None => self
+                    .oneclick
+                    .steps
+                    .push((STEP.into(), Err("Documents folder not found".into()))),
+            }
+
+            let step = crate::winsettings::WINDOWED_OPT_LABEL.to_string();
+            match crate::winsettings::restore_windowed_optimizations() {
+                Ok(true) => self.oneclick.steps.push((step, Ok("put back".into()))),
+                Ok(false) => self
+                    .oneclick
+                    .steps
+                    .push((step, Ok("was never changed by this app".into()))),
+                Err(e) => self.oneclick.steps.push((step, Err(e))),
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn one_click_config_files(&mut self) {
+        const STEP: &str = "Game config files";
+        let Some(root) = crate::gameconfig::config_root() else {
+            self.oneclick
+                .steps
+                .push((STEP.into(), Err("Documents folder not found".into())));
+            return;
+        };
+        let game_absent = || bdo_bench::is_process_running(bdo_launch::GAME_EXE).is_none();
+        if !game_absent() {
+            self.oneclick.steps.push((
+                STEP.into(),
+                Err("Black Desert is running — close it and click again".into()),
+            ));
+            return;
+        }
+        let found = crate::gameconfig::discover(&root);
+        if found.files.is_empty() {
+            self.oneclick.steps.push((
+                STEP.into(),
+                Err("no config files found — start the game once so it creates them".into()),
+            ));
+            return;
+        }
+        let outcomes = crate::gameconfig::apply_files(&root, &found.files, &game_absent);
+        let failures: Vec<String> = outcomes
+            .iter()
+            .filter_map(|o| o.result.as_ref().err().cloned())
+            .collect();
+        if !failures.is_empty() {
+            self.oneclick
+                .steps
+                .push((STEP.into(), Err(failures.join("; "))));
+            return;
+        }
+        let changed: usize = outcomes
+            .iter()
+            .filter_map(|o| match o.result {
+                Ok(crate::gameconfig::FileChange::Patched(n)) => Some(n),
+                _ => None,
+            })
+            .sum();
+        let detail = if changed == 0 {
+            "already applied".to_string()
+        } else {
+            format!("{changed} value(s) set across {} file(s)", outcomes.len())
+        };
+        self.oneclick.steps.push((STEP.into(), Ok(detail)));
+        // Keep the detailed per-file view below in sync with what just ran.
+        self.gameconfig.outcomes = outcomes;
+        self.gameconfig.last_action = Some("apply");
+    }
+
+    #[cfg(windows)]
+    fn one_click_windowed_optimizations(&mut self) {
+        let step = crate::winsettings::WINDOWED_OPT_LABEL.to_string();
+        match crate::winsettings::enable_windowed_optimizations_recording_undo() {
+            Ok(true) => self.oneclick.steps.push((step, Ok("enabled".into()))),
+            Ok(false) => self
+                .oneclick
+                .steps
+                .push((step, Ok("already enabled".into()))),
+            Err(e) => self.oneclick.steps.push((step, Err(e))),
+        }
     }
 
     // --------------------------------------------------------------- Game path

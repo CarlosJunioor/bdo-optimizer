@@ -23,6 +23,7 @@ mod presentmon;
 #[cfg(windows)]
 mod relaunch;
 mod video;
+mod winsettings;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {

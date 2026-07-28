@@ -97,6 +97,15 @@ pub struct GameConfigState {
     pub blocked: Option<String>,
 }
 
+/// State for the one-click "Apply everything safe" action.
+#[derive(Default)]
+pub struct OneClickState {
+    /// Per-step outcome of the last run, in the order the steps ran.
+    pub steps: Vec<(String, Result<String, String>)>,
+    /// True once a run has happened, so the empty list is not shown as success.
+    pub ran: bool,
+}
+
 /// Outcome of a read-only affinity verification.
 ///
 /// Only constructed/read on Windows (the verify action is Windows-only); the
@@ -237,6 +246,7 @@ pub struct App {
     pub optimize: OptimizeState,
     pub video: VideoState,
     pub gameconfig: GameConfigState,
+    pub oneclick: OneClickState,
     pub benchmark: BenchmarkState,
 }
 
@@ -252,6 +262,7 @@ impl App {
             optimize: OptimizeState::default(),
             video: VideoState::default(),
             gameconfig: GameConfigState::default(),
+            oneclick: OneClickState::default(),
             benchmark: BenchmarkState::new(),
         }
     }
