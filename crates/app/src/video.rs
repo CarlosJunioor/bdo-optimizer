@@ -492,12 +492,18 @@ pub mod worker {
     /// restoring would hide the user's exports permanently: the stash name does
     /// not end in `.nip`, so nothing would ever look at them again.
     ///
-    /// ponytail: stashes belonging to *this* process are skipped, since a live
-    /// guard owns those. A second copy of the app running concurrently could
-    /// have its stash restored mid-run; that yields a fail-closed "more than one
-    /// export" error for that run, never data loss.
+    /// Stashes are recovered regardless of which pid owns them. Skipping this
+    /// process's own pid looks safer but is strictly worse: it leaves a failed
+    /// restore hidden for the rest of the session, and Windows reuses pids, so
+    /// after a crash a new process can inherit the pid of the run that stranded
+    /// the file and skip it forever. Nothing live is at risk either way —
+    /// `job_lock` serializes jobs and this runs before the new stash is made,
+    /// so no guard of ours owns a stash at this moment.
+    ///
+    /// ponytail: a second copy of the app running concurrently could have its
+    /// stash restored mid-run; that yields a fail-closed "more than one export"
+    /// error for that run, never data loss.
     fn recover_orphaned_stashes(dir: &Path) {
-        let own_suffix = format!("{STASH_MARKER}{}", std::process::id());
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
@@ -505,9 +511,6 @@ pub mod worker {
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            if name.ends_with(&own_suffix) {
-                continue;
-            }
             let Some(marker_at) = name.rfind(STASH_MARKER) else {
                 continue;
             };
@@ -700,6 +703,31 @@ pub mod worker {
                 "stranded export"
             );
             assert!(!orphan.exists());
+
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        /// A stash carrying *our own* pid must be recovered too: a failed
+        /// restore would otherwise stay hidden for the whole session, and
+        /// Windows reuses pids, so a crashed run's pid can come back.
+        #[test]
+        fn an_orphan_with_our_own_pid_is_recovered() {
+            let dir = create_private_dir().expect("dir");
+            let original_name = "CustomProfiles_2021-02-03_04-05-06.nip";
+            let orphan = dir.join(format!(
+                "{original_name}{STASH_MARKER}{}",
+                std::process::id()
+            ));
+            std::fs::write(&orphan, "ours, stranded").unwrap();
+
+            recover_orphaned_stashes(&dir);
+
+            let restored = dir.join(original_name);
+            assert_eq!(export_files(&dir), vec![restored.clone()]);
+            assert_eq!(
+                std::fs::read_to_string(&restored).unwrap(),
+                "ours, stranded"
+            );
 
             let _ = std::fs::remove_dir_all(dir);
         }
