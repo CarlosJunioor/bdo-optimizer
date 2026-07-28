@@ -209,10 +209,78 @@ fn lines_inclusive(text: &str) -> Vec<&str> {
     out
 }
 
-/// Patch `GameOption.txt` text: `postFilter = 0` and `Tessellation = 0`.
+/// One setting the guide asks for, in the spellings each store uses.
 ///
-/// Only the value of those two keys changes; every other byte, including line
-/// endings and unrelated lines, is preserved.
+/// The same setting is written differently depending on the file: booleans are
+/// `0`/`1` in `GameOption.txt` but `false`/`true` in the XML, and the key is
+/// lower-camel in the text file and upper-camel in the XML. Both spellings are
+/// carried here so neither store gets the other's format.
+pub struct Tweak {
+    /// Key in `GameOption.txt` (matched case-insensitively).
+    pub txt_key: &'static str,
+    /// Element or `Type=` name in `gamevariable.xml`.
+    pub xml_key: &'static str,
+    pub txt_value: &'static str,
+    pub xml_value: &'static str,
+}
+
+/// The settings applied by the config-file tweak.
+///
+/// Deliberately limited to values the guide states plainly and that are plain
+/// booleans or a documented 0/1. Numeric settings whose scale is not certain
+/// (the effect-optimization slider, the anti-aliasing index) are **not** here:
+/// writing a guessed number into a live config is how this feature would make
+/// someone's game worse rather than better.
+pub const TWEAKS: &[Tweak] = &[
+    // "next to PostFilter where there's a 1 it should be a 0"
+    Tweak {
+        txt_key: "postFilter",
+        xml_key: "PostFilter",
+        txt_value: "0",
+        xml_value: "0",
+    },
+    // "You can also disable Tessellation on High settings and above"
+    Tweak {
+        txt_key: "Tessellation",
+        xml_key: "Tessellation",
+        txt_value: "0",
+        xml_value: "false",
+    },
+    // "I don't use Auto Frame Optimization... It will cancel out the settings below"
+    Tweak {
+        txt_key: "autoOptimization",
+        xml_key: "AutoOptimization",
+        txt_value: "0",
+        xml_value: "false",
+    },
+    // "Disable low power mode. This one's a big deal."
+    Tweak {
+        txt_key: "sleepModeEnable",
+        xml_key: "SleepModeEnable",
+        txt_value: "0",
+        xml_value: "false",
+    },
+    // "Combine this with Remove Faraway Effects to clean up unnecessary particles"
+    Tweak {
+        txt_key: "useNearestEffectOnly",
+        xml_key: "UseNearestEffectOnly",
+        txt_value: "1",
+        xml_value: "true",
+    },
+    // "I don't use the Character Optimization setting."
+    Tweak {
+        txt_key: "useFarPlayerOptimization",
+        xml_key: "useFarPlayerOptimization",
+        txt_value: "0",
+        xml_value: "false",
+    },
+];
+
+/// Patch `GameOption.txt` text: every [`TWEAKS`] key gets its `txt_value`.
+///
+/// Only the value of a matched key changes; every other byte, including line
+/// endings and unrelated lines, is preserved. A key absent from this file is
+/// simply not applicable — it is not an error and is not counted.
 pub fn patch_game_option(text: &str) -> (String, PatchStats) {
     let mut stats = PatchStats::default();
     let mut out = String::with_capacity(text.len());
@@ -227,28 +295,91 @@ fn patch_option_line(line: &str, stats: &mut PatchStats) -> String {
         return line.to_string();
     };
     let key = line[..eq].trim();
-    if !key.eq_ignore_ascii_case("postFilter") && !key.eq_ignore_ascii_case("Tessellation") {
+    let Some(tweak) = TWEAKS.iter().find(|t| key.eq_ignore_ascii_case(t.txt_key)) else {
         return line.to_string();
-    }
+    };
     let value_part = &line[eq + 1..];
     let trimmed = value_part.trim_end_matches(['\r', '\n']);
     let (value, ending) = value_part.split_at(trimmed.len());
     stats.found += 1;
-    if value.trim() == "0" {
+    if value.trim() == tweak.txt_value {
         return line.to_string();
     }
     stats.changed += 1;
-    format!("{}= 0{}", &line[..eq], ending)
+    format!("{}= {}{}", &line[..eq], tweak.txt_value, ending)
 }
 
-/// Patch `gamevariable.xml` text: every `<PostFilter Value="…"/>` becomes `"0"`
-/// and every `<Tessellation Value="…"/>` becomes `"false"` (the guide says all
-/// matching entries).
+/// Patch `gamevariable.xml` text: every [`TWEAKS`] key gets its `xml_value`.
+///
+/// These files store the same setting in two syntactically different shapes,
+/// and which one a given setting uses is not predictable — several appear in
+/// both. Every key is therefore tried against both:
+///
+/// * `<Key Value="…"/>`
+/// * `<GameOption Type="Key" DataValue="…"/>`
+///
+/// Each shape occurs multiple times per file (the live values plus one copy per
+/// in-game settings preset); the guide says to set them all.
 pub fn patch_game_variable(text: &str) -> (String, PatchStats) {
     let mut stats = PatchStats::default();
-    let text = set_attr_values(text, "<PostFilter Value=\"", "0", &mut stats);
-    let text = set_attr_values(&text, "<Tessellation Value=\"", "false", &mut stats);
+    let mut text = text.to_string();
+    for tweak in TWEAKS {
+        let element = format!("<{} Value=\"", tweak.xml_key);
+        text = set_attr_values(&text, &element, tweak.xml_value, &mut stats);
+        text = set_game_option_values(&text, tweak.xml_key, tweak.xml_value, &mut stats);
+    }
     (text, stats)
+}
+
+/// Rewrite `DataValue` inside every `<GameOption Type="key" … />` tag.
+///
+/// The `DataValue` must be found *within the same tag* as the matched `Type`,
+/// which is why the search is bounded by the tag's closing `>`. Some tags carry
+/// a second discriminating attribute (`RenderPlayerColor` repeats with
+/// different `ColorType`s), so the tag — not the `Type` — is the unit of work.
+fn set_game_option_values(
+    text: &str,
+    key: &str,
+    new_value: &str,
+    stats: &mut PatchStats,
+) -> String {
+    let opener = format!("<GameOption Type=\"{key}\"");
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(found) = rest.find(&opener) {
+        let tag_start = found + opener.len();
+        out.push_str(&rest[..tag_start]);
+        rest = &rest[tag_start..];
+
+        // Bound everything below to this tag.
+        let tag_end = rest.find('>').unwrap_or(rest.len());
+        let (tag, after) = rest.split_at(tag_end);
+
+        const ATTR: &str = "DataValue=\"";
+        let Some(attr_at) = tag.find(ATTR) else {
+            // No DataValue in this tag — copy it untouched and keep scanning.
+            out.push_str(tag);
+            rest = after;
+            continue;
+        };
+        let value_start = attr_at + ATTR.len();
+        let Some(close) = tag[value_start..].find('"') else {
+            out.push_str(tag);
+            rest = after;
+            continue;
+        };
+        let current = &tag[value_start..value_start + close];
+        if current != new_value {
+            stats.changed += 1;
+        }
+        stats.found += 1;
+        out.push_str(&tag[..value_start]);
+        out.push_str(new_value);
+        out.push_str(&tag[value_start + close..]);
+        rest = after;
+    }
+    out.push_str(rest);
+    out
 }
 
 fn set_attr_values(
@@ -1010,6 +1141,73 @@ mod tests {
         let (twice, stats) = patch_game_variable(&once);
         assert_eq!(stats.changed, 0);
         assert_eq!(twice, once);
+    }
+
+    #[test]
+    fn game_option_type_shape_is_patched_within_its_own_tag() {
+        // Shape A: several settings live only here, never as <Key Value="…"/>.
+        let text = "<GameOption Type=\"AutoOptimization\" DataValue=\"true\"/>\n\
+                    <GameOption Type=\"useFarPlayerOptimization\" DataValue=\"true\"/>\n";
+        let (patched, stats) = patch_game_variable(text);
+        assert_eq!(stats.changed, 2);
+        assert!(patched.contains("<GameOption Type=\"AutoOptimization\" DataValue=\"false\"/>"));
+        assert!(
+            patched.contains("<GameOption Type=\"useFarPlayerOptimization\" DataValue=\"false\"/>")
+        );
+    }
+
+    #[test]
+    fn a_tag_without_datavalue_is_left_alone() {
+        // The DataValue search must not run past this tag into the next one.
+        let text = "<GameOption Type=\"AutoOptimization\"/>\n<Other DataValue=\"keep\"/>\n";
+        let (patched, stats) = patch_game_variable(text);
+        assert_eq!(patched, text);
+        assert_eq!(stats, PatchStats::default());
+    }
+
+    #[test]
+    fn a_repeated_type_with_a_discriminator_is_not_confused() {
+        // RenderPlayerColor repeats with different ColorType values; each tag is
+        // its own unit of work, so a matcher must not spill across them.
+        let text = "<GameOption Type=\"SleepModeEnable\" DataValue=\"true\"/>\n\
+                    <GameOption Type=\"RenderPlayerColor\" ColorType=\"1\" DataValue=\"7\"/>\n";
+        let (patched, stats) = patch_game_variable(text);
+        assert_eq!(stats.changed, 1);
+        assert!(patched.contains("<GameOption Type=\"SleepModeEnable\" DataValue=\"false\"/>"));
+        assert!(
+            patched.contains("ColorType=\"1\" DataValue=\"7\""),
+            "{patched}"
+        );
+    }
+
+    #[test]
+    fn every_tweak_is_idempotent_across_both_shapes() {
+        let mut doc = String::new();
+        for t in TWEAKS {
+            doc.push_str(&format!("<{} Value=\"zzz\"/>\n", t.xml_key));
+            doc.push_str(&format!(
+                "<GameOption Type=\"{}\" DataValue=\"zzz\"/>\n",
+                t.xml_key
+            ));
+        }
+        let (once, first) = patch_game_variable(&doc);
+        assert_eq!(first.changed, TWEAKS.len() * 2);
+        let (twice, second) = patch_game_variable(&once);
+        assert_eq!(second.changed, 0);
+        assert_eq!(twice, once);
+    }
+
+    #[test]
+    fn text_store_uses_numeric_booleans_not_xml_ones() {
+        // Regression: the .txt store must never receive true/false.
+        let text = "sleepModeEnable = 1\r\nuseNearestEffectOnly = 0\r\n";
+        let (patched, stats) = patch_game_option(text);
+        assert_eq!(stats.changed, 2);
+        assert_eq!(
+            patched,
+            "sleepModeEnable = 0\r\nuseNearestEffectOnly = 1\r\n"
+        );
+        assert!(!patched.contains("false") && !patched.contains("true"));
     }
 
     #[test]
