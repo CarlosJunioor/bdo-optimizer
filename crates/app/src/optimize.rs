@@ -538,10 +538,19 @@ impl App {
             ))
             .size(12.0),
         );
-        ui.checkbox(
-            &mut self.video.ull,
-            "Also enable Ultra Low Latency (guide: test whether your CPU handles the overhead)",
-        );
+        // The running job captured this value at start; letting it change
+        // mid-run would make the result message describe a different profile
+        // than the one actually imported.
+        #[cfg(windows)]
+        let ull_locked = self.video.worker.is_some();
+        #[cfg(not(windows))]
+        let ull_locked = false;
+        ui.add_enabled_ui(!ull_locked, |ui| {
+            ui.checkbox(
+                &mut self.video.ull,
+                "Also enable Ultra Low Latency (guide: test whether your CPU handles the overhead)",
+            );
+        });
 
         #[cfg(windows)]
         {
@@ -686,8 +695,19 @@ impl App {
             ui.label(RichText::new("Documents folder not found.").color(WARN));
             return;
         };
-        let files = crate::gameconfig::find_config_files(&root);
-        if files.is_empty() {
+        let found = crate::gameconfig::discover(&root);
+        // A directory we could not read means the sweep is incomplete — say so
+        // rather than letting a reduced file count read as "all done".
+        for problem in &found.unreadable {
+            ui.label(
+                RichText::new(format!(
+                    "Could not read {problem} — files under it were not included."
+                ))
+                .color(WARN)
+                .size(12.0),
+            );
+        }
+        if found.files.is_empty() {
             ui.label(
                 RichText::new(format!(
                     "No BDO config files found under {}. Start the game once so it creates them.",
@@ -701,13 +721,14 @@ impl App {
         ui.label(
             RichText::new(format!(
                 "{} file(s) found under {}",
-                files.len(),
+                found.files.len(),
                 root.display()
             ))
             .size(12.0)
             .weak(),
         );
 
+        let files = found.files.clone();
         ui.horizontal(|ui| {
             if ui.button("Set PostFilter & Tessellation to 0").clicked() {
                 self.run_gameconfig(&files, "apply");
@@ -720,36 +741,48 @@ impl App {
         if let Some(msg) = &self.gameconfig.blocked {
             ui.label(RichText::new(msg.as_str()).color(WARN).strong());
         }
-        if let Some(action) = self.gameconfig.last_action {
-            for outcome in &self.gameconfig.outcomes {
-                let name = outcome
-                    .path
-                    .strip_prefix(&root)
-                    .unwrap_or(&outcome.path)
-                    .display();
-                match (&outcome.result, action) {
-                    (Ok(0), "apply") => {
-                        ui.label(RichText::new(format!("• {name}: already optimized")).size(12.0))
-                    }
-                    (Ok(n), "apply") => ui.label(
-                        RichText::new(format!("✔ {name}: {n} value(s) set to guide defaults"))
-                            .color(OK_GREEN)
-                            .size(12.0),
-                    ),
-                    (Ok(0), _) => ui
-                        .label(RichText::new(format!("• {name}: no backup to restore")).size(12.0)),
-                    (Ok(_), _) => ui.label(
-                        RichText::new(format!("✔ {name}: restored original"))
-                            .color(OK_GREEN)
-                            .size(12.0),
-                    ),
-                    (Err(e), _) => ui.label(
-                        RichText::new(format!("✘ {name}: {e}"))
-                            .color(ERR)
-                            .size(12.0),
-                    ),
-                };
-            }
+        for outcome in &self.gameconfig.outcomes {
+            use crate::gameconfig::FileChange;
+            let name = outcome
+                .path
+                .strip_prefix(&root)
+                .unwrap_or(&outcome.path)
+                .display();
+            match &outcome.result {
+                Ok(FileChange::Patched(n)) => ui.label(
+                    RichText::new(format!("✔ {name}: {n} value(s) set to guide defaults"))
+                        .color(OK_GREEN)
+                        .size(12.0),
+                ),
+                Ok(FileChange::AlreadyOptimized) => {
+                    ui.label(RichText::new(format!("• {name}: already optimized")).size(12.0))
+                }
+                Ok(FileChange::NothingRecognized) => ui.label(
+                    RichText::new(format!(
+                        "! {name}: no PostFilter/Tessellation settings recognized — left unchanged"
+                    ))
+                    .color(WARN)
+                    .size(12.0),
+                ),
+                Ok(FileChange::Restored) => ui.label(
+                    RichText::new(format!("✔ {name}: restored original"))
+                        .color(OK_GREEN)
+                        .size(12.0),
+                ),
+                Ok(FileChange::NoBackup) => {
+                    ui.label(RichText::new(format!("• {name}: no backup to restore")).size(12.0))
+                }
+                Ok(FileChange::Skipped) => ui.label(
+                    RichText::new(format!("! {name}: skipped — BDO started mid-run"))
+                        .color(WARN)
+                        .size(12.0),
+                ),
+                Err(e) => ui.label(
+                    RichText::new(format!("✘ {name}: {e}"))
+                        .color(ERR)
+                        .size(12.0),
+                ),
+            };
         }
     }
 
@@ -757,7 +790,13 @@ impl App {
     /// rewrites these files on exit, so an edit would be lost or race).
     fn run_gameconfig(&mut self, files: &[std::path::PathBuf], action: &'static str) {
         self.gameconfig.blocked = None;
-        if bdo_bench::is_process_running(bdo_launch::GAME_EXE).is_some() {
+        // Stale results from an earlier click must not survive next to a fresh
+        // warning — they would read as if this click had succeeded.
+        self.gameconfig.outcomes.clear();
+        self.gameconfig.last_action = None;
+
+        let game_absent = || bdo_bench::is_process_running(bdo_launch::GAME_EXE).is_none();
+        if !game_absent() {
             self.gameconfig.blocked = Some(
                 "BDO is running — close the game first. It rewrites these files on exit, \
                  which would undo the change."
@@ -765,11 +804,25 @@ impl App {
             );
             return;
         }
+        // The guard is re-checked before each file, so a launch mid-batch stops
+        // the run instead of writing behind the game's back.
         self.gameconfig.outcomes = if action == "apply" {
-            crate::gameconfig::apply_files(files)
+            crate::gameconfig::apply_files(files, &game_absent)
         } else {
-            crate::gameconfig::restore_files(files)
+            crate::gameconfig::restore_files(files, &game_absent)
         };
+        if self
+            .gameconfig
+            .outcomes
+            .iter()
+            .any(|o| matches!(o.result, Ok(crate::gameconfig::FileChange::Skipped)))
+        {
+            self.gameconfig.blocked = Some(
+                "BDO launched while files were being processed — the run stopped early. \
+                 Close the game and click again."
+                    .to_string(),
+            );
+        }
         self.gameconfig.last_action = Some(action);
     }
 

@@ -173,28 +173,59 @@ pub fn candidate_paths(exe_dir: Option<&Path>) -> Vec<PathBuf> {
     out
 }
 
-/// Verify that `path` is the exact bundled Profile Inspector build.
-pub fn is_trusted_inspector(path: &Path) -> bool {
+/// Open the inspector for hashing in a way that blocks tampering while the
+/// handle lives.
+///
+/// On Windows the share mode is `FILE_SHARE_READ` only: other processes may
+/// read the file but cannot write to, rename, or delete it. Holding this handle
+/// across both the hash check *and* the spawn is what makes the pin meaningful
+/// — otherwise a same-user process could swap the executable in between and get
+/// its replacement launched with the administrator token we run under.
+fn open_locked(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(path)
+    }
+    #[cfg(not(windows))]
+    std::fs::File::open(path)
+}
+
+/// Hash an already-open handle against the pinned build identity.
+fn handle_is_trusted(file: &mut std::fs::File) -> bool {
     use sha2::Digest;
-    let Ok(metadata) = path.metadata() else {
+    let Ok(metadata) = file.metadata() else {
         return false;
     };
     if !metadata.is_file() || metadata.len() != INSPECTOR_SIZE {
         return false;
     }
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return false;
-    };
     let mut hash = sha2::Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
-        match std::io::Read::read(&mut file, &mut buffer) {
+        match std::io::Read::read(file, &mut buffer) {
             Ok(0) => break,
             Ok(read) => hash.update(&buffer[..read]),
             Err(_) => return false,
         }
     }
     <[u8; 32]>::from(hash.finalize()) == INSPECTOR_SHA256
+}
+
+/// Verify that `path` is the exact bundled Profile Inspector build.
+///
+/// Suitable for *discovery* only. Anything that goes on to execute the file
+/// must instead hold the handle from [`open_locked`] across the spawn; see
+/// [`worker::run`].
+pub fn is_trusted_inspector(path: &Path) -> bool {
+    match open_locked(path) {
+        Ok(mut file) => handle_is_trusted(&mut file),
+        Err(_) => false,
+    }
 }
 
 /// Resolve the bundled inspector executable, or `None` if it cannot be found.
@@ -222,10 +253,26 @@ pub mod worker {
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc::{channel, Receiver};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::{Duration, Instant};
 
     /// How long one inspector invocation may take before it is killed.
     const INSPECTOR_TIMEOUT: Duration = Duration::from_secs(90);
+
+    /// Serializes driver jobs so two of our own jobs cannot mistake each other's
+    /// `CustomProfiles_*.nip` export for their own.
+    ///
+    /// ponytail: in-process lock only. A second *copy* of the app (or a manual
+    /// Profile Inspector export) still races; that is why the export step below
+    /// also picks the newest created file and deletes only the file it claimed.
+    /// A named Windows mutex would close the cross-process case if it ever bites.
+    fn job_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let mutex = LOCK.get_or_init(|| Mutex::new(()));
+        mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     /// A one-shot background driver-profile job. Poll `rx` from the UI loop.
     pub struct DriverWorker {
@@ -244,7 +291,14 @@ pub mod worker {
     }
 
     fn run(exe: &Path, settings: &[(u32, u32)]) -> Result<String, String> {
-        if !super::is_trusted_inspector(exe) {
+        let _serialized = job_lock();
+
+        // Hold this handle for the whole job. It denies other processes write /
+        // rename / delete access to the executable, so the binary we hashed is
+        // provably the binary every spawn below runs — no swap window.
+        let mut locked = super::open_locked(exe)
+            .map_err(|e| format!("could not open {}: {e}", exe.display()))?;
+        if !super::handle_is_trusted(&mut locked) {
             return Err(format!(
                 "{} does not match the bundled Profile Inspector build",
                 exe.display()
@@ -255,30 +309,43 @@ pub mod worker {
             .ok_or_else(|| "inspector path has no parent directory".to_string())?
             .to_path_buf();
 
-        // 1. Write the .nip and merge-import it silently.
-        let nip = std::env::temp_dir().join("bdo-optimizer-nvidia-profile.nip");
-        std::fs::write(&nip, super::utf16le_bytes(&super::nip_xml(settings)))
-            .map_err(|e| format!("could not write {}: {e}", nip.display()))?;
-        let nip_arg = nip.to_string_lossy().into_owned();
-        let import = run_inspector(exe, &["-mergeImport", "-silentImport", &nip_arg]);
-        let _ = std::fs::remove_file(&nip);
+        // 1. Write the .nip into a private directory and merge-import it.
+        //    `create_dir` fails if the name already exists, so winning that call
+        //    proves exclusive ownership: no other process can have pre-created
+        //    the path and no shared, predictable file is handed to the elevated
+        //    child for it to re-open.
+        let job_dir = create_private_dir()?;
+        let nip = job_dir.join("profile.nip");
+        let write = std::fs::write(&nip, super::utf16le_bytes(&super::nip_xml(settings)))
+            .map_err(|e| format!("could not write {}: {e}", nip.display()));
+        let import = write.and_then(|()| {
+            let nip_arg = nip.to_string_lossy().into_owned();
+            run_inspector(exe, &["-mergeImport", "-silentImport", &nip_arg])
+        });
+        let _ = std::fs::remove_dir_all(&job_dir);
         import?;
 
         // 2. The silent import reports nothing, so verify through an export.
         let before: HashSet<PathBuf> = export_files(&exe_dir).into_iter().collect();
         run_inspector(exe, &["-exportCustomized"])?;
-        let created: Vec<PathBuf> = export_files(&exe_dir)
+        let mut created: Vec<PathBuf> = export_files(&exe_dir)
             .into_iter()
             .filter(|p| !before.contains(p))
             .collect();
+        // `read_dir` order is unspecified; the newest file is the one this run
+        // just produced. Only that file is consumed and deleted, so a concurrent
+        // manual export is never swallowed.
+        created.sort_by_key(|p| {
+            std::fs::metadata(p)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+        });
         let export = created
-            .first()
+            .last()
             .ok_or_else(|| "verification export produced no file".to_string())?;
         let bytes = std::fs::read(export)
             .map_err(|e| format!("could not read {}: {e}", export.display()))?;
-        for file in &created {
-            let _ = std::fs::remove_file(file);
-        }
+        let _ = std::fs::remove_file(export);
 
         if super::export_confirms(&super::decode_export(&bytes), settings) {
             Ok(format!(
@@ -299,6 +366,28 @@ pub mod worker {
                 kept.display()
             ))
         }
+    }
+
+    /// Create a fresh, exclusively-owned directory under the temp dir.
+    ///
+    /// `create_dir` is atomic and fails when the path exists, so the first name
+    /// that succeeds is one nobody else holds.
+    fn create_private_dir() -> Result<PathBuf, String> {
+        let base = std::env::temp_dir();
+        let pid = std::process::id();
+        for attempt in 0..64u32 {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(attempt);
+            let dir = base.join(format!("bdo-optimizer-nvidia-{pid}-{nanos}-{attempt}"));
+            match std::fs::create_dir(&dir) {
+                Ok(()) => return Ok(dir),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("could not create {}: {e}", dir.display())),
+            }
+        }
+        Err("could not create a private temp directory".to_string())
     }
 
     /// Every `CustomProfiles_*.nip` currently next to the inspector executable.
@@ -331,16 +420,32 @@ pub mod worker {
         let started = Instant::now();
         loop {
             match child.try_wait() {
-                Ok(Some(_)) => return Ok(()),
+                Ok(Some(status)) if status.success() => return Ok(()),
+                // A non-zero exit means the import/export did not do what we
+                // asked. Reporting it as success would let a failed run wear a
+                // green check whenever the profile already matched.
+                Ok(Some(status)) => {
+                    return Err(format!(
+                        "Profile Inspector exited with {status} (it may have been closed or \
+                         refused by the driver)"
+                    ))
+                }
                 Ok(None) if started.elapsed() > INSPECTOR_TIMEOUT => {
+                    // Kill *and reap*: without the wait the child stays a zombie
+                    // handle and can still be mid-write while we report failure.
                     let _ = child.kill();
+                    let _ = child.wait();
                     return Err(format!(
                         "Profile Inspector did not finish within {}s",
                         INSPECTOR_TIMEOUT.as_secs()
                     ));
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-                Err(e) => return Err(format!("failed waiting for Profile Inspector: {e}")),
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("failed waiting for Profile Inspector: {e}"));
+                }
             }
         }
     }
