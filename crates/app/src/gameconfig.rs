@@ -371,9 +371,16 @@ fn apply_one(root: &Path, path: &Path) -> Result<FileChange, String> {
     let backup = backup_path(path);
     // A zero-length backup is treated as absent: it would be a useless restore
     // point, and trusting mere existence would also skip making a real one.
-    let has_backup = std::fs::metadata(&backup).is_ok_and(|m| m.is_file() && m.len() > 0);
-    if !has_backup {
-        write_atomic(&backup, &text).map_err(|e| format!("backup failed: {e}"))?;
+    match std::fs::metadata(&backup) {
+        // A usable backup already exists: never touch it.
+        Ok(m) if m.is_file() && m.len() > 0 => {}
+        // A zero-length leftover from a crashed write is worthless as a restore
+        // point, so it gets replaced outright.
+        Ok(_) => write_atomic(&backup, &text).map_err(|e| format!("backup failed: {e}"))?,
+        // Nothing there: create, never replace. A backup that appears in the
+        // gap is an *older* copy of the file and therefore the better restore
+        // point, so losing that race must not overwrite it.
+        Err(_) => write_new_only(&backup, &text).map_err(|e| format!("backup failed: {e}"))?,
     }
     write_atomic(path, &patched).map_err(|e| format!("write failed: {e}"))?;
     Ok(FileChange::Patched(stats.changed))
@@ -453,8 +460,53 @@ fn pin_and_verify(root: &Path, path: &Path) -> Result<(DirGuard, PathBuf), Strin
     Ok((DirGuard(handles), target))
 }
 
+/// Whether an open handle refers to a *name-surrogate* reparse point — a
+/// symlink or junction, i.e. one that redirects a path.
+///
+/// Classifying from the handle (rather than re-inspecting the path) is what
+/// makes the check atomic with the open. The name-surrogate bit is what keeps
+/// OneDrive Files On-Demand folders working: those are reparse points too, but
+/// not surrogates, and rejecting them would lock out everyone whose Documents
+/// folder lives in OneDrive.
+#[cfg(windows)]
+fn is_name_surrogate(handle: &std::fs::File) -> std::io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        FileAttributeTagInfo, GetFileInformationByHandleEx, FILE_ATTRIBUTE_TAG_INFO,
+    };
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    /// `IsReparseTagNameSurrogate`: the tag names another entity.
+    const REPARSE_TAG_NAME_SURROGATE: u32 = 0x2000_0000;
+
+    let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
+    // SAFETY: `info` is a valid, correctly-sized FILE_ATTRIBUTE_TAG_INFO and the
+    // handle is live for the call.
+    unsafe {
+        GetFileInformationByHandleEx(
+            HANDLE(handle.as_raw_handle() as _),
+            FileAttributeTagInfo,
+            std::ptr::from_mut(&mut info).cast(),
+            std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    }
+    .map_err(std::io::Error::other)?;
+
+    Ok(info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        && info.ReparseTag & REPARSE_TAG_NAME_SURROGATE != 0)
+}
+
 /// Refuse a leaf that is itself a symlink, so no read or write follows it out
 /// of the pinned directory. A file that does not exist is fine.
+///
+/// ponytail: this is a check, not a pin — the leaf is not held open, because
+/// holding it would block the very replace that publishes the new contents. The
+/// residual window is narrow: the containing directory *is* pinned for the whole
+/// operation, and creating a *file* symlink inside it requires either
+/// administrator rights or Developer Mode, so an ordinary same-user process
+/// cannot swap one in. Pin the leaf through a handle-relative open if that ever
+/// stops being true.
 fn reject_leaf_link(path: &Path) -> Result<(), String> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => Err(format!(
@@ -476,30 +528,30 @@ fn pin_dir(dir: &Path) -> Result<std::fs::File, String> {
         const FILE_READ_ATTRIBUTES: u32 = 0x0080;
         const FILE_SHARE_READ: u32 = 0x0000_0001;
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 
-        // Reject only *name-surrogate* reparse points — symlinks and junctions,
-        // the ones that redirect a path. `is_symlink` is precisely that test.
-        // Checking the raw FILE_ATTRIBUTE_REPARSE_POINT bit instead would also
-        // reject OneDrive Files On-Demand folders, which are reparse points too
-        // and are how a great many people's Documents folder is stored.
-        if std::fs::symlink_metadata(dir)
-            .map_err(|e| format!("could not inspect {}: {e}", dir.display()))?
-            .file_type()
-            .is_symlink()
+        // Open first, classify from the handle second. Inspecting the path and
+        // then opening it would be two separate lookups, and a link swapped in
+        // between the two would be followed — pinning the wrong directory.
+        // `FILE_FLAG_OPEN_REPARSE_POINT` means this open never follows one.
+        let handle = std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            // Read sharing only: denying write and delete sharing is what stops
+            // a rename, a delete, or a reparse point being set while we work.
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(dir)
+            .map_err(|e| format!("could not pin {}: {e}", dir.display()))?;
+
+        if is_name_surrogate(&handle)
+            .map_err(|e| format!("could not classify {}: {e}", dir.display()))?
         {
             return Err(format!(
                 "{} is a link — refusing to write through it",
                 dir.display()
             ));
         }
-        std::fs::OpenOptions::new()
-            .access_mode(FILE_READ_ATTRIBUTES)
-            // Read sharing only: denying write and delete sharing is what stops
-            // a rename, a delete, or a reparse point being set while we work.
-            .share_mode(FILE_SHARE_READ)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(dir)
-            .map_err(|e| format!("could not pin {}: {e}", dir.display()))
+        Ok(handle)
     }
     #[cfg(not(windows))]
     std::fs::File::open(dir).map_err(|e| format!("could not open {}: {e}", dir.display()))
@@ -546,6 +598,40 @@ struct Replace {
     consumed: bool,
 }
 
+/// Write `contents` to `path` only if nothing is there, leaving any existing
+/// file untouched. Used for the one-time backup, where an existing copy is
+/// always the more valuable one.
+fn write_new_only(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let (mut file, tmp) = create_temp_sibling(path)?;
+    let write = file
+        .write_all(contents.as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(e) = write {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    #[cfg(windows)]
+    let moved = move_without_replacing(&tmp, path).map_err(|r| r.error);
+    #[cfg(not(windows))]
+    let moved = std::fs::hard_link(&tmp, path).and_then(|()| std::fs::remove_file(&tmp));
+    match moved {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            // Losing the race is success: a backup already exists.
+            if e.kind() == std::io::ErrorKind::Interrupted
+                || e.kind() == std::io::ErrorKind::AlreadyExists
+            {
+                return Ok(());
+            }
+            Err(e)
+        }
+    }
+}
+
 /// Create an exclusively-owned temp file next to `path`.
 ///
 /// `create_new` is the important part: it fails when the name already exists,
@@ -590,7 +676,41 @@ fn create_temp_sibling(path: &Path) -> std::io::Result<(std::fs::File, PathBuf)>
 /// Every other failure is reported instead of being papered over with a rename.
 fn replace_file(tmp: &Path, dest: &Path) -> Result<(), Replace> {
     #[cfg(windows)]
-    return replace_file_windows(tmp, dest);
+    {
+        // The two Windows strategies hand off to each other when the
+        // destination appears or disappears between calls. A pathological
+        // create/delete race could ping-pong forever, so the handoff is a
+        // bounded loop rather than mutual recursion.
+        const MAX_ATTEMPTS: u32 = 8;
+        let mut replace_existing = dest.exists();
+        for _ in 0..MAX_ATTEMPTS {
+            let outcome = if replace_existing {
+                replace_file_windows(tmp, dest)
+            } else {
+                move_without_replacing(tmp, dest)
+            };
+            match outcome {
+                Err(Replace {
+                    consumed: false,
+                    error,
+                }) if error.kind() == std::io::ErrorKind::Interrupted => {
+                    // `Interrupted` is the private signal meaning "the other
+                    // strategy is the right one now"; flip and retry.
+                    replace_existing = !replace_existing;
+                }
+                other => return other,
+            }
+        }
+        Err(Replace {
+            error: std::io::Error::other(format!(
+                "could not settle a replacement for {} — the file kept appearing and \
+                 disappearing",
+                dest.display()
+            )),
+            consumed: false,
+        })
+    }
+    #[allow(unreachable_code)]
     #[cfg(not(windows))]
     std::fs::rename(tmp, dest).map_err(|error| Replace {
         error,
@@ -633,9 +753,13 @@ fn move_without_replacing(tmp: &Path, dest: &Path) -> Result<(), Replace> {
         Err(e) => {
             let code = win32_code(&e);
             if code == Some(ERROR_ALREADY_EXISTS.0) || code == Some(ERROR_FILE_EXISTS.0) {
-                // Someone created the destination in the gap; go back through
-                // the ACL-preserving path rather than clobbering it.
-                return replace_file_windows(tmp, dest);
+                // Someone created the destination in the gap; ask the caller to
+                // retry through the ACL-preserving path rather than clobbering
+                // it. See `replace_file` for why this is a signal, not a call.
+                return Err(Replace {
+                    error: std::io::Error::from(std::io::ErrorKind::Interrupted),
+                    consumed: false,
+                });
             }
             Err(Replace {
                 error: std::io::Error::other(format!(
@@ -700,21 +824,25 @@ fn replace_file_windows(tmp: &Path, dest: &Path) -> Result<(), Replace> {
             let missing_dest =
                 code == Some(ERROR_FILE_NOT_FOUND.0) || code == Some(ERROR_PATH_NOT_FOUND.0);
             if missing_dest {
-                return move_without_replacing(tmp, dest);
+                // Destination vanished; retry as a plain non-replacing move.
+                return Err(Replace {
+                    error: std::io::Error::from(std::io::ErrorKind::Interrupted),
+                    consumed: false,
+                });
             }
             // Only these three leave the two names in a half-moved state, so
             // only these make the temp file something other than disposable
             // scratch. Marking *every* failure as consumed would leak a .tmp
             // sibling after ordinary failures like a sharing violation, which
             // leave both names untouched.
-            const ERROR_UNABLE_TO_REMOVE_REPLACED: u32 = 1175;
+            // 1175 (UNABLE_TO_REMOVE_REPLACED) is deliberately *not* here:
+            // Windows guarantees both original names still exist in that case,
+            // so the temp file is still disposable and must be cleaned up.
             const ERROR_UNABLE_TO_MOVE_REPLACEMENT: u32 = 1176;
             const ERROR_UNABLE_TO_MOVE_REPLACEMENT_2: u32 = 1177;
             let consumed = matches!(
                 code,
-                Some(ERROR_UNABLE_TO_REMOVE_REPLACED)
-                    | Some(ERROR_UNABLE_TO_MOVE_REPLACEMENT)
-                    | Some(ERROR_UNABLE_TO_MOVE_REPLACEMENT_2)
+                Some(ERROR_UNABLE_TO_MOVE_REPLACEMENT) | Some(ERROR_UNABLE_TO_MOVE_REPLACEMENT_2)
             );
             let detail = if consumed {
                 format!(" (a replacement may remain at {})", tmp.display())
@@ -900,6 +1028,33 @@ mod tests {
         let paths = vec![file.clone()];
         apply_files(&dir, &paths, always_safe());
         assert_eq!(std::fs::read_to_string(&backup).unwrap(), GAME_OPTION);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn write_new_only_never_overwrites_an_existing_backup() {
+        let dir = temp_dir("newonly");
+        let target = dir.join("GameOption.txt.bak");
+        std::fs::write(&target, "the older, better copy").unwrap();
+
+        write_new_only(&target, "should not land").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "the older, better copy"
+        );
+        // And it must not leave scratch files behind when it declines.
+        let leftovers = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(leftovers, 0);
+
+        // With nothing there, it writes.
+        let fresh = dir.join("fresh.bak");
+        write_new_only(&fresh, "written").unwrap();
+        assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "written");
 
         std::fs::remove_dir_all(dir).unwrap();
     }

@@ -331,20 +331,16 @@ pub mod worker {
 
         // 2. The silent import reports nothing, so verify through an export.
         let before: HashSet<PathBuf> = export_files(&exe_dir).into_iter().collect();
-        let started = std::time::SystemTime::now();
         run_inspector(exe, &["-exportCustomized"])?;
-        // The export name carries only a second-resolution timestamp, so a run
-        // in the same second as an earlier one reuses the pathname. Matching on
-        // "new name" alone would then see nothing and report a false failure;
-        // a freshly written mtime identifies the reused name as ours.
+        // Attribution is by pathname alone. Timestamps were tried and dropped:
+        // they depend on clock direction and filesystem granularity, and a
+        // wrong-but-plausible match is worse here than a clear failure. If a
+        // stale export from the same wall-clock second already occupies the
+        // name, this run reports "no file" and the user retries — failing
+        // closed, never verifying against a file that is not ours.
         let created: Vec<PathBuf> = export_files(&exe_dir)
             .into_iter()
-            .filter(|p| {
-                !before.contains(p)
-                    || std::fs::metadata(p)
-                        .and_then(|m| m.modified())
-                        .is_ok_and(|m| m >= started)
-            })
+            .filter(|p| !before.contains(p))
             .collect();
         // The export lands next to the executable under a timestamped name we
         // do not choose, so the only sound attribution is "exactly one new file
@@ -480,6 +476,49 @@ pub mod worker {
             .collect()
     }
 
+    /// Spawn the inspector without a console window and wait for it to exit.
+    fn run_inspector(exe: &Path, args: &[&str]) -> Result<(), String> {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+        let mut child = std::process::Command::new(exe)
+            .args(args)
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|e| format!("could not start {}: {e}", exe.display()))?;
+
+        let started = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => return Ok(()),
+                // A non-zero exit means the import/export did not do what we
+                // asked. Reporting it as success would let a failed run wear a
+                // green check whenever the profile already matched.
+                Ok(Some(status)) => {
+                    return Err(format!(
+                        "Profile Inspector exited with {status} (it may have been closed or \
+                         refused by the driver)"
+                    ))
+                }
+                Ok(None) if started.elapsed() > INSPECTOR_TIMEOUT => {
+                    // Kill *and reap*: without the wait the child stays a zombie
+                    // handle and can still be mid-write while we report failure.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "Profile Inspector did not finish within {}s",
+                        INSPECTOR_TIMEOUT.as_secs()
+                    ));
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("failed waiting for Profile Inspector: {e}"));
+                }
+            }
+        }
+    }
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -529,50 +568,6 @@ pub mod worker {
             assert_ne!(a, b);
             let _ = std::fs::remove_dir_all(a);
             let _ = std::fs::remove_dir_all(b);
-        }
-    }
-
-    /// Spawn the inspector without a console window and wait for it to exit.
-    fn run_inspector(exe: &Path, args: &[&str]) -> Result<(), String> {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-        let mut child = std::process::Command::new(exe)
-            .args(args)
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()
-            .map_err(|e| format!("could not start {}: {e}", exe.display()))?;
-
-        let started = Instant::now();
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) if status.success() => return Ok(()),
-                // A non-zero exit means the import/export did not do what we
-                // asked. Reporting it as success would let a failed run wear a
-                // green check whenever the profile already matched.
-                Ok(Some(status)) => {
-                    return Err(format!(
-                        "Profile Inspector exited with {status} (it may have been closed or \
-                         refused by the driver)"
-                    ))
-                }
-                Ok(None) if started.elapsed() > INSPECTOR_TIMEOUT => {
-                    // Kill *and reap*: without the wait the child stays a zombie
-                    // handle and can still be mid-write while we report failure.
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!(
-                        "Profile Inspector did not finish within {}s",
-                        INSPECTOR_TIMEOUT.as_secs()
-                    ));
-                }
-                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-                Err(e) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!("failed waiting for Profile Inspector: {e}"));
-                }
-            }
         }
     }
 }
