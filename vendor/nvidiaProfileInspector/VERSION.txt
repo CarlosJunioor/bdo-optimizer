@@ -1,0 +1,9 @@
+NVIDIA Profile Inspector v3.0.2.1
+https://github.com/Orbmu2k/nvidiaProfileInspector/releases/tag/v3.0.2.1
+nvidiaProfileInspector.exe SHA-256:
+1ebd8129b3c564bf226291fb3344819fd59668066f0c5e03334a69a04a62859e
+
+The app pins this exact hash (crates/app/src/video.rs) and refuses to run any
+other copy. When updating: replace the exe + .config, re-run
+`sha256sum nvidiaProfileInspector.exe`, and update INSPECTOR_SIZE /
+INSPECTOR_SHA256 in video.rs plus this file.

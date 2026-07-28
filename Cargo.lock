@@ -440,6 +440,7 @@ dependencies = [
  "egui",
  "egui_plot",
  "rfd",
+ "sha2",
  "windows",
 ]
 

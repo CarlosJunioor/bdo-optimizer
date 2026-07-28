@@ -40,6 +40,10 @@ jobs:
           Copy-Item README.md, LICENSE $dir\
           Copy-Item vendor\presentmon\LICENSE.txt $dir\PresentMon-LICENSE.txt
           Copy-Item vendor\presentmon\VERSION.txt $dir\PresentMon-VERSION.txt
+          Copy-Item vendor\nvidiaProfileInspector\nvidiaProfileInspector.exe $dir\
+          Copy-Item vendor\nvidiaProfileInspector\nvidiaProfileInspector.exe.config $dir\
+          Copy-Item vendor\nvidiaProfileInspector\LICENSE.txt $dir\nvidiaProfileInspector-LICENSE.txt
+          Copy-Item vendor\nvidiaProfileInspector\VERSION.txt $dir\nvidiaProfileInspector-VERSION.txt
           Compress-Archive -Path $dir -DestinationPath "$dir.zip"
           $hash = (Get-FileHash "$dir.zip" -Algorithm SHA256).Hash
           "$hash  $dir.zip" | Out-File -Encoding ascii "$dir.zip.sha256"
@@ -73,6 +77,8 @@ jobs:
           SHA256: `__SHA256__`
 
           Bundled PresentMon is Intel's MIT-licensed CLI; see `PresentMon-LICENSE.txt`.
+          Bundled NVIDIA Profile Inspector (for the optional NVIDIA driver-profile
+          tweaks) is Orbmu2k's MIT-licensed tool; see `nvidiaProfileInspector-LICENSE.txt`.
           '@ -replace '__SHA256__', $env:SHA256 | Out-File -Encoding utf8 notes.md
 
       - name: Publish release

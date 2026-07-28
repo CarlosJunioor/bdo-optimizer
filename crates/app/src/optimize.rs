@@ -115,6 +115,9 @@ impl App {
         ui.add_space(10.0);
         ui.separator();
         self.verify_section(ui);
+        ui.add_space(10.0);
+        ui.separator();
+        self.nvidia_section(ui);
         if matches!(&self.optimize.verify, Some(VerifyOutcome::Match { .. }))
             && ui.button("Continue to Measure").clicked()
         {
@@ -471,6 +474,183 @@ impl App {
                             .color(ERR)
                             .strong()
                             .size(14.0),
+                    ),
+                };
+            }
+        }
+    }
+
+    // ---------------------------------------------------- NVIDIA driver profile
+    /// The guide's NVIDIA per-game profile tweaks, applied through the bundled
+    /// Profile Inspector. Hidden entirely on non-Windows and non-NVIDIA hosts.
+    fn nvidia_section(&mut self, ui: &mut egui::Ui) {
+        if !cfg!(windows) {
+            return;
+        }
+        let (has_nvidia, physical_cores) = match &self.detection {
+            Some(d) => (
+                d.gpus.iter().any(|g| g.vendor == bdo_hw::GpuVendor::Nvidia),
+                d.cpu.physical_cores,
+            ),
+            None => return,
+        };
+        if !has_nvidia {
+            return;
+        }
+
+        ui.label(
+            RichText::new("NVIDIA driver profile (guide settings)")
+                .strong()
+                .size(16.0),
+        );
+        ui.label(
+            RichText::new(
+                "Writes only the driver's per-game \"Black Desert\" profile using the bundled \
+                 NVIDIA Profile Inspector (merge import). Other profile settings — G-Sync \
+                 included — and all global driver settings stay untouched. Every apply is \
+                 verified against the driver database afterwards.",
+            )
+            .size(12.0)
+            .weak(),
+        );
+
+        if !self.video.inspector_resolved {
+            self.video.inspector_resolved = true;
+            self.video.inspector = crate::video::resolve();
+        }
+
+        let threaded = if physical_cores >= 6 {
+            "On (6+ cores)"
+        } else {
+            "Off (guide rule for older quad-cores)"
+        };
+        ui.label(
+            RichText::new(format!(
+                "Applies: Threaded optimization {threaded} · Ansel Off · Power management Adaptive{}",
+                if self.video.ull {
+                    " · Ultra Low Latency On"
+                } else {
+                    ""
+                }
+            ))
+            .size(12.0),
+        );
+        ui.checkbox(
+            &mut self.video.ull,
+            "Also enable Ultra Low Latency (guide: test whether your CPU handles the overhead)",
+        );
+
+        #[cfg(windows)]
+        {
+            // Profile Inspector's manifest is requireAdministrator, so spawning
+            // it silently only works from an elevated app (same relaunch flow
+            // the Benchmark tab uses).
+            if !self.benchmark.elevated {
+                ui.label(
+                    RichText::new(
+                        "Driver-profile changes need administrator rights. Restart the app as \
+                         administrator to enable these actions.",
+                    )
+                    .color(WARN)
+                    .size(12.0),
+                );
+                if ui
+                    .button(RichText::new("🛡 Restart as administrator").strong())
+                    .on_hover_text(
+                        "Relaunches this app with a UAC prompt, then closes this window.",
+                    )
+                    .clicked()
+                {
+                    self.benchmark.relaunch_error = None;
+                    match crate::relaunch::relaunch_as_admin() {
+                        crate::relaunch::RelaunchOutcome::Launched => {
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        crate::relaunch::RelaunchOutcome::Cancelled => {}
+                        crate::relaunch::RelaunchOutcome::Failed(e) => {
+                            self.benchmark.relaunch_error = Some(e);
+                        }
+                    }
+                }
+                if let Some(err) = &self.benchmark.relaunch_error {
+                    ui.label(
+                        RichText::new(format!("Could not relaunch: {err}"))
+                            .color(ERR)
+                            .size(12.0),
+                    );
+                }
+                return;
+            }
+
+            let finished = self
+                .video
+                .worker
+                .as_ref()
+                .and_then(|worker| worker.rx.try_recv().ok());
+            if let Some(result) = finished {
+                self.video.last = Some(result);
+                self.video.worker = None;
+            }
+            if let Some(worker) = &self.video.worker {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(if worker.label == "apply" {
+                        "Applying and verifying the driver profile…"
+                    } else {
+                        "Restoring driver defaults…"
+                    });
+                });
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(250));
+            }
+
+            let busy = self.video.worker.is_some();
+            match self.video.inspector.clone() {
+                Some(exe) => {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(!busy, egui::Button::new("Apply guide profile"))
+                            .clicked()
+                        {
+                            self.video.last = None;
+                            self.video.worker = Some(crate::video::worker::start(
+                                exe.clone(),
+                                crate::video::guide_settings(physical_cores, self.video.ull),
+                                "apply",
+                            ));
+                        }
+                        if ui
+                            .add_enabled(!busy, egui::Button::new("Restore driver defaults"))
+                            .clicked()
+                        {
+                            self.video.last = None;
+                            self.video.worker = Some(crate::video::worker::start(
+                                exe,
+                                crate::video::default_settings(),
+                                "restore",
+                            ));
+                        }
+                    });
+                }
+                None => {
+                    let locations = crate::video::expected_locations();
+                    ui.label(
+                        RichText::new(format!(
+                            "{} not found — expected {} or {}.",
+                            crate::video::INSPECTOR_EXE,
+                            locations[0],
+                            locations[1]
+                        ))
+                        .color(WARN),
+                    );
+                }
+            }
+
+            if let Some(result) = &self.video.last {
+                match result {
+                    Ok(msg) => ui.label(RichText::new(format!("✔ {msg}")).color(OK_GREEN)),
+                    Err(e) => ui.label(
+                        RichText::new(format!("Driver profile action failed: {e}")).color(ERR),
                     ),
                 };
             }

@@ -27,6 +27,10 @@ The affinity recommendations are based on
   blocks an optimized capture until it matches the selected mask.
 - **Compares against a real baseline:** saved runs contain raw frame times and
   locally calculated average FPS, P1 low, and time-weighted low metrics.
+- **Applies the guide's NVIDIA driver-profile tweaks (optional):** merge-imports
+  the per-game "Black Desert" profile through the bundled NVIDIA Profile
+  Inspector and verifies the result against the driver database. Nothing global
+  changes, and one click restores driver defaults.
 - **Shows its version:** the current package version appears in the app header.
 
 ## Requirements
@@ -37,6 +41,9 @@ The affinity recommendations are based on
 - An installed copy of Black Desert Online.
 - `PresentMon.exe` beside `bdo-optimizer.exe` for FPS capture. Official packaged
   builds should ship both files together.
+- `nvidiaProfileInspector.exe` (plus its `.exe.config`) beside
+  `bdo-optimizer.exe` for the optional NVIDIA driver-profile tweaks. Packaged
+  builds ship it; the feature is hidden on machines without an NVIDIA GPU.
 - Administrator permission for benchmarking. Windows ETW will not start the
   PresentMon trace from a non-elevated process.
 
@@ -100,9 +107,40 @@ Affinity is applied only to that launch chain. To restore the default:
 2. Start BDO from its normal launcher or Steam entry.
 3. Delete the optional optimized desktop shortcut if you no longer want it.
 
-There is no persistent service to disable. BDO Optimizer does not write NVIDIA,
-AMD, or Intel driver profiles, global Windows settings, registry priority
-tweaks, or the running game process.
+There is no persistent service to disable. BDO Optimizer never writes global
+driver settings, global Windows settings, registry priority tweaks, or the
+running game process. The only driver change it can make is the optional,
+user-initiated NVIDIA per-game "Black Desert" profile described below — and
+that has its own **Restore driver defaults** button.
+
+## NVIDIA driver profile (optional)
+
+On Windows machines with an NVIDIA GPU, **2 Apply** shows an extra section that
+applies the performance guide's driver-profile recommendations to the game's
+own "Black Desert" profile:
+
+- **Threaded optimization** — On for 6+ physical cores, Off for older
+  quad-cores (the guide's rule).
+- **Ansel** — Off.
+- **Power management mode** — Adaptive.
+- **Ultra Low Latency** — opt-in checkbox; the guide advises testing whether
+  your CPU handles the overhead.
+
+How it works and why it is safe:
+
+- The change is a **merge** import through the bundled, hash-pinned
+  [NVIDIA Profile Inspector](https://github.com/Orbmu2k/nvidiaProfileInspector)
+  CLI. Only the listed settings are written; anything else on the profile
+  (G-Sync preferences, for example) and all global driver settings are left
+  alone.
+- Every apply is **verified**: the app exports the driver database afterwards
+  and confirms the profile really carries the expected values.
+- **Restore driver defaults** writes the documented default values back to the
+  same settings.
+- Profile Inspector requires administrator rights, so the section offers the
+  same **Restart as administrator** flow the Benchmark tab uses.
+- AMD users: the equivalent tweaks (Radeon Enhanced Sync on, Wait for Vertical
+  Refresh off) have no safe automation API — set them in AMD Software manually.
 
 ## Repeatable benchmark method
 
@@ -149,6 +187,7 @@ representative pairs rather than relying on one unusually good run.
 | Create/launch optimized shortcut | UAC may appear | Sets affinity on the launcher before it runs |
 | Verify affinity | Read-only process query | Reads the current mask; never sets it |
 | Capture FPS | Administrator | PresentMon uses external Windows ETW tracing |
+| Apply/restore NVIDIA profile | Administrator | Profile Inspector writes only the per-game driver profile; no game access |
 | Show overlay | Same app session | Separate always-on-top native window; no injection or graphics hook |
 
 The FPS overlay can appear over windowed and borderless-windowed BDO. It cannot
@@ -215,6 +254,14 @@ Close BDO completely, confirm the selected mask, and relaunch from **2 Apply** o
 the optimized shortcut. Do not switch to a normal launcher between verification
 and capture.
 
+### The NVIDIA profile apply fails or the section is missing
+
+The section only appears on Windows with a detected NVIDIA GPU. Applying needs
+`nvidiaProfileInspector.exe` (and its `.exe.config`) next to `bdo-optimizer.exe`
+and administrator rights. If verification reports that the driver database does
+not show the expected values, open NVIDIA Profile Inspector manually — a driver
+update may have renamed the "Black Desert" profile.
+
 ### The BDO install was not detected
 
 Use **Browse** and select `BlackDesertLauncher.exe`. Confirm the Steam option
@@ -249,10 +296,14 @@ The workspace contains:
 - `crates/hw` — hardware detection and recommendation engine;
 - `crates/launch` — safe launch inheritance, shortcuts, and read-only verification;
 - `crates/bench` — PresentMon capture, metrics, and local session storage;
-- `vendor/presentmon` — pinned PresentMon executable and MIT license.
+- `vendor/presentmon` — pinned PresentMon executable and MIT license;
+- `vendor/nvidiaProfileInspector` — pinned NVIDIA Profile Inspector executable
+  and MIT license.
 
 ## License
 
 BDO Optimizer is licensed under the [MIT License](LICENSE). Bundled PresentMon is
 licensed by Intel under MIT; see
-[`vendor/presentmon/LICENSE.txt`](vendor/presentmon/LICENSE.txt).
+[`vendor/presentmon/LICENSE.txt`](vendor/presentmon/LICENSE.txt). Bundled NVIDIA
+Profile Inspector is licensed by Orbmu2k under MIT; see
+[`vendor/nvidiaProfileInspector/LICENSE.txt`](vendor/nvidiaProfileInspector/LICENSE.txt).

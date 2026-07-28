@@ -32,6 +32,9 @@ egui_plot = "0.36"
 # Native file picker for the launcher path.
 rfd = "0.17"
 
+# Hash-pinning the bundled NVIDIA Profile Inspector (same as bench's PresentMon pin).
+sha2 = "0.10.9"
+
 # Windows-only: relaunch the app elevated (ShellExecuteW verb "runas") from the
 # Benchmark tab's "Restart as administrator" button.
 [target.'cfg(windows)'.dependencies.windows]

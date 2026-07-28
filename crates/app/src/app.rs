@@ -66,6 +66,26 @@ impl OptimizeState {
     }
 }
 
+/// State for the NVIDIA driver-profile section of the Optimize tab.
+///
+/// The worker handle only exists on Windows (the inspector pipeline is
+/// Windows-only); the remaining fields stay cross-platform so the struct's
+/// default wiring is identical everywhere.
+#[derive(Default)]
+pub struct VideoState {
+    /// Opt-in Ultra Low Latency (the guide says "test with your system").
+    pub ull: bool,
+    /// Resolved bundled Profile Inspector path (`None` until resolved / missing).
+    pub inspector: Option<PathBuf>,
+    /// Whether inspector resolution has been attempted.
+    pub inspector_resolved: bool,
+    /// In-flight apply/restore job, if any.
+    #[cfg(windows)]
+    pub worker: Option<crate::video::worker::DriverWorker>,
+    /// Outcome of the last finished job (message to show).
+    pub last: Option<Result<String, String>>,
+}
+
 /// Outcome of a read-only affinity verification.
 ///
 /// Only constructed/read on Windows (the verify action is Windows-only); the
@@ -204,6 +224,7 @@ pub struct App {
     detect_rx: Receiver<DetectResult>,
     pub detection: Option<DetectResult>,
     pub optimize: OptimizeState,
+    pub video: VideoState,
     pub benchmark: BenchmarkState,
 }
 
@@ -217,6 +238,7 @@ impl App {
             detect_rx,
             detection: None,
             optimize: OptimizeState::default(),
+            video: VideoState::default(),
             benchmark: BenchmarkState::new(),
         }
     }

@@ -21,6 +21,7 @@ mod overlay;
 mod presentmon;
 #[cfg(windows)]
 mod relaunch;
+mod video;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
