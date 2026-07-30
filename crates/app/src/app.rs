@@ -104,6 +104,9 @@ pub struct OneClickState {
     pub steps: Vec<(String, Result<String, String>)>,
     /// True once a run has happened, so the empty list is not shown as success.
     pub ran: bool,
+    /// Set while the driver-profile job this run started is still in flight, so
+    /// its result can be folded back into `steps` when it finishes.
+    pub driver_step: Option<String>,
 }
 
 /// Outcome of a read-only affinity verification.

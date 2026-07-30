@@ -184,9 +184,10 @@ impl App {
         ui.label(
             RichText::new(
                 "Applies the guide settings that are reversible, need no reboot, and only affect \
-                 Black Desert: the config-file tweaks and Windows' windowed-game optimizations. \
-                 Driver settings, memory compression, and HAGS stay on their own buttons because \
-                 they need administrator rights, a reboot, or affect every application.",
+                 Black Desert: the config-file tweaks, Windows' windowed-game optimizations, and \
+                 — when the app runs as administrator on an NVIDIA GPU — the \"Black Desert\" \
+                 driver profile. Memory compression and HAGS stay on their own buttons because \
+                 they need a reboot or affect every application.",
             )
             .size(12.0)
             .weak(),
@@ -220,6 +221,7 @@ impl App {
         if !self.oneclick.ran {
             return;
         }
+        self.collect_driver_step();
         for (step, outcome) in &self.oneclick.steps {
             match outcome {
                 Ok(detail) => ui.label(
@@ -234,24 +236,112 @@ impl App {
                 ),
             };
         }
+        if self.oneclick.driver_step.is_some() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(RichText::new("NVIDIA driver profile: applying…").size(12.0));
+            });
+        }
     }
+
+    /// Fold a finished driver-profile job started by the one-click button back
+    /// into its step list. The driver pipeline is the only asynchronous step, so
+    /// its result arrives a frame or two after the rest.
+    #[cfg(windows)]
+    fn collect_driver_step(&mut self) {
+        if self.video.worker.is_some() {
+            return;
+        }
+        let Some(step) = self.oneclick.driver_step.take() else {
+            return;
+        };
+        // A worker gone without a result leaves nothing to report; the marker is
+        // already cleared above, so the label cannot spin forever either.
+        if let Some(result) = self.video.last.clone() {
+            self.oneclick.steps.push((step, result));
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn collect_driver_step(&mut self) {}
 
     /// Run the safe steps in order, recording each outcome separately so a
     /// failure in one never reads as a failure of the whole thing.
     fn run_one_click(&mut self) {
         self.oneclick.steps.clear();
+        self.oneclick.driver_step = None;
         self.oneclick.ran = true;
 
         #[cfg(windows)]
         {
             self.one_click_config_files();
             self.one_click_windowed_optimizations();
+            self.one_click_driver_profile(
+                crate::video::guide_settings(
+                    self.detection.as_ref().map_or(0, |d| d.cpu.physical_cores),
+                    self.video.ull,
+                ),
+                "apply",
+            );
         }
+    }
+
+    /// Start the driver-profile job as part of a one-click run.
+    ///
+    /// Skipped silently on non-NVIDIA hosts (nothing to apply). Everything else
+    /// that stops it — no elevation, missing inspector — is reported as a failed
+    /// step rather than swallowed, because the user asked for it.
+    #[cfg(windows)]
+    fn one_click_driver_profile(&mut self, settings: Vec<(u32, u32)>, label: &'static str) {
+        const STEP: &str = "NVIDIA driver profile";
+        let has_nvidia = self
+            .detection
+            .as_ref()
+            .is_some_and(|d| d.gpus.iter().any(|g| g.vendor == bdo_hw::GpuVendor::Nvidia));
+        if !has_nvidia {
+            return;
+        }
+        if !self.benchmark.elevated {
+            self.oneclick.steps.push((
+                STEP.into(),
+                Err(
+                    "needs administrator — use \"Restart as administrator\" in the NVIDIA \
+                     section below, then click again"
+                        .into(),
+                ),
+            ));
+            return;
+        }
+        if !self.video.inspector_resolved {
+            self.video.inspector_resolved = true;
+            self.video.inspector = crate::video::resolve();
+        }
+        let Some(exe) = self.video.inspector.clone() else {
+            self.oneclick.steps.push((
+                STEP.into(),
+                Err(format!(
+                    "{} not found next to the app",
+                    crate::video::INSPECTOR_EXE
+                )),
+            ));
+            return;
+        };
+        if self.video.worker.is_some() {
+            self.oneclick.steps.push((
+                STEP.into(),
+                Err("a driver-profile job is already running".into()),
+            ));
+            return;
+        }
+        self.video.last = None;
+        self.video.worker = Some(crate::video::worker::start(exe, settings, label));
+        self.oneclick.driver_step = Some(STEP.to_string());
     }
 
     /// Reverse everything [`Self::run_one_click`] applied.
     fn undo_one_click(&mut self) {
         self.oneclick.steps.clear();
+        self.oneclick.driver_step = None;
         self.oneclick.ran = true;
 
         #[cfg(windows)]
@@ -305,6 +395,8 @@ impl App {
                     .push((step, Ok("was never changed by this app".into()))),
                 Err(e) => self.oneclick.steps.push((step, Err(e))),
             }
+
+            self.one_click_driver_profile(crate::video::default_settings(), "restore");
         }
     }
 

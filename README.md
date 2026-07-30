@@ -34,6 +34,11 @@ The affinity recommendations are based on
 - **Applies the guide's config-file tweaks (optional):** sets PostFilter and
   Tessellation off in `GameOption.txt` and every UserCache `gamevariable.xml`,
   backing each file up first, with a one-click restore.
+- **Applies the safe settings in one click:** the config-file tweaks, Windows'
+  "Optimizations for windowed games", and — when the app runs as administrator on
+  an NVIDIA GPU — the driver profile, each reported as its own step and reversed
+  by one "Undo all of it". Memory compression and HAGS stay on their own buttons:
+  one needs a reboot, the other affects every application.
 - **Shows its version:** the current package version appears in the app header.
 
 ## Requirements
