@@ -484,7 +484,7 @@ fn apply_one(root: &Path, path: &Path) -> Result<FileChange, String> {
     let (_pinned, path) = pin_and_verify(root, path)?;
     let path = path.as_path();
     let bytes = std::fs::read(path).map_err(|e| format!("read failed: {e}"))?;
-    let text = String::from_utf8(bytes).map_err(|_| "unexpected non-UTF-8 content".to_string())?;
+    let text = decode_latin1(&bytes);
     let is_xml = path
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("xml"));
@@ -507,12 +507,12 @@ fn apply_one(root: &Path, path: &Path) -> Result<FileChange, String> {
         Ok(m) if m.is_file() && m.len() > 0 => {}
         // A zero-length leftover from a crashed write is worthless as a restore
         // point, so it gets replaced outright.
-        Ok(_) => write_atomic(&backup, &text).map_err(|e| format!("backup failed: {e}"))?,
+        Ok(_) => write_atomic_bytes(&backup, &bytes).map_err(|e| format!("backup failed: {e}"))?,
         // Nothing there: create, never replace. A backup that appears in the
         // gap is an *older* copy of the file and therefore the better restore
         // point, so losing that race must not overwrite it.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            write_new_only(&backup, &text).map_err(|e| format!("backup failed: {e}"))?
+            write_new_only(&backup, &bytes).map_err(|e| format!("backup failed: {e}"))?
         }
         // A permission or transient error is *not* "missing". Treating it as
         // missing would fall through to a create that accepts a collision as
@@ -531,7 +531,7 @@ fn apply_one(root: &Path, path: &Path) -> Result<FileChange, String> {
             backup.display()
         ));
     }
-    write_atomic(path, &patched).map_err(|e| format!("write failed: {e}"))?;
+    write_atomic_bytes(path, &encode_latin1(&patched)).map_err(|e| format!("write failed: {e}"))?;
     Ok(FileChange::Patched(stats.changed))
 }
 
@@ -717,8 +717,33 @@ fn pin_dir(dir: &Path) -> Result<std::fs::File, String> {
 
 /// Write via a temp sibling + atomic replace so the destination is never
 /// observed half-written: readers see either the old bytes or the new ones.
-fn write_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
-    write_atomic_bytes(path, contents.as_bytes())
+/// Read a config file as Latin-1 rather than UTF-8.
+///
+/// BDO writes anything the player typed — skill memos above all — in the OS
+/// legacy codepage, so a config file is frequently *not* valid UTF-8: a
+/// Portuguese "Espaço" lands as a lone `0xE7`. Rejecting those files meant
+/// refusing to optimize on any non-English install.
+///
+/// Latin-1 is the one encoding that maps every possible byte to a distinct char
+/// and back, so this is a total, lossless view of arbitrary bytes — and since
+/// everything this module matches on is pure ASCII, guessing the real codepage
+/// wrong cannot change which values get patched. [`encode_latin1`] reverses it,
+/// so untouched text is written back byte-for-byte whatever it originally was.
+fn decode_latin1(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| b as char).collect()
+}
+
+/// Reverse [`decode_latin1`].
+///
+/// ponytail: no UTF-16 support and no encoding detection. Every BDO config seen
+/// so far is single-byte; a UTF-16 one would simply not match the ASCII patterns
+/// and be reported as unrecognized rather than corrupted.
+fn encode_latin1(text: &str) -> Vec<u8> {
+    // Every char here came from `decode_latin1` or from this module's own ASCII
+    // replacements, so all of them fit in a single byte.
+    text.chars()
+        .map(|c| u8::try_from(c as u32).unwrap_or(b'?'))
+        .collect()
 }
 
 fn write_atomic_bytes(path: &Path, contents: &[u8]) -> std::io::Result<()> {
@@ -779,13 +804,11 @@ fn backup_is_readable(backup: &Path) -> bool {
 /// Write `contents` to `path` only if nothing is there, leaving any existing
 /// file untouched. Used for the one-time backup, where an existing copy is
 /// always the more valuable one.
-fn write_new_only(path: &Path, contents: &str) -> std::io::Result<()> {
+fn write_new_only(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
     let (mut file, tmp) = create_temp_sibling(path)?;
-    let write = file
-        .write_all(contents.as_bytes())
-        .and_then(|()| file.sync_all());
+    let write = file.write_all(contents).and_then(|()| file.sync_all());
     drop(file);
     if let Err(e) = write {
         let _ = std::fs::remove_file(&tmp);
@@ -1283,7 +1306,7 @@ mod tests {
         let target = dir.join("GameOption.txt.bak");
         std::fs::write(&target, "the older, better copy").unwrap();
 
-        write_new_only(&target, "should not land").unwrap();
+        write_new_only(&target, b"should not land").unwrap();
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
             "the older, better copy"
@@ -1298,8 +1321,50 @@ mod tests {
 
         // With nothing there, it writes.
         let fresh = dir.join("fresh.bak");
-        write_new_only(&fresh, "written").unwrap();
+        write_new_only(&fresh, b"written").unwrap();
         assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "written");
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_codepage_bytes_are_patched_and_preserved() {
+        // A real gamevariable.xml from a Portuguese install: the skill memo
+        // "Espaço" is CP1252, so the file is not valid UTF-8. It must still be
+        // patched, and every byte outside the patch must survive untouched.
+        let dir = temp_dir("cp1252");
+        let file = dir.join("gamevariable.xml");
+        let mut original = Vec::new();
+        original.extend_from_slice(b"<SkillCoolTimeMemo Memo=\"Espa");
+        original.push(0xE7); // 'ç' in CP1252 — a lone continuation byte in UTF-8
+        original.extend_from_slice(b"o\"/>\r\n");
+        original.extend_from_slice(GAME_VARIABLE.as_bytes());
+        std::fs::write(&file, &original).unwrap();
+
+        let out = apply_files(&dir, std::slice::from_ref(&file), always_safe());
+        let change = out[0]
+            .result
+            .as_ref()
+            .expect("non-UTF-8 must not be refused");
+        assert!(
+            matches!(change, FileChange::Patched(n) if *n > 0),
+            "{change:?}"
+        );
+
+        // The backup is the original bytes, exactly.
+        let backup = dir.join(format!("gamevariable.xml{BACKUP_SUFFIX}"));
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+
+        // The memo survives the patch byte-for-byte; only the guide values moved.
+        let patched = std::fs::read(&file).unwrap();
+        assert!(
+            patched.starts_with(b"<SkillCoolTimeMemo Memo=\"Espa\xE7o\"/>\r\n"),
+            "the legacy-codepage memo was rewritten"
+        );
+
+        // And restore puts the original back, byte for byte.
+        restore_files(&dir, std::slice::from_ref(&file), always_safe());
+        assert_eq!(std::fs::read(&file).unwrap(), original);
 
         std::fs::remove_dir_all(dir).unwrap();
     }
