@@ -58,6 +58,91 @@ fn available_masks(
     rows
 }
 
+/// Animation clock id for the success checkmark on one-click step `index`.
+fn check_id(index: usize) -> egui::Id {
+    egui::Id::new(("oneclick-check", index))
+}
+
+/// Reset one checkmark's clock to zero so its next frame draws in from nothing.
+///
+/// `animate_bool_with_time` seeds an unknown id at its *target* value, so a
+/// checkmark rendered for the first time would appear already finished. Forcing
+/// the clock to `false` over a zero-length animation gives it somewhere to
+/// travel from.
+fn seed_checks_at(ctx: &egui::Context, index: usize) {
+    ctx.animate_bool_with_time(check_id(index), false, 0.0);
+}
+
+/// Seed the clocks for steps `0..count`.
+fn seed_checks(ctx: &egui::Context, count: usize) {
+    for index in 0..count {
+        seed_checks_at(ctx, index);
+    }
+}
+
+/// A checkmark that pops its ring in and then draws its stroke, left to right.
+///
+/// Progress comes from egui's animation clock keyed on `id`; the caller seeds
+/// that clock when the row first appears (see [`seed_checks_at`]).
+fn animated_check(ui: &mut egui::Ui, id: egui::Id, color: Color32) {
+    const DURATION: f32 = 0.55;
+    let side = 15.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::hover());
+    let t = ui.ctx().animate_bool_with_time(id, true, DURATION);
+    if t < 1.0 {
+        ui.ctx().request_repaint();
+    }
+
+    let painter = ui.painter();
+    let center = rect.center();
+    let radius = side * 0.5 - 1.0;
+
+    // Ring: eases out with a slight overshoot that settles as the stroke starts.
+    let pop = ease_out_cubic((t / 0.35).clamp(0.0, 1.0));
+    let scale = pop * (1.0 + 0.2 * (1.0 - pop));
+    painter.circle_stroke(
+        center,
+        radius * scale,
+        egui::Stroke::new(1.4, color.gamma_multiply(0.5)),
+    );
+
+    // Stroke: two segments treated as one path, revealed by arc length so the
+    // corner is crossed at a constant speed rather than jumping.
+    let points = [
+        center + egui::vec2(-radius * 0.48, radius * 0.04),
+        center + egui::vec2(-radius * 0.14, radius * 0.42),
+        center + egui::vec2(radius * 0.52, -radius * 0.42),
+    ];
+    let drawn = ease_out_cubic(((t - 0.28) / (1.0 - 0.28)).clamp(0.0, 1.0));
+    let first = (points[1] - points[0]).length();
+    let length = drawn * (first + (points[2] - points[1]).length());
+    let stroke = egui::Stroke::new(2.0, color);
+    if length > 0.0 {
+        let head = length.min(first);
+        painter.line_segment(
+            [
+                points[0],
+                points[0] + (points[1] - points[0]).normalized() * head,
+            ],
+            stroke,
+        );
+        if length > first {
+            let head = length - first;
+            painter.line_segment(
+                [
+                    points[1],
+                    points[1] + (points[2] - points[1]).normalized() * head,
+                ],
+                stroke,
+            );
+        }
+    }
+}
+
+fn ease_out_cubic(t: f32) -> f32 {
+    1.0 - (1.0 - t).powi(3)
+}
+
 #[cfg(windows)]
 fn verification_due(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
     last.map(|last| now.saturating_duration_since(last) >= std::time::Duration::from_secs(1))
@@ -205,6 +290,7 @@ impl App {
                 .clicked()
             {
                 self.run_one_click();
+                seed_checks(ui.ctx(), self.oneclick.steps.len());
             }
             if ui
                 .button("Undo all of it")
@@ -215,26 +301,35 @@ impl App {
                 .clicked()
             {
                 self.undo_one_click();
+                seed_checks(ui.ctx(), self.oneclick.steps.len());
             }
         });
 
         if !self.oneclick.ran {
             return;
         }
-        self.collect_driver_step();
-        for (step, outcome) in &self.oneclick.steps {
+        let ctx = ui.ctx().clone();
+        self.collect_driver_step(&ctx);
+        for (index, (step, outcome)) in self.oneclick.steps.iter().enumerate() {
             match outcome {
-                Ok(detail) => ui.label(
-                    RichText::new(format!("✔ {step}: {detail}"))
-                        .color(OK_GREEN)
-                        .size(12.0),
-                ),
-                Err(e) => ui.label(
-                    RichText::new(format!("✘ {step}: {e}"))
-                        .color(ERR)
-                        .size(12.0),
-                ),
-            };
+                Ok(detail) => {
+                    ui.horizontal(|ui| {
+                        animated_check(ui, check_id(index), OK_GREEN);
+                        ui.label(
+                            RichText::new(format!("{step}: {detail}"))
+                                .color(OK_GREEN)
+                                .size(12.0),
+                        );
+                    });
+                }
+                Err(e) => {
+                    ui.label(
+                        RichText::new(format!("✘ {step}: {e}"))
+                            .color(ERR)
+                            .size(12.0),
+                    );
+                }
+            }
         }
         if self.oneclick.driver_step.is_some() {
             ui.horizontal(|ui| {
@@ -248,13 +343,16 @@ impl App {
     /// into its step list. The driver pipeline is the only asynchronous step, so
     /// its result arrives a frame or two after the rest.
     #[cfg(windows)]
-    fn collect_driver_step(&mut self) {
+    fn collect_driver_step(&mut self, ctx: &egui::Context) {
         if self.video.worker.is_some() {
             return;
         }
         let Some(step) = self.oneclick.driver_step.take() else {
             return;
         };
+        // This row appears frames after the synchronous ones, so it needs its
+        // own seed to animate instead of popping in finished.
+        seed_checks_at(ctx, self.oneclick.steps.len());
         // A worker gone without a result leaves nothing to report; the marker is
         // already cleared above, so the label cannot spin forever either.
         if let Some(result) = self.video.last.clone() {
@@ -263,7 +361,7 @@ impl App {
     }
 
     #[cfg(not(windows))]
-    fn collect_driver_step(&mut self) {}
+    fn collect_driver_step(&mut self, _ctx: &egui::Context) {}
 
     /// Run the safe steps in order, recording each outcome separately so a
     /// failure in one never reads as a failure of the whole thing.
