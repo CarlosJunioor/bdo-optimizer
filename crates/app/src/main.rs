@@ -23,6 +23,8 @@ mod presentmon;
 #[cfg(windows)]
 mod relaunch;
 mod theme;
+#[cfg(windows)]
+mod update;
 mod video;
 mod winsettings;
 

@@ -251,6 +251,8 @@ pub struct App {
     pub gameconfig: GameConfigState,
     pub oneclick: OneClickState,
     pub benchmark: BenchmarkState,
+    #[cfg(windows)]
+    pub update: crate::update::UpdateState,
 }
 
 impl App {
@@ -267,6 +269,8 @@ impl App {
             gameconfig: GameConfigState::default(),
             oneclick: OneClickState::default(),
             benchmark: BenchmarkState::new(),
+            #[cfg(windows)]
+            update: crate::update::UpdateState::new(cc.egui_ctx.clone()),
         }
     }
 
@@ -425,6 +429,8 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_detection();
         self.poll_capture();
+        #[cfg(windows)]
+        self.poll_update();
         self.drive_overlay(&ui.ctx().clone());
 
         // The GL clear is transparent for the overlay viewport's sake, so any
@@ -520,6 +526,8 @@ impl App {
                     ui.add_space(10.0);
                     ui.separator();
                 });
+            #[cfg(windows)]
+            self.update_row(ui);
         });
     }
 }

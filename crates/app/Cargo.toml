@@ -40,6 +40,10 @@ sha2 = "0.10.9"
 # Locating Documents\Black Desert for the guide's config-file edits.
 directories = "6.0.0"
 
+# Parsing the GitHub Releases API response for the in-app updater (already in
+# the tree via bdo-bench's session files).
+serde_json = "1.0.151"
+
 # Windows-only: relaunch the app elevated (ShellExecuteW verb "runas") from the
 # Benchmark tab's "Restart as administrator" button.
 [target.'cfg(windows)'.dependencies.windows]
