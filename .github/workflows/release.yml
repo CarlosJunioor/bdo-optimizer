@@ -56,30 +56,36 @@ jobs:
           name: ${{ env.ZIP }}
           path: ${{ env.ZIP }}
 
+      # The "What's new" section is a placeholder: fill it with short bullets
+      # after publishing (gh release edit <tag> --notes-file ...).
       - name: Write release notes
         shell: pwsh
         run: |
           @'
-          ## Download
+          ## What's new in __TAG__
 
-          Grab the `.zip` below, extract the folder anywhere, and run `bdo-optimizer.exe`.
+          - _Changelog pending — see the commit history for now._
 
-          Keep `bdo-optimizer.exe` and `PresentMon.exe` in the same folder — FPS capture
-          will not start if they are separated.
+          ## How to download
 
-          FPS capture needs **Run as administrator** (Windows ETW tracing). Hardware
-          inspection and viewing saved sessions do not.
+          1. Download the `.zip` below.
+          2. Extract the folder anywhere.
+          3. Run `bdo-optimizer.exe`.
 
-          Windows SmartScreen will warn on first run because the build is unsigned:
-          *More info* -> *Run anyway*. Verify the zip against `SHA256` below first if you
-          prefer — `Get-FileHash <zip> -Algorithm SHA256`.
+          **Good to know:**
+
+          - Keep all files in the same folder — FPS capture and NVIDIA tweaks need the bundled tools next to the exe.
+          - FPS capture needs **Run as administrator**. Everything else works without it.
+          - SmartScreen warning on first run? The build is unsigned: click *More info* -> *Run anyway*.
+
+          <details>
+          <summary>Checksum &amp; licenses</summary>
 
           SHA256: `__SHA256__`
 
-          Bundled PresentMon is Intel's MIT-licensed CLI; see `PresentMon-LICENSE.txt`.
-          Bundled NVIDIA Profile Inspector (for the optional NVIDIA driver-profile
-          tweaks) is Orbmu2k's MIT-licensed tool; see `nvidiaProfileInspector-LICENSE.txt`.
-          '@ -replace '__SHA256__', $env:SHA256 | Out-File -Encoding utf8 notes.md
+          Verify with `Get-FileHash <zip> -Algorithm SHA256`. Bundled PresentMon (Intel, MIT) and NVIDIA Profile Inspector (Orbmu2k, MIT) — licenses are in the zip.
+          </details>
+          '@ -replace '__SHA256__', $env:SHA256 -replace '__TAG__', $env:TAG | Out-File -Encoding utf8 notes.md
 
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/')
