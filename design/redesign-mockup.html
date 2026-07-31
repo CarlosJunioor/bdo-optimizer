@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BDO Optimizer — redesign mockup</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0C0F16; --panel:#10141D; --card:#161B26; --hover:#1D2330;
+    --stroke:#252C3B; --stroke-soft:#1C2230;
+    --ink:#E7E2D6; --ink-2:#9B978C; --ink-3:#6A6963;
+    --accent:#E5A83E; --accent-dim:#8A6524;
+    --ok:#66BD8C; --err:#E06056; --warn:#E8C558;
+    --chart-1:#BD8226; --chart-2:#5E8FD9;
+    --r:12px;
+    --display:"Chakra Petch",sans-serif; --body:"IBM Plex Sans",sans-serif; --mono:"IBM Plex Mono",monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{background:var(--bg);color:var(--ink);font:14px/1.5 var(--body);}
+  .app{display:flex;height:100vh;min-height:640px}
+
+  /* ---------- sidebar ---------- */
+  .side{width:232px;flex:0 0 232px;background:var(--panel);border-right:1px solid var(--stroke-soft);
+        display:flex;flex-direction:column;padding:20px 12px 16px}
+  .brand{font-family:var(--display);font-weight:600;font-size:17px;letter-spacing:.06em;
+         padding:2px 10px 18px;color:var(--ink)}
+  .brand .sl{color:var(--accent)}
+  .nav{display:flex;flex-direction:column;gap:4px}
+  .nav button{display:flex;align-items:center;gap:10px;width:100%;padding:10px 10px;border:0;border-radius:9px;
+      background:transparent;color:var(--ink-2);font:500 14px var(--body);cursor:pointer;text-align:left;position:relative}
+  .nav button:hover{background:var(--hover);color:var(--ink)}
+  .nav button.on{background:var(--hover);color:var(--ink)}
+  .nav button.on::before{content:"";position:absolute;left:-12px;top:8px;bottom:8px;width:3px;border-radius:2px;background:var(--accent)}
+  .nav .num{font-family:var(--display);font-weight:600;font-size:12px;color:var(--ink-3);width:14px}
+  .nav button.on .num{color:var(--accent)}
+  .nav .st{margin-left:auto;font-size:12px;color:var(--ok)}
+  .side .foot{margin-top:auto;border-top:1px solid var(--stroke-soft);padding:12px 10px 0;
+              font:12px/1.7 var(--body);color:var(--ink-2)}
+  .side .foot .mono{font-family:var(--mono);font-size:11px;color:var(--ink-3)}
+
+  /* ---------- main ---------- */
+  .main{flex:1;overflow-y:auto;scrollbar-color:var(--stroke) transparent}
+  .col{max-width:860px;margin:0 auto;padding:28px 32px 64px}
+  .screen{display:none}
+  .screen.on{display:block;animation:rise .18s ease-out}
+  @keyframes rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+  @media (prefers-reduced-motion: reduce){.screen.on{animation:none}}
+  h1{font-family:var(--display);font-weight:600;font-size:22px;letter-spacing:.04em;margin-bottom:4px}
+  .sub{color:var(--ink-2);margin-bottom:24px}
+
+  .card{background:var(--card);border:1px solid var(--stroke);border-radius:var(--r);
+        padding:20px;margin-bottom:16px}
+  .card h2{font-family:var(--display);font-weight:600;font-size:15px;letter-spacing:.03em;
+           display:flex;align-items:center;gap:8px;margin-bottom:6px}
+  .card h2 svg{flex:0 0 16px;color:var(--accent)}
+  .card .hint{color:var(--ink-2);font-size:13px;margin-bottom:14px}
+  .row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media (max-width:760px){.grid2{grid-template-columns:1fr}.side{width:64px;flex-basis:64px}
+    .side .label,.brand,.side .foot,.nav .st{display:none}}
+
+  button.act{font:600 13px var(--body);border:0;border-radius:9px;padding:10px 16px;cursor:pointer;
+             background:var(--accent);color:#171308}
+  button.act:hover{filter:brightness(1.08)}
+  button.ghost{background:transparent;color:var(--ink-2);border:1px solid var(--stroke)}
+  button.ghost:hover{color:var(--ink);background:var(--hover)}
+
+  .kv{display:grid;grid-template-columns:150px 1fr;row-gap:6px;font-size:13px}
+  .kv dt{color:var(--ink-2)} .kv dd{color:var(--ink)}
+  .kv .mono, .mono{font-family:var(--mono);font-size:12.5px}
+
+  .step{display:flex;align-items:baseline;gap:8px;font-size:13px;padding:3px 0}
+  .step .ic{width:15px;text-align:center}
+  .step.ok .ic{color:var(--ok)} .step.ok{color:var(--ok)}
+  .step .why{color:var(--ink-2)}
+
+  .pill{display:inline-flex;align-items:center;gap:6px;font:500 12px var(--body);
+        padding:3px 10px;border-radius:99px;border:1px solid var(--stroke);color:var(--ink-2)}
+  .pill.ok{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 35%,transparent)}
+  .pill.acc{color:var(--accent);border-color:color-mix(in srgb,var(--accent) 35%,transparent)}
+
+  /* ---------- core map (signature) ---------- */
+  .coremap{display:flex;gap:22px;flex-wrap:wrap;margin:10px 0 14px}
+  .ccd{border:1px solid var(--stroke);border-radius:10px;padding:12px 14px 10px;background:var(--panel)}
+  .ccd .t{font:500 11px var(--body);letter-spacing:.08em;text-transform:uppercase;color:var(--ink-2);margin-bottom:9px;display:flex;gap:8px;align-items:center}
+  .ccd .t .vc{color:var(--accent)}
+  .chips{display:flex;gap:6px}
+  .chip{width:30px;height:34px;border-radius:6px;border:1px solid var(--stroke);background:var(--card);
+        display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px}
+  .chip .n{font:500 10px var(--mono);color:var(--ink-3)}
+  .chip .th{display:flex;gap:3px}
+  .chip .th i{width:5px;height:5px;border-radius:2px;background:var(--stroke)}
+  .chip.onc{border-color:var(--accent-dim);background:color-mix(in srgb,var(--accent) 14%,var(--card))}
+  .chip.onc .n{color:var(--accent)}
+  .chip.onc .th i.a{background:var(--accent)}
+  .masks{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  .maskhex{font:500 17px var(--mono);color:var(--accent);background:var(--panel);
+           border:1px solid var(--stroke);border-radius:8px;padding:7px 12px}
+  .alt{color:var(--ink-2);font-size:12.5px}
+  .alt .mono{color:var(--ink)}
+
+  /* ---------- charts ---------- */
+  .chart{position:relative}
+  .chart svg{display:block;width:100%;height:auto}
+  .tip{position:absolute;pointer-events:none;background:var(--panel);border:1px solid var(--stroke);
+       border-radius:8px;padding:6px 9px;font:12px var(--body);color:var(--ink);display:none;white-space:nowrap}
+  .tip .mono{color:var(--accent)}
+  .legend{display:flex;gap:16px;margin:2px 0 10px;font-size:12.5px;color:var(--ink-2)}
+  .legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;vertical-align:-1px}
+  .axis{font:11px var(--mono);fill:var(--ink-3)}
+  .bar-l{font:11px var(--mono);fill:var(--ink-2)}
+
+  table.sess{width:100%;border-collapse:collapse;font-size:13px}
+  table.sess th{font:500 11px var(--body);letter-spacing:.07em;text-transform:uppercase;color:var(--ink-3);
+                text-align:left;padding:6px 8px;border-bottom:1px solid var(--stroke)}
+  table.sess td{padding:7px 8px;border-bottom:1px solid var(--stroke-soft)}
+  table.sess td.mono{font-family:var(--mono);font-size:12.5px}
+  .up{color:var(--ok);font-family:var(--mono);font-size:12.5px}
+</style>
+</head>
+<body>
+<div class="app">
+  <!-- ======================= sidebar ======================= -->
+  <nav class="side">
+    <div class="brand">BDO<span class="sl"> // </span>OPTIMIZER</div>
+    <div class="nav">
+      <button data-s="inspect" class="on"><span class="num">1</span><span class="label">Inspect</span><span class="st">✓</span></button>
+      <button data-s="apply"><span class="num">2</span><span class="label">Apply</span><span class="st">✓</span></button>
+      <button data-s="measure"><span class="num">3</span><span class="label">Measure</span></button>
+    </div>
+    <div class="foot">
+      Ryzen 9 7950X3D<br>GeForce RTX 4070<br>
+      <span class="mono">v0.3.0 · windows-x64</span>
+    </div>
+  </nav>
+
+  <main class="main">
+    <!-- ======================= 1 · inspect ======================= -->
+    <section class="screen on col" id="inspect">
+      <h1>Inspect</h1>
+      <p class="sub">What this machine is, and the affinity mask it should run Black Desert on.</p>
+
+      <div class="card">
+        <h2><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="10" height="10" rx="2"/><path d="M6 1v2M10 1v2M6 13v2M10 13v2M1 6h2M1 10h2M13 6h2M13 10h2"/></svg>
+            Processor</h2>
+        <div class="grid2">
+          <dl class="kv">
+            <dt>Model</dt><dd>AMD Ryzen 9 7950X3D</dd>
+            <dt>Cores / threads</dt><dd>16 / 32 · SMT on</dd>
+            <dt>L3 cache</dt><dd><span class="mono">96 MB</span> V-Cache CCD + <span class="mono">32 MB</span></dd>
+            <dt>Topology</dt><dd><span class="pill ok">✓ verified live</span></dd>
+          </dl>
+          <dl class="kv">
+            <dt>Memory</dt><dd>32 GB DDR5-6000</dd>
+            <dt>GPU</dt><dd>NVIDIA GeForce RTX 4070</dd>
+            <dt>Driver</dt><dd class="mono">576.28 · DX12</dd>
+            <dt>Storage</dt><dd>NVMe · 1.8 TB free</dd>
+          </dl>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 1l2 4.2 4.6.5-3.4 3.1.9 4.5L8 11l-4.1 2.3.9-4.5L1.4 5.7 6 5.2z"/></svg>
+            Recommendation</h2>
+        <p class="hint">Dual-CCD X3D: pin BDO to the 8-core V-Cache CCD, one thread per physical core. L3 topology confirms the V-Cache die matches the guide's mask.</p>
+        <div class="coremap">
+          <div class="ccd">
+            <div class="t">CCD 0 <span class="vc">96 MB V-Cache</span></div>
+            <div class="chips" id="ccd0"></div>
+          </div>
+          <div class="ccd">
+            <div class="t">CCD 1 · 32 MB</div>
+            <div class="chips" id="ccd1"></div>
+          </div>
+        </div>
+        <div class="masks">
+          <span class="maskhex">0x5555</span>
+          <span class="alt">8 cores · game threads only &nbsp;·&nbsp; alternate <span class="mono">FFFF</span> keeps SMT siblings</span>
+        </div>
+      </div>
+
+      <div class="row" style="justify-content:flex-end">
+        <button class="act" onclick="go('apply')">Continue to Apply →</button>
+      </div>
+    </section>
+
+    <!-- ======================= 2 · apply ======================= -->
+    <section class="screen col" id="apply">
+      <h1>Apply</h1>
+      <p class="sub">Everything reversible. Every change backed up before it is made.</p>
+
+      <div class="card">
+        <h2><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 1L3 9h4l-1 6 6-8H8z"/></svg>
+            One click</h2>
+        <p class="hint">Applies the guide settings that are reversible, need no reboot, and only affect Black Desert.</p>
+        <div class="row" style="margin-bottom:12px">
+          <button class="act">⚡ Apply everything safe</button>
+          <button class="ghost">Undo all of it</button>
+        </div>
+        <div class="step ok"><span class="ic">✓</span> Config files <span class="why">— PostFilter and Tessellation off, 3 files patched, backups written</span></div>
+        <div class="step ok"><span class="ic">✓</span> Windowed-game optimization <span class="why">— Windows setting stored for undo</span></div>
+        <div class="step ok"><span class="ic">✓</span> NVIDIA driver profile <span class="why">— merge-imported, verified against the driver database</span></div>
+      </div>
+
+      <div class="card">
+        <h2><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="12" height="10" rx="2"/><path d="M5 7h6M5 10h3"/></svg>
+            Affinity</h2>
+        <p class="hint">BDO inherits the mask from the launcher — the running game is never touched.</p>
+        <div class="coremap">
+          <div class="ccd">
+            <div class="t">CCD 0 <span class="vc">96 MB V-Cache</span></div>
+            <div class="chips" id="ccd0b"></div>
+          </div>
+          <div class="ccd">
+            <div class="t">CCD 1 · 32 MB</div>
+            <div class="chips" id="ccd1b"></div>
+          </div>
+        </div>
+        <div class="masks" style="margin-bottom:14px">
+          <span class="maskhex">0x5555</span>
+          <span class="pill ok">✓ verified on BlackDesert64.exe</span>
+        </div>
+        <div class="row">
+          <button class="act">Create optimized shortcut</button>
+          <button class="ghost">Launch once with mask</button>
+          <button class="ghost">Verify running game</button>
+        </div>
+      </div>
+
+      <div class="grid2">
+        <div class="card" style="margin-bottom:0">
+          <h2><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 1l6 3v4c0 3.5-2.5 6-6 7-3.5-1-6-3.5-6-7V4z"/></svg>
+              NVIDIA driver profile</h2>
+          <p class="hint">Per-game "Black Desert" profile only — global settings and G-Sync stay untouched.</p>
+          <div class="step ok"><span class="ic">✓</span> Threaded optimization · Ansel off · Adaptive power</div>
+          <div class="step"><span class="ic" style="color:var(--ink-3)">□</span> <span class="why">Ultra Low Latency — test whether your CPU handles it</span></div>
+        </div>
+        <div class="card" style="margin-bottom:0">
+          <h2><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 4h12M2 8h12M2 12h8"/></svg>
+              Config files</h2>
+          <p class="hint">GameOption.txt and every UserCache gamevariable.xml, backed up first.</p>
+          <div class="step ok"><span class="ic">✓</span> PostFilter 0 · Tessellation off</div>
+          <div class="step"><span class="ic" style="color:var(--ink-3)">↩</span> <span class="why">Restore originals any time</span></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ======================= 3 · measure ======================= -->
+    <section class="screen col" id="measure">
+      <h1>Measure</h1>
+      <p class="sub">Frame times captured out-of-process with PresentMon. Needs administrator.</p>
+
+      <div class="card">
+        <div class="row" style="justify-content:space-between;margin-bottom:6px">
+          <h2 style="margin:0"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M1 13L5 7l3 3 3-6 3 4"/></svg>
+              Live frame time</h2>
+          <span class="pill acc">● capturing · 0x5555</span>
+        </div>
+        <div class="legend"><span><i style="background:var(--chart-1)"></i>ms between presents</span></div>
+        <div class="chart" id="ft"></div>
+      </div>
+
+      <div class="card">
+        <h2><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1" y="8" width="3.4" height="7" rx="1"/><rect x="6.3" y="4" width="3.4" height="11" rx="1"/><rect x="11.6" y="1" width="3.4" height="14" rx="1"/></svg>
+            Sessions by mask</h2>
+        <div class="legend">
+          <span><i style="background:var(--chart-1)"></i>Average FPS</span>
+          <span><i style="background:var(--chart-2)"></i>1% low (time-weighted)</span>
+        </div>
+        <div class="chart" id="cmp"></div>
+        <table class="sess">
+          <tr><th>Session</th><th>Mask</th><th>Avg</th><th>1% low</th><th>vs baseline</th></tr>
+          <tr><td>Heidel — optimized</td><td class="mono">0x5555</td><td class="mono">143.8</td><td class="mono">96.2</td><td class="up">+18.3%</td></tr>
+          <tr><td>Heidel — SMT alternate</td><td class="mono">0xFFFF</td><td class="mono">131.9</td><td class="mono">84.0</td><td class="up">+8.6%</td></tr>
+          <tr><td>Heidel — baseline</td><td class="mono">all cores</td><td class="mono">121.5</td><td class="mono">71.4</td><td class="mono" style="color:var(--ink-3)">—</td></tr>
+        </table>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script>
+// ---------- nav ----------
+function go(id){
+  document.querySelectorAll('.screen').forEach(s=>s.classList.toggle('on',s.id===id));
+  document.querySelectorAll('.nav button').forEach(b=>b.classList.toggle('on',b.dataset.s===id));
+}
+document.querySelectorAll('.nav button').forEach(b=>b.onclick=()=>go(b.dataset.s));
+
+// ---------- core map ----------
+function chips(el, base, lit){
+  for(let i=0;i<8;i++){
+    const c=document.createElement('div');
+    c.className='chip'+(lit?' onc':'');
+    c.innerHTML=`<span class="n">${base+i}</span><div class="th"><i class="${lit?'a':''}"></i><i></i></div>`;
+    el.appendChild(c);
+  }
+}
+for(const [a,b] of [['ccd0','ccd1'],['ccd0b','ccd1b']]){
+  chips(document.getElementById(a),0,true);
+  chips(document.getElementById(b),8,false);
+}
+
+// ---------- frame-time line ----------
+(function(){
+  const W=796,H=170,P={l:44,r:8,t:8,b:22};
+  // Plausible 16.6ms baseline with mild noise and two grass-pop spikes.
+  const pts=[];let seed=7;
+  const rnd=()=> (seed=(seed*16807)%2147483647)/2147483647;
+  for(let i=0;i<160;i++){
+    let v=16.6+(rnd()-.5)*2.2;
+    if(i===52||i===118) v=31+rnd()*4;
+    if(i===53||i===119) v=24;
+    pts.push(v);
+  }
+  const ymax=40,ymin=8;
+  const x=i=>P.l+i*(W-P.l-P.r)/(pts.length-1);
+  const y=v=>P.t+(ymax-v)/(ymax-ymin)*(H-P.t-P.b);
+  let d='M'+pts.map((v,i)=>`${x(i).toFixed(1)} ${y(v).toFixed(1)}`).join(' L');
+  const gl=[10,20,30,40].map(g=>`<line x1="${P.l}" x2="${W-P.r}" y1="${y(g)}" y2="${y(g)}" stroke="var(--stroke-soft)"/>
+      <text class="axis" x="${P.l-8}" y="${y(g)+3}" text-anchor="end">${g}</text>`).join('');
+  const el=document.getElementById('ft');
+  el.innerHTML=`<svg viewBox="0 0 ${W} ${H}">${gl}
+    <path d="${d}" fill="none" stroke="var(--chart-1)" stroke-width="2" stroke-linejoin="round"/>
+    <line id="ftx" y1="${P.t}" y2="${H-P.b}" stroke="var(--ink-3)" stroke-dasharray="3 3" style="display:none"/>
+    <text class="axis" x="${P.l}" y="${H-6}">0 s</text>
+    <text class="axis" x="${W-P.r}" y="${H-6}" text-anchor="end">20 s</text></svg>
+    <div class="tip" id="fttip"></div>`;
+  const svg=el.querySelector('svg'),vx=el.querySelector('#ftx'),tip=el.querySelector('#fttip');
+  svg.addEventListener('mousemove',e=>{
+    const r=svg.getBoundingClientRect(),sx=W/r.width;
+    const px=(e.clientX-r.left)*sx;
+    const i=Math.max(0,Math.min(pts.length-1,Math.round((px-P.l)/((W-P.l-P.r)/(pts.length-1)))));
+    vx.style.display='block';vx.setAttribute('x1',x(i));vx.setAttribute('x2',x(i));
+    tip.style.display='block';
+    tip.style.left=Math.min(e.clientX-r.left+14,r.width-130)+'px';
+    tip.style.top=(y(pts[i])/H*r.height-34)+'px';
+    tip.innerHTML=`<span class="mono">${pts[i].toFixed(1)} ms</span> · ${(1000/pts[i]).toFixed(0)} FPS`;
+  });
+  svg.addEventListener('mouseleave',()=>{vx.style.display='none';tip.style.display='none'});
+})();
+
+// ---------- comparison bars ----------
+(function(){
+  const W=796,H=180,P={l:44,r:8,t:10,b:26};
+  const groups=[
+    {label:'0x5555',a:143.8,b:96.2},
+    {label:'0xFFFF',a:131.9,b:84.0},
+    {label:'all cores',a:121.5,b:71.4},
+  ];
+  const ymax=160;
+  const y=v=>P.t+(ymax-v)/ymax*(H-P.t-P.b);
+  const bw=46,gap=2,gw=bw*2+gap,step=(W-P.l-P.r)/groups.length;
+  const gl=[40,80,120,160].map(g=>`<line x1="${P.l}" x2="${W-P.r}" y1="${y(g)}" y2="${y(g)}" stroke="var(--stroke-soft)"/>
+      <text class="axis" x="${P.l-8}" y="${y(g)+3}" text-anchor="end">${g}</text>`).join('');
+  let bars='';
+  groups.forEach((g,i)=>{
+    const cx=P.l+step*i+step/2;
+    const x1=cx-gw/2, x2=x1+bw+gap;
+    bars+=`<g class="bar" data-i="${i}">
+      <rect x="${x1}" y="${y(g.a)}" width="${bw}" height="${y(0)-y(g.a)}" rx="4" fill="var(--chart-1)"/>
+      <rect x="${x2}" y="${y(g.b)}" width="${bw}" height="${y(0)-y(g.b)}" rx="4" fill="var(--chart-2)"/>
+      <text class="bar-l" x="${x1+bw/2}" y="${y(g.a)-6}" text-anchor="middle">${g.a.toFixed(0)}</text>
+      <text class="bar-l" x="${x2+bw/2}" y="${y(g.b)-6}" text-anchor="middle">${g.b.toFixed(0)}</text>
+      <text class="axis" x="${cx}" y="${H-8}" text-anchor="middle">${g.label}</text></g>`;
+  });
+  document.getElementById('cmp').innerHTML=`<svg viewBox="0 0 ${W} ${H}">${gl}${bars}</svg>`;
+})();
+</script>
+</body>
+</html>
