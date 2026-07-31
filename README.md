@@ -41,6 +41,15 @@ The affinity recommendations are based on
   one needs a reboot, the other affects every application.
 - **Shows its version:** the current package version appears in the app header.
 
+## Download
+
+Grab the latest `bdo-optimizer-*-windows-x64.zip` from
+[Releases](https://github.com/CarlosJunioor/bdo-optimizer/releases), extract the
+folder anywhere, and run `bdo-optimizer.exe`. Keep the bundled files together —
+FPS capture and the NVIDIA tweaks look for their tools beside the exe. Windows
+SmartScreen will warn on first run because the build is unsigned: *More info* →
+*Run anyway* (each release ships a `.sha256` you can check first).
+
 ## Requirements
 
 ### To use the BDO workflow
