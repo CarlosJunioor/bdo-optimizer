@@ -19,8 +19,11 @@ The affinity recommendations are based on
 
 - **Explains the relevant hardware:** CPU model and topology, L1/L2/L3 cache,
   AMD X3D V-Cache CCDs, RAM, GPU and driver details, and local storage.
-- **Recommends a supported affinity mask:** the recommendation is pre-filled,
-  while alternate masks remain available under the advanced control.
+- **Recommends an affinity mask for any CPU:** the guide's published masks for
+  the CPUs it names, and a mask derived from live topology for everything else —
+  Intel hybrid parts run on their P-cores (by reported efficiency class), X3D
+  parts on the V-Cache CCD, multi-CCD parts on one CCD, SMT parts on one thread
+  per physical core. Alternate masks worth A/B testing come with it.
 - **Applies affinity without touching the running game:** BDO inherits the mask
   from `BlackDesertLauncher.exe`.
 - **Verifies before measuring:** the app reads the running process affinity and

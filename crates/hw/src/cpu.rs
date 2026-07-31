@@ -21,6 +21,18 @@ pub struct CacheInfo {
     pub instances: usize,
 }
 
+/// One physical core: its SMT threads and its performance tier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreTopo {
+    /// Logical processor ids belonging to this physical core (1 without SMT,
+    /// 2 with). Sorted ascending.
+    pub logical_cores: Vec<usize>,
+    /// Windows `EfficiencyClass`: higher is faster. On Intel hybrid parts
+    /// P-cores report a higher class than E-cores; on homogeneous CPUs every
+    /// core reports the same value. Always 0 where the OS has no such notion.
+    pub efficiency_class: u8,
+}
+
 /// Detected CPU characteristics used by the recommendation engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CpuInfo {
@@ -35,6 +47,9 @@ pub struct CpuInfo {
     pub l3_domains: Vec<L3Domain>,
     /// Total capacity and instance count for each reported cache level.
     pub caches: Vec<CacheInfo>,
+    /// Per-physical-core topology (SMT siblings + efficiency class), sorted by
+    /// first logical id. Empty when unavailable.
+    pub cores: Vec<CoreTopo>,
 }
 
 /// Detect the host CPU: model string, core counts and L3 topology.
@@ -66,12 +81,15 @@ pub fn detect_cpu() -> CpuInfo {
     let physical_cores = System::physical_core_count().unwrap_or(logical_cores.max(1));
 
     let (l3_domains, caches) = detect_caches();
+    let mut cores = detect_core_topology();
+    cores.sort_by_key(|c| c.logical_cores.first().copied().unwrap_or(usize::MAX));
     CpuInfo {
         model,
         physical_cores,
         logical_cores,
         l3_domains,
         caches,
+        cores,
     }
 }
 
@@ -102,6 +120,132 @@ pub fn vcache_ccd(domains: &[L3Domain]) -> Option<&L3Domain> {
     } else {
         None
     }
+}
+
+// ---------------------------------------------------------------------------
+// Windows: GetLogicalProcessorInformationEx(RelationProcessorCore)
+// ---------------------------------------------------------------------------
+#[cfg(windows)]
+fn detect_core_topology() -> Vec<CoreTopo> {
+    use windows::Win32::System::SystemInformation::{
+        GetLogicalProcessorInformationEx, RelationProcessorCore, GROUP_AFFINITY,
+        LOGICAL_PROCESSOR_RELATIONSHIP, PROCESSOR_RELATIONSHIP,
+        SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+    };
+
+    let mut cores = Vec::new();
+    unsafe {
+        let mut len: u32 = 0;
+        let _ = GetLogicalProcessorInformationEx(RelationProcessorCore, None, &mut len);
+        if len == 0 {
+            return cores;
+        }
+
+        // u64-backed buffer for the same alignment reason as `detect_caches`.
+        let mut buffer: Vec<u64> = vec![0; (len as usize).div_ceil(8)];
+        let ptr = buffer.as_mut_ptr() as *mut SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX;
+        if GetLogicalProcessorInformationEx(RelationProcessorCore, Some(ptr), &mut len).is_err() {
+            return cores;
+        }
+
+        // Same variable-length walk as `detect_caches`: never materialise a
+        // reference to the full union, read each variant unaligned.
+        const HEADER: usize = 2 * std::mem::size_of::<u32>();
+        let min_record = HEADER + std::mem::size_of::<PROCESSOR_RELATIONSHIP>();
+        let base = buffer.as_ptr() as *const u8;
+        let len = len as usize;
+
+        let mut offset: usize = 0;
+        while offset + HEADER <= len {
+            let size = std::ptr::read_unaligned(
+                base.add(offset + std::mem::size_of::<u32>()) as *const u32
+            ) as usize;
+            if size < min_record || len - offset < size {
+                break;
+            }
+
+            let relationship =
+                std::ptr::read_unaligned(base.add(offset) as *const LOGICAL_PROCESSOR_RELATIONSHIP);
+            if relationship == RelationProcessorCore {
+                let core = std::ptr::read_unaligned(
+                    base.add(offset + HEADER) as *const PROCESSOR_RELATIONSHIP
+                );
+                // The struct declares one GROUP_AFFINITY but `GroupCount` of
+                // them actually follow; walk them all so >64-thread machines
+                // (Threadripper) are not silently truncated to group 0.
+                let masks_at =
+                    offset + HEADER + std::mem::offset_of!(PROCESSOR_RELATIONSHIP, GroupMask);
+                let ga_size = std::mem::size_of::<GROUP_AFFINITY>();
+                let mut logical = Vec::new();
+                for i in 0..core.GroupCount.max(1) as usize {
+                    let at = masks_at + i * ga_size;
+                    if at + ga_size > offset + size {
+                        break;
+                    }
+                    let ga = std::ptr::read_unaligned(base.add(at) as *const GROUP_AFFINITY);
+                    let group_base = ga.Group as usize * 64;
+                    let mask = ga.Mask as u64;
+                    logical.extend(
+                        (0..64u32)
+                            .filter(|b| mask & (1u64 << b) != 0)
+                            .map(|b| group_base + b as usize),
+                    );
+                }
+                logical.sort_unstable();
+                if !logical.is_empty() {
+                    cores.push(CoreTopo {
+                        logical_cores: logical,
+                        efficiency_class: core.EfficiencyClass,
+                    });
+                }
+            }
+
+            offset += size;
+        }
+    }
+    cores
+}
+
+// ---------------------------------------------------------------------------
+// Linux: /sys/devices/system/cpu/cpu*/topology/
+// ---------------------------------------------------------------------------
+#[cfg(target_os = "linux")]
+fn detect_core_topology() -> Vec<CoreTopo> {
+    use std::collections::BTreeSet;
+
+    let mut seen: BTreeSet<Vec<usize>> = BTreeSet::new();
+    let mut cores = Vec::new();
+    let Ok(root) = std::fs::read_dir("/sys/devices/system/cpu") else {
+        return cores;
+    };
+    for entry in root.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("cpu") || !name[3..].chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let topo = entry.path().join("topology");
+        let list = read_trimmed(&topo.join("core_cpus_list"))
+            .or_else(|| read_trimmed(&topo.join("thread_siblings_list")));
+        let Some(list) = list.as_deref().and_then(parse_cpu_list) else {
+            continue;
+        };
+        if list.is_empty() || !seen.insert(list.clone()) {
+            continue;
+        }
+        // ponytail: efficiency_class stays 0 on Linux — sysfs has no direct
+        // EfficiencyClass equivalent and the affinity workflow is Windows-only.
+        cores.push(CoreTopo {
+            logical_cores: list,
+            efficiency_class: 0,
+        });
+    }
+    cores
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn detect_core_topology() -> Vec<CoreTopo> {
+    Vec::new()
 }
 
 // ---------------------------------------------------------------------------
@@ -384,6 +528,29 @@ mod tests {
         // 48 MB vs 32 MB is only 1.5x -> not a clear X3D split.
         let domains = vec![dom(48, vec![0, 1]), dom(32, vec![2, 3])];
         assert!(vcache_ccd(&domains).is_none());
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn live_core_topology_is_consistent() {
+        // Runs against the real machine (and CI): every logical processor
+        // belongs to exactly one physical core, 1-2 threads each.
+        let cpu = detect_cpu();
+        assert!(
+            !cpu.cores.is_empty(),
+            "core topology must be available here"
+        );
+        let mut seen: Vec<usize> = cpu
+            .cores
+            .iter()
+            .flat_map(|c| c.logical_cores.iter().copied())
+            .collect();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..cpu.logical_cores).collect::<Vec<_>>());
+        assert!(cpu
+            .cores
+            .iter()
+            .all(|c| (1..=2).contains(&c.logical_cores.len())));
     }
 
     #[cfg(target_os = "linux")]
