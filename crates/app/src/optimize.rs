@@ -206,6 +206,7 @@ impl App {
         ui.add_space(10.0);
         ui.separator();
         self.nvidia_section(ui);
+        self.amd_section(ui);
         ui.add_space(10.0);
         ui.separator();
         self.gameconfig_section(ui);
@@ -877,6 +878,64 @@ impl App {
                 };
             }
         }
+    }
+
+    // ------------------------------------------------------ AMD driver settings
+    /// The guide's Radeon advice as manual steps. Shown only on Windows hosts
+    /// with an AMD GPU.
+    ///
+    /// Manual on purpose: AMD's per-game profiles live in a proprietary blob
+    /// that Adrenalin overwrites at will, and AMD's supported SDK (ADLX) can
+    /// only change *global* GPU settings — every game, not just BDO. There is
+    /// no safe per-game write path for an external app, so unlike the NVIDIA
+    /// side this stays a walkthrough instead of a button.
+    fn amd_section(&mut self, ui: &mut egui::Ui) {
+        if !cfg!(windows) {
+            return;
+        }
+        // Only when Radeon is what BDO will run on: an NVIDIA card alongside an
+        // AMD iGPU (the common Ryzen APU + GeForce build) gets the automated
+        // NVIDIA profile instead, and this walkthrough would be noise.
+        let amd_only = self.detection.as_ref().is_some_and(|d| {
+            d.gpus.iter().any(|g| g.vendor == bdo_hw::GpuVendor::Amd)
+                && !d.gpus.iter().any(|g| g.vendor == bdo_hw::GpuVendor::Nvidia)
+        });
+        if !amd_only {
+            return;
+        }
+
+        ui.label(
+            RichText::new("AMD Radeon settings (guide settings)")
+                .strong()
+                .size(16.0),
+        );
+        ui.label(
+            RichText::new(
+                "The guide's driver tweak for Radeon is two switches in one screen. AMD \
+                 offers no safe way for an app to write a per-game profile (Adrenalin owns \
+                 and overwrites them), so these two are set by hand:",
+            )
+            .size(12.0)
+            .weak(),
+        );
+        for step in [
+            "1.  Open AMD Software: Adrenalin Edition (right-click the desktop).",
+            "2.  Gaming → Games → Black Desert. If it is not listed, add \
+             BlackDesert64.exe via the ⋯ menu → Add A Game.",
+            "3.  Enhanced Sync: On.",
+            "4.  Wait for Vertical Refresh: Always Off.",
+        ] {
+            ui.label(RichText::new(step).size(12.0));
+        }
+        ui.label(
+            RichText::new(
+                "Leave injection-based extras (e.g. the retired Anti-Lag+) alone — BDO runs \
+                 Easy Anti-Cheat. The original driver-level Anti-Lag is safe if you want to \
+                 try it.",
+            )
+            .size(12.0)
+            .weak(),
+        );
     }
 
     // ---------------------------------------------------- NVIDIA driver profile

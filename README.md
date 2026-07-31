@@ -34,6 +34,10 @@ The affinity recommendations are based on
   the per-game "Black Desert" profile through the bundled NVIDIA Profile
   Inspector and verifies the result against the driver database. Nothing global
   changes, and one click restores driver defaults.
+- **Guides AMD Radeon users through the guide's driver settings:** on AMD GPUs
+  the app shows the exact Adrenalin steps (Enhanced Sync on, Wait for Vertical
+  Refresh off, per-game). Manual by design — AMD offers no safe way for an
+  external app to write per-game driver profiles.
 - **Applies the guide's config-file tweaks (optional):** sets PostFilter and
   Tessellation off in `GameOption.txt` and every UserCache `gamevariable.xml`,
   backing each file up first, with a one-click restore.
