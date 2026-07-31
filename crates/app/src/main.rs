@@ -22,6 +22,7 @@ mod overlay;
 mod presentmon;
 #[cfg(windows)]
 mod relaunch;
+mod theme;
 mod video;
 mod winsettings;
 

@@ -6,9 +6,9 @@ use egui::{Color32, RichText};
 use crate::app::{App, Tab, VerifyOutcome};
 use crate::format;
 
-const OK_GREEN: Color32 = Color32::from_rgb(0x63, 0xd6, 0x88);
-const WARN: Color32 = Color32::from_rgb(0xff, 0xc1, 0x07);
-const ERR: Color32 = Color32::from_rgb(0xff, 0x6b, 0x6b);
+const OK_GREEN: Color32 = crate::theme::OK;
+const WARN: Color32 = crate::theme::WARN;
+const ERR: Color32 = crate::theme::ERR;
 
 const MASK_PRESETS: &[(&str, &str)] = &[
     ("C", "AMD 4-core without SMT"),
@@ -172,11 +172,13 @@ impl App {
     }
 
     pub(crate) fn optimize_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Apply safely");
-        ui.label(
-            RichText::new("Use the detected recommendation, verify it in-game, and return to normal launch at any time.")
-                .size(13.0)
-                .weak(),
+        use egui_phosphor::regular as icons;
+
+        crate::theme::screen_heading(
+            ui,
+            "Apply",
+            "Use the detected recommendation, verify it in-game, and return to normal \
+             launch at any time.",
         );
 
         if self.detection.is_none() {
@@ -190,31 +192,55 @@ impl App {
 
         self.optimization_status(ui);
         ui.add_space(10.0);
-        self.one_click_section(ui);
-        ui.add_space(10.0);
-        ui.separator();
-        self.game_path_section(ui);
-        ui.add_space(10.0);
-        ui.separator();
-        self.mask_section(ui);
-        ui.add_space(10.0);
-        ui.separator();
-        self.actions_section(ui);
-        ui.add_space(10.0);
-        ui.separator();
-        self.verify_section(ui);
-        ui.add_space(10.0);
-        ui.separator();
-        self.nvidia_section(ui);
-        self.amd_section(ui);
-        ui.add_space(10.0);
-        ui.separator();
-        self.gameconfig_section(ui);
+        crate::theme::section_card(ui, icons::LIGHTNING, "One click", |ui| {
+            self.one_click_section(ui)
+        });
+        crate::theme::section_card(ui, icons::FOLDER_OPEN, "Game path", |ui| {
+            self.game_path_section(ui)
+        });
+        crate::theme::section_card(ui, icons::CIRCUITRY, "Affinity", |ui| self.mask_section(ui));
+        crate::theme::section_card(ui, icons::ROCKET_LAUNCH, "Apply for this launch", |ui| {
+            self.actions_section(ui)
+        });
+        crate::theme::section_card(ui, icons::SEAL_CHECK, "Automatic verification", |ui| {
+            self.verify_section(ui)
+        });
+        if self.show_nvidia_section() {
+            crate::theme::section_card(ui, icons::SHIELD_CHECK, "NVIDIA driver profile", |ui| {
+                self.nvidia_section(ui)
+            });
+        }
+        if self.show_amd_section() {
+            crate::theme::section_card(ui, icons::SLIDERS, "AMD Radeon settings", |ui| {
+                self.amd_section(ui)
+            });
+        }
+        if cfg!(windows) {
+            crate::theme::section_card(ui, icons::FILE_TEXT, "Game config files", |ui| {
+                self.gameconfig_section(ui)
+            });
+        }
         if matches!(&self.optimize.verify, Some(VerifyOutcome::Match { .. }))
             && ui.button("Continue to Measure").clicked()
         {
             self.tab = Tab::Benchmark;
         }
+    }
+
+    fn show_nvidia_section(&self) -> bool {
+        cfg!(windows)
+            && self
+                .detection
+                .as_ref()
+                .is_some_and(|d| d.gpus.iter().any(|g| g.vendor == bdo_hw::GpuVendor::Nvidia))
+    }
+
+    fn show_amd_section(&self) -> bool {
+        cfg!(windows)
+            && self.detection.as_ref().is_some_and(|d| {
+                d.gpus.iter().any(|g| g.vendor == bdo_hw::GpuVendor::Amd)
+                    && !d.gpus.iter().any(|g| g.vendor == bdo_hw::GpuVendor::Nvidia)
+            })
     }
 
     fn optimization_status(&self, ui: &mut egui::Ui) {
@@ -234,12 +260,12 @@ impl App {
             _ => (
                 "PENDING",
                 "Launch with the optimized shortcut or Launch Now; verification starts when BDO opens.",
-                Color32::from_rgb(104, 200, 255),
+                crate::theme::ACCENT,
             ),
         };
 
         egui::Frame::new()
-            .fill(Color32::from_rgb(16, 25, 39))
+            .fill(crate::theme::PANEL)
             .stroke(egui::Stroke::new(1.0, color))
             .corner_radius(8)
             .inner_margin(egui::Margin::same(14))
@@ -266,7 +292,6 @@ impl App {
     /// conditionally. Those stay as their own buttons further down, so a user
     /// who wants them chooses them knowingly.
     fn one_click_section(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Apply everything safe").strong().size(16.0));
         ui.label(
             RichText::new(
                 "Applies the guide settings that are reversible, need no reboot, and only affect \
@@ -568,8 +593,6 @@ impl App {
 
     // --------------------------------------------------------------- Game path
     fn game_path_section(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Find your BDO install").strong().size(16.0));
-
         if !cfg!(windows) {
             ui.label(
                 RichText::new(
@@ -653,12 +676,6 @@ impl App {
 
     // --------------------------------------------------------------- Mask entry
     fn mask_section(&mut self, ui: &mut egui::Ui) {
-        ui.label(
-            RichText::new("Review the affinity mask")
-                .strong()
-                .size(16.0),
-        );
-
         let Some(detection) = &self.detection else {
             return;
         };
@@ -683,6 +700,15 @@ impl App {
             }
         });
         ui.label(RichText::new(&recommendation.explanation).size(12.0).weak());
+
+        // The mask the user is about to apply, drawn on the actual CPU.
+        if let Ok(cores) = bdo_hw::mask_to_cores(&self.optimize.mask_input) {
+            if !cores.is_empty() && cores.iter().all(|c| *c < detection.cpu.logical_cores) {
+                ui.add_space(6.0);
+                crate::theme::core_map(ui, &detection.cpu, &cores);
+                ui.add_space(6.0);
+            }
+        }
 
         ui.horizontal(|ui| {
             ui.label("Current mask:");
@@ -788,8 +814,6 @@ impl App {
 
     // ----------------------------------------------------------------- Actions
     fn actions_section(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Apply for this launch").strong().size(16.0));
-
         if !cfg!(windows) {
             ui.label(
                 RichText::new(
@@ -905,11 +929,6 @@ impl App {
         }
 
         ui.label(
-            RichText::new("AMD Radeon settings (guide settings)")
-                .strong()
-                .size(16.0),
-        );
-        ui.label(
             RichText::new(
                 "The guide's driver tweak for Radeon is two switches in one screen. AMD \
                  offers no safe way for an app to write a per-game profile (Adrenalin owns \
@@ -956,11 +975,6 @@ impl App {
             return;
         }
 
-        ui.label(
-            RichText::new("NVIDIA driver profile (guide settings)")
-                .strong()
-                .size(16.0),
-        );
         ui.label(
             RichText::new(
                 "Writes only the driver's per-game \"Black Desert\" profile using the bundled \
@@ -1132,11 +1146,6 @@ impl App {
             return;
         }
         ui.label(
-            RichText::new("Game config files (guide settings)")
-                .strong()
-                .size(16.0),
-        );
-        ui.label(
             RichText::new(
                 "Turns off PostFilter (forced sharpening) and Tessellation in GameOption.txt and \
                  every UserCache gamevariable.xml, exactly as the guide describes. The original \
@@ -1301,7 +1310,6 @@ impl App {
 
     // ------------------------------------------------------------------ Verify
     fn verify_section(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Automatic verification").strong().size(16.0));
         ui.label(
             RichText::new(
                 "The app checks the running game every second. This is read-only; the game inherits the mask at launch.",

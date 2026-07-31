@@ -15,32 +15,39 @@ use crate::app::{App, CaptureStatus, VerifyOutcome};
 use crate::capture::{CaptureParams, CaptureWorker};
 use crate::{format, presentmon};
 
-const OK_GREEN: Color32 = Color32::from_rgb(0x63, 0xd6, 0x88);
-const WARN: Color32 = Color32::from_rgb(0xff, 0xc1, 0x07);
-const ERR: Color32 = Color32::from_rgb(0xff, 0x6b, 0x6b);
+const OK_GREEN: Color32 = crate::theme::OK;
+const WARN: Color32 = crate::theme::WARN;
+const ERR: Color32 = crate::theme::ERR;
 
-const COL_AVG: Color32 = Color32::from_rgb(0x4d, 0xa6, 0xff);
-const COL_P1: Color32 = Color32::from_rgb(0xff, 0xa6, 0x4d);
-const COL_INTEGRAL: Color32 = Color32::from_rgb(0x9d, 0x7d, 0xff);
+const COL_AVG: Color32 = crate::theme::CHART_1;
+const COL_P1: Color32 = crate::theme::CHART_2;
+const COL_INTEGRAL: Color32 = crate::theme::CHART_3;
 
 impl App {
     pub(crate) fn benchmark_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Measure the gain");
-        ui.label(
-            RichText::new("Capture one normal-launch baseline and one verified affinity run, then compare them below.")
-                .size(13.0)
-                .weak(),
+        use egui_phosphor::regular as icons;
+
+        crate::theme::screen_heading(
+            ui,
+            "Measure",
+            "Capture one normal-launch baseline and one verified affinity run, then compare \
+             them below.",
         );
 
         self.poll_verification(ui.ctx());
         self.elevation_banner(ui);
-        self.capture_section(ui);
-        ui.add_space(10.0);
-        ui.separator();
-        self.sessions_section(ui);
-        ui.add_space(10.0);
-        ui.separator();
-        self.comparison_section(ui);
+        crate::theme::section_card(ui, icons::RECORD, "Capture a run", |ui| {
+            self.capture_section(ui)
+        });
+        crate::theme::section_card(ui, icons::ROWS, "Choose two runs", |ui| {
+            self.sessions_section(ui)
+        });
+        crate::theme::section_card(
+            ui,
+            icons::CHART_BAR,
+            "Compare baseline vs optimized",
+            |ui| self.comparison_section(ui),
+        );
     }
 
     // ------------------------------------------------ Elevation warning banner
@@ -116,7 +123,6 @@ impl App {
 
     // ----------------------------------------------------------- Capture panel
     fn capture_section(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Capture a run").strong().size(20.0));
         let capturing = self.benchmark.worker.is_some();
         let previous_mode = self.benchmark.baseline_capture;
         ui.add_enabled_ui(!capturing, |ui| {
@@ -504,7 +510,6 @@ impl App {
     // ------------------------------------------------------------ Session table
     fn sessions_section(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Choose two runs").strong().size(20.0));
             ui.label(
                 RichText::new(format!(
                     "{} / 2 selected",
@@ -666,11 +671,6 @@ impl App {
 
     // -------------------------------------------------------- Comparison chart
     fn comparison_section(&mut self, ui: &mut egui::Ui) {
-        ui.label(
-            RichText::new("Compare baseline vs optimized")
-                .strong()
-                .size(24.0),
-        );
         ui.label(
             RichText::new("The delta is B minus A. Higher FPS is better.")
                 .size(12.0)

@@ -427,66 +427,151 @@ impl eframe::App for App {
         self.poll_capture();
         self.drive_overlay(&ui.ctx().clone());
 
-        egui::Panel::top("tabs")
-            .exact_size(64.0)
+        // The GL clear is transparent for the overlay viewport's sake, so any
+        // pixel the panels miss (stroke insets, rounded corners) would show the
+        // window behind. Paint the whole main window opaque first.
+        ui.painter()
+            .rect_filled(ui.ctx().content_rect(), 0.0, crate::theme::BG);
+
+        egui::Panel::left("nav")
+            .exact_size(232.0)
             .frame(
                 egui::Frame::new()
-                    .fill(egui::Color32::from_rgb(14, 22, 34))
-                    .inner_margin(egui::Margin::symmetric(20, 12)),
+                    .fill(crate::theme::PANEL)
+                    .stroke(egui::Stroke::new(1.0, crate::theme::STROKE_SOFT))
+                    .inner_margin(egui::Margin::symmetric(12, 20)),
             )
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("BDO // OPTIMIZER")
-                            .monospace()
-                            .strong()
-                            .size(20.0)
-                            .color(egui::Color32::from_rgb(104, 200, 255)),
-                    );
-                    ui.separator();
-                    ui.selectable_value(&mut self.tab, Tab::Hardware, "1  Inspect");
-                    ui.selectable_value(&mut self.tab, Tab::Optimize, "2  Apply");
-                    ui.selectable_value(&mut self.tab, Tab::Benchmark, "3  Measure");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                                .monospace()
-                                .size(12.0)
-                                .color(egui::Color32::from_rgb(150, 166, 186)),
-                        )
-                        .on_hover_text("Current BDO Optimizer version");
-                    });
-                });
+                self.sidebar(ui);
             });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| match self.tab {
-                Tab::Hardware => self.hardware_ui(ui),
-                Tab::Optimize => self.optimize_ui(ui),
-                Tab::Benchmark => self.benchmark_ui(ui),
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                crate::theme::content_column(ui, |ui| match self.tab {
+                    Tab::Hardware => self.hardware_ui(ui),
+                    Tab::Optimize => self.optimize_ui(ui),
+                    Tab::Benchmark => self.benchmark_ui(ui),
+                });
             });
         });
     }
 }
 
+impl App {
+    fn sidebar(&mut self, ui: &mut egui::Ui) {
+        use crate::theme;
+
+        ui.horizontal(|ui| {
+            ui.add_space(10.0);
+            ui.label(
+                egui::RichText::new("BDO")
+                    .font(egui::FontId::new(17.0, theme::display()))
+                    .color(theme::INK),
+            );
+            ui.label(
+                egui::RichText::new("//")
+                    .font(egui::FontId::new(17.0, theme::display()))
+                    .color(theme::ACCENT),
+            );
+            ui.label(
+                egui::RichText::new("OPTIMIZER")
+                    .font(egui::FontId::new(17.0, theme::display()))
+                    .color(theme::INK),
+            );
+        });
+        ui.add_space(16.0);
+
+        let inspect_done = self.detection.is_some();
+        let apply_done = matches!(&self.optimize.verify, Some(VerifyOutcome::Match { .. }));
+        for (tab, num, label, done) in [
+            (Tab::Hardware, "1", "Inspect", inspect_done),
+            (Tab::Optimize, "2", "Apply", apply_done),
+            (Tab::Benchmark, "3", "Measure", false),
+        ] {
+            if nav_row(ui, self.tab == tab, num, label, done) {
+                self.tab = tab;
+            }
+        }
+
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+            ui.add_space(2.0);
+            egui::Frame::new()
+                .inner_margin(egui::Margin::symmetric(10, 0))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "v{} · windows-x64",
+                            env!("CARGO_PKG_VERSION")
+                        ))
+                        .monospace()
+                        .size(11.0)
+                        .color(theme::INK_3),
+                    );
+                    ui.label(
+                        egui::RichText::new(self.gpu_label())
+                            .size(12.0)
+                            .color(theme::INK_2),
+                    );
+                    ui.label(
+                        egui::RichText::new(self.cpu_label())
+                            .size(12.0)
+                            .color(theme::INK_2),
+                    );
+                    ui.add_space(10.0);
+                    ui.separator();
+                });
+        });
+    }
+}
+
+/// One sidebar navigation row: number, label, optional done-check, and the
+/// accent bar on the active row. Custom-painted for left alignment.
+fn nav_row(ui: &mut egui::Ui, active: bool, num: &str, label: &str, done: bool) -> bool {
+    use crate::theme;
+
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 38.0), egui::Sense::click());
+    let painter = ui.painter();
+    if active || response.hovered() {
+        painter.rect_filled(rect, egui::CornerRadius::same(9), theme::HOVER);
+    }
+    if active {
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(rect.left() - 12.0, rect.top() + 8.0),
+                egui::pos2(rect.left() - 9.0, rect.bottom() - 8.0),
+            ),
+            egui::CornerRadius::same(2),
+            theme::ACCENT,
+        );
+    }
+    let ink = if active { theme::INK } else { theme::INK_2 };
+    painter.text(
+        egui::pos2(rect.left() + 14.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        num,
+        egui::FontId::new(12.0, theme::display()),
+        if active { theme::ACCENT } else { theme::INK_3 },
+    );
+    painter.text(
+        egui::pos2(rect.left() + 34.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::new(14.0, egui::FontFamily::Proportional),
+        ink,
+    );
+    if done {
+        painter.text(
+            egui::pos2(rect.right() - 12.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            egui_phosphor::regular::CHECK,
+            egui::FontId::new(13.0, egui::FontFamily::Proportional),
+            theme::OK,
+        );
+    }
+    response.clicked()
+}
+
 fn configure_ui(ctx: &egui::Context) {
-    ctx.set_theme(egui::Theme::Dark);
-    let mut style = (*ctx.style_of(egui::Theme::Dark)).clone();
-    style.spacing.item_spacing = egui::vec2(10.0, 8.0);
-    style.spacing.button_padding = egui::vec2(14.0, 9.0);
-    style.spacing.interact_size = egui::vec2(44.0, 40.0);
-    style.visuals = egui::Visuals::dark();
-    style.visuals.panel_fill = egui::Color32::from_rgb(10, 16, 26);
-    style.visuals.window_fill = egui::Color32::from_rgb(16, 25, 39);
-    style.visuals.extreme_bg_color = egui::Color32::from_rgb(7, 12, 20);
-    style.visuals.faint_bg_color = egui::Color32::from_rgb(19, 31, 47);
-    style.visuals.selection.bg_fill = egui::Color32::from_rgb(25, 113, 160);
-    style.visuals.selection.stroke.color = egui::Color32::from_rgb(177, 229, 255);
-    style.visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(25, 38, 56);
-    style.visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(34, 56, 78);
-    style.visuals.widgets.active.weak_bg_fill = egui::Color32::from_rgb(31, 92, 122);
-    style.visuals.hyperlink_color = egui::Color32::from_rgb(104, 200, 255);
-    style.visuals.warn_fg_color = egui::Color32::from_rgb(255, 191, 92);
-    style.visuals.error_fg_color = egui::Color32::from_rgb(255, 112, 112);
-    ctx.set_style_of(egui::Theme::Dark, style);
+    crate::theme::apply(ctx);
 }

@@ -28,6 +28,8 @@ eframe = { version = "0.35", default-features = false, features = [
 ] }
 egui = "0.35"
 egui_plot = "0.36"
+# Phosphor icon font for nav, section headers and status rows.
+egui-phosphor = "0.13"
 
 # Native file picker for the launcher path.
 rfd = "0.17"
