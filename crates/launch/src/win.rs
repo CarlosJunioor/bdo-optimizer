@@ -200,7 +200,7 @@ fn elevated_shell_params(
     steam: bool,
     launcher_dir: &str,
     launcher_filename: &str,
-) -> String {
+) -> Result<String, LaunchError> {
     build_cmd_arguments(&mask_to_hex(mask), steam, launcher_dir, launcher_filename)
 }
 
@@ -223,7 +223,7 @@ fn launch_via_elevated_shell(
         .file_name()
         .and_then(|f| f.to_str())
         .unwrap_or(LAUNCHER_EXE);
-    let params = elevated_shell_params(mask, steam, &workdir.to_string_lossy(), filename);
+    let params = elevated_shell_params(mask, steam, &workdir.to_string_lossy(), filename)?;
     let comspec = system_cmd()?;
 
     let verb_w = to_wide("runas");
@@ -343,7 +343,7 @@ pub fn create_shortcut(opts: ShortcutOptions) -> Result<PathBuf, LaunchError> {
     };
 
     let comspec = system_cmd()?;
-    let args = build_cmd_arguments(&mask_hex, opts.steam, &workdir.to_string_lossy(), &filename);
+    let args = build_cmd_arguments(&mask_hex, opts.steam, &workdir.to_string_lossy(), &filename)?;
     let description = shortcut_description(&mask_hex);
     let icon = opts.launcher_path.to_string_lossy().to_string();
 
@@ -782,11 +782,11 @@ mod tests {
     #[test]
     fn elevated_shell_params_matches_cmd_arguments() {
         assert_eq!(
-            elevated_shell_params(0x555, false, r"C:\Games\BDO", "BlackDesertLauncher.exe"),
+            elevated_shell_params(0x555, false, r"C:\Games\BDO", "BlackDesertLauncher.exe").unwrap(),
             "/d /c cd /d \"C:\\Games\\BDO\" && start \"\" /affinity 555 \"BlackDesertLauncher.exe\""
         );
         assert_eq!(
-            elevated_shell_params(0x554, true, r"C:\Games\BDO", "BlackDesertLauncher.exe"),
+            elevated_shell_params(0x554, true, r"C:\Games\BDO", "BlackDesertLauncher.exe").unwrap(),
             "/d /c cd /d \"C:\\Games\\BDO\" && start \"\" /affinity 554 \"BlackDesertLauncher.exe\" -steam"
         );
     }
@@ -798,11 +798,22 @@ mod tests {
             false,
             r"C:\BDO EUW\BlackDesert",
             "BlackDesertLauncher.exe",
-        );
+        )
+        .unwrap();
         assert!(
             params.starts_with("/d /c cd /d \"C:\\BDO EUW\\BlackDesert\" && "),
             "elevated command must cd into the launcher dir first, got: {params}"
         );
+    }
+
+    /// The elevated path must refuse a launcher whose directory would be
+    /// expanded by cmd rather than taken literally.
+    #[test]
+    fn elevated_shell_params_reject_expandable_paths() {
+        assert!(matches!(
+            elevated_shell_params(0x555, false, r"C:\%TMP%\BDO", "BlackDesertLauncher.exe"),
+            Err(LaunchError::UnsafeForCmd(_))
+        ));
     }
 
     #[test]

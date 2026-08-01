@@ -39,17 +39,38 @@ const MAX_CAPTURE_BYTES: u64 = 512 * 1024 * 1024;
 /// Maximum stderr retained in memory while still draining the child pipe.
 const MAX_STDERR_BYTES: u64 = 64 * 1024;
 
-/// Verify that `path` is the exact bundled PresentMon build before elevation.
-pub fn is_supported_presentmon(path: &Path) -> bool {
-    let Ok(metadata) = path.metadata() else {
+/// Open PresentMon for hashing in a way that blocks tampering while the handle
+/// lives.
+///
+/// On Windows the share mode is `FILE_SHARE_READ` only: other processes may
+/// read (and execute) the file but cannot write to, rename, or delete it.
+/// Holding this handle across both the hash check *and* the spawn is what makes
+/// the pin meaningful — the app runs elevated and ships as a portable folder, so
+/// otherwise a same-user, medium-integrity process could swap the executable in
+/// between and have its replacement launched with our administrator token. Same
+/// contract as the NVIDIA inspector in `crates/app/src/video.rs`.
+fn open_locked(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(path)
+    }
+    #[cfg(not(windows))]
+    std::fs::File::open(path)
+}
+
+/// Hash an already-open handle against the pinned build identity.
+fn handle_is_supported(file: &mut std::fs::File) -> bool {
+    let Ok(metadata) = file.metadata() else {
         return false;
     };
     if !metadata.is_file() || metadata.len() != PRESENTMON_SIZE {
         return false;
     }
-    let Ok(mut file) = std::fs::File::open(path) else {
-        return false;
-    };
     let mut hash = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
@@ -60,6 +81,19 @@ pub fn is_supported_presentmon(path: &Path) -> bool {
         }
     }
     <[u8; 32]>::from(hash.finalize()) == PRESENTMON_SHA256
+}
+
+/// Verify that `path` is the exact bundled PresentMon build.
+///
+/// Suitable for *discovery* only — the handle is closed before this returns, so
+/// the answer is already stale by the time a caller could act on it. Anything
+/// that goes on to execute the file must instead hold the handle from
+/// [`open_locked`] across the spawn; see [`start_capture`].
+pub fn is_supported_presentmon(path: &Path) -> bool {
+    match open_locked(path) {
+        Ok(mut file) => handle_is_supported(&mut file),
+        Err(_) => false,
+    }
 }
 
 /// Copy at most `limit` bytes to `writer`, then drain the rest of `reader`.
@@ -322,7 +356,12 @@ pub fn start_capture(cfg: &CaptureConfig) -> Result<CaptureHandle, BenchError> {
         // nothing — we already read its output through the pipes.
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-        if !is_supported_presentmon(&cfg.presentmon_path) {
+        // Hold this handle across the spawn below. It denies other processes
+        // write / rename / delete access, so the binary we hashed is provably
+        // the binary Windows loads — no swap window between check and use.
+        let mut locked = open_locked(&cfg.presentmon_path)
+            .map_err(|_| BenchError::UntrustedPresentMon(cfg.presentmon_path.clone()))?;
+        if !handle_is_supported(&mut locked) {
             return Err(BenchError::UntrustedPresentMon(cfg.presentmon_path.clone()));
         }
 
@@ -354,6 +393,10 @@ pub fn start_capture(cfg: &CaptureConfig) -> Result<CaptureHandle, BenchError> {
                 return Err(BenchError::Spawn(e.to_string()));
             }
         };
+        // Windows has loaded the image by now, so the pin has done its job.
+        // Dropping explicitly keeps that guarantee from silently depending on
+        // where this binding happens to fall out of scope.
+        drop(locked);
 
         // PresentMon streams the CSV over stdout (--output_stdout); copy it into
         // output_csv ourselves. Unlike PresentMon's own --output_file (opened
@@ -584,5 +627,43 @@ mod tests {
             Duration::from_millis(30),
         );
         assert!(got.is_none());
+    }
+
+    /// The whole PresentMon pin rests on one Windows behaviour: a handle opened
+    /// with `FILE_SHARE_READ` alone still lets the loader execute the image
+    /// while blocking any writer. If that were wrong the pin would either be
+    /// useless (writer gets in) or would break capture outright (spawn fails),
+    /// and neither shows up without an elevated PresentMon run — so prove it
+    /// here against a stand-in executable instead.
+    #[cfg(windows)]
+    #[test]
+    fn a_locked_executable_still_runs_but_cannot_be_written() {
+        let dir = std::env::temp_dir().join(format!("bdo-lock-exec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("stand-in.exe");
+        let system_cmd = PathBuf::from(std::env::var("ComSpec").unwrap_or_default());
+        std::fs::copy(&system_cmd, &exe).unwrap();
+
+        let held = open_locked(&exe).expect("the pinned handle must open");
+
+        // The loader must still be able to start it.
+        let status = std::process::Command::new(&exe)
+            .args(["/c", "exit 0"])
+            .status()
+            .expect("a locked executable must still be spawnable");
+        assert!(status.success());
+
+        // …and a tamperer must be locked out for as long as we hold it.
+        assert!(
+            std::fs::OpenOptions::new().write(true).open(&exe).is_err(),
+            "a pinned executable must not be writable"
+        );
+        assert!(
+            std::fs::remove_file(&exe).is_err(),
+            "a pinned executable must not be deletable"
+        );
+
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

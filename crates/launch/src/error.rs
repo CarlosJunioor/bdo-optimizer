@@ -18,6 +18,9 @@ pub enum LaunchError {
     PathNotFound(PathBuf),
     /// A launcher path had no parent directory to use as the working dir.
     NoParentDir(PathBuf),
+    /// The launcher path contains a character that `cmd.exe` would interpret
+    /// rather than treat as part of the path. Carries the offending path.
+    UnsafeForCmd(String),
     /// This operation is not supported on the current operating system.
     UnsupportedPlatform,
     /// The user dismissed the UAC elevation prompt (`ERROR_CANCELLED`). This is a
@@ -45,6 +48,12 @@ impl fmt::Display for LaunchError {
             LaunchError::NoParentDir(p) => {
                 write!(f, "path has no parent directory: {}", p.display())
             }
+            LaunchError::UnsafeForCmd(p) => write!(
+                f,
+                "the game path {p:?} contains a character cmd.exe would interpret (% or a \
+                 control character), so an optimized shortcut for it cannot be built safely — \
+                 move or rename the install so its path has none"
+            ),
             LaunchError::UnsupportedPlatform => {
                 write!(f, "operation not supported on this platform")
             }

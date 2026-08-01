@@ -55,6 +55,52 @@ pub const DX_VALUE: &str = "DirectXUserGlobalSettings";
 /// in windowed mode.
 pub const SWAP_EFFECT_UPGRADE: &str = "SwapEffectUpgradeEnable";
 
+/// Remove `key` from a `DirectXUserGlobalSettings` string, preserving every
+/// other entry.
+pub fn drop_dx_setting(existing: &str, key: &str) -> String {
+    let mut out = String::with_capacity(existing.len());
+    for entry in existing.split(';').filter(|e| !e.trim().is_empty()) {
+        let name = entry.split('=').next().unwrap_or("").trim();
+        if !name.eq_ignore_ascii_case(key) {
+            out.push_str(entry.trim());
+            out.push(';');
+        }
+    }
+    out
+}
+
+/// Read `key` out of a `DirectXUserGlobalSettings` string, if it is present.
+pub fn dx_setting_value(existing: &str, key: &str) -> Option<String> {
+    existing
+        .split(';')
+        .filter_map(|e| e.split_once('='))
+        .find(|(name, _)| name.trim().eq_ignore_ascii_case(key))
+        .map(|(_, value)| value.trim().to_string())
+}
+
+/// Undo our edit to a *current* `DirectXUserGlobalSettings` value, using the
+/// recorded original only to decide what `SwapEffectUpgradeEnable` should go
+/// back to.
+///
+/// Writing the recorded snapshot back wholesale is what a naive undo does, and
+/// it is wrong: this value is shared. Windows and other apps add their own keys
+/// to it, so restoring a snapshot taken before the optimization silently deletes
+/// every unrelated change made since — including ones the user made deliberately
+/// in the Graphics settings page. Only the key this app owns is put back.
+pub fn undo_windowed_optimization(current: &str, previous: &Previous) -> String {
+    let original = match previous {
+        Previous::Absent => None,
+        Previous::Was(text) => dx_setting_value(text, SWAP_EFFECT_UPGRADE),
+    };
+    match original {
+        // The key existed before us: restore exactly the value it had.
+        Some(value) => merge_dx_setting(current, SWAP_EFFECT_UPGRADE, &value),
+        // It did not exist before us, so undo means removing it again — not
+        // writing a zero, which is a different state to Windows.
+        None => drop_dx_setting(current, SWAP_EFFECT_UPGRADE),
+    }
+}
+
 /// Merge `key=value;` into a `DirectXUserGlobalSettings` string, preserving any
 /// other entries already present.
 ///
@@ -264,7 +310,8 @@ mod imp {
         Ok(true)
     }
 
-    /// Put the setting back exactly as it was, using the saved record.
+    /// Put our setting back as it was, leaving every other entry in the shared
+    /// value exactly as it stands today.
     pub fn restore_windowed_optimizations() -> Result<bool, String> {
         let Some(path) = undo_record_path() else {
             return Err("no place to look for an undo record".to_string());
@@ -278,7 +325,21 @@ mod imp {
                 path.display()
             ));
         };
-        write_dx_settings(&previous)?;
+        // Undo against the value as it is *now*, not against the snapshot: see
+        // [`super::undo_windowed_optimization`].
+        let current = match read_dx_settings()? {
+            Previous::Absent => String::new(),
+            Previous::Was(text) => text,
+        };
+        let merged = super::undo_windowed_optimization(&current, &previous);
+        // An empty result means nothing is left in the value at all; that is the
+        // "absent" state, not an empty string.
+        let restored = if merged.trim().is_empty() {
+            Previous::Absent
+        } else {
+            Previous::Was(merged)
+        };
+        write_dx_settings(&restored)?;
         let _ = std::fs::remove_file(&path);
         Ok(true)
     }
@@ -365,6 +426,58 @@ mod tests {
     fn a_corrupt_undo_record_is_rejected_not_guessed() {
         assert_eq!(Previous::decode("garbage"), None);
         assert_eq!(Previous::decode(""), None);
+    }
+
+    /// The value is shared with Windows and other apps. Undo must put back only
+    /// our key and leave everything that changed since the snapshot alone —
+    /// writing the whole recorded snapshot back would delete it.
+    #[test]
+    fn undo_touches_only_our_key() {
+        // Recorded before we touched anything: our key absent, one other entry.
+        let previous = Previous::Was("VRROptimizeEnable=1;".to_string());
+        // Since then: we set our key, and something else added a new entry and
+        // changed the existing one.
+        let current = "VRROptimizeEnable=0;SwapEffectUpgradeEnable=1;AutoHDREnable=1;";
+
+        let undone = undo_windowed_optimization(current, &previous);
+
+        assert!(
+            !undone.contains("SwapEffectUpgradeEnable"),
+            "our key was absent before, so undo must remove it: {undone}"
+        );
+        assert!(
+            undone.contains("VRROptimizeEnable=0;"),
+            "a later change to another entry must survive: {undone}"
+        );
+        assert!(
+            undone.contains("AutoHDREnable=1;"),
+            "an entry added after the snapshot must survive: {undone}"
+        );
+    }
+
+    /// When the key did exist beforehand, undo restores that exact value rather
+    /// than deleting it.
+    #[test]
+    fn undo_restores_a_preexisting_value() {
+        let previous = Previous::Was("SwapEffectUpgradeEnable=0;VRROptimizeEnable=1;".to_string());
+        let current = "SwapEffectUpgradeEnable=1;VRROptimizeEnable=1;AutoHDREnable=1;";
+
+        let undone = undo_windowed_optimization(current, &previous);
+
+        assert!(undone.contains("SwapEffectUpgradeEnable=0;"), "{undone}");
+        assert!(undone.contains("AutoHDREnable=1;"), "{undone}");
+        assert_eq!(undone.matches("SwapEffectUpgradeEnable").count(), 1);
+    }
+
+    /// A record of "the whole value was absent" still means only our key is
+    /// removed — anything written since belongs to someone else.
+    #[test]
+    fn undo_from_an_absent_record_removes_only_our_key() {
+        let undone = undo_windowed_optimization(
+            "SwapEffectUpgradeEnable=1;AutoHDREnable=1;",
+            &Previous::Absent,
+        );
+        assert_eq!(undone, "AutoHDREnable=1;");
     }
 }
 

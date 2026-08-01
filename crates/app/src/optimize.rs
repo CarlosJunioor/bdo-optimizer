@@ -229,6 +229,64 @@ fn round_apply_button(ui: &mut egui::Ui, enabled: bool) -> bool {
     enabled && response.clicked()
 }
 
+/// Turn a config-file sweep into one step outcome, refusing to call a partial
+/// sweep a success.
+///
+/// Three things make a sweep incomplete, and none of them is an `Err` on an
+/// individual file, so filtering for errors alone reported "everything applied"
+/// after doing less than everything:
+///
+/// * a per-file failure — the obvious case;
+/// * [`FileChange::Skipped`], meaning the game started mid-run and the latched
+///   guard abandoned the rest of the batch;
+/// * a path `discover` could not enumerate or open, which is a file that was
+///   never in the batch to begin with.
+///
+/// `NothingRecognized` is deliberately *not* a failure: a `gamevariable.xml`
+/// that holds none of the tweaked keys is the normal shape of a real install,
+/// and failing on it would flag healthy machines. It is mentioned in the detail
+/// instead so a sweep that recognized nothing anywhere is still visible.
+#[cfg(windows)]
+fn config_step_result(
+    outcomes: &[crate::gameconfig::FileOutcome],
+    unreadable: &[String],
+    detail: String,
+) -> Result<String, String> {
+    use crate::gameconfig::FileChange;
+
+    let mut problems: Vec<String> = outcomes
+        .iter()
+        .filter_map(|o| o.result.as_ref().err().cloned())
+        .collect();
+
+    let skipped = outcomes
+        .iter()
+        .filter(|o| matches!(o.result, Ok(FileChange::Skipped)))
+        .count();
+    if skipped > 0 {
+        problems.push(format!(
+            "stopped early — Black Desert started mid-run, so {skipped} file(s) were left \
+             untouched; close it and click again"
+        ));
+    }
+    problems.extend(unreadable.iter().cloned());
+
+    if !problems.is_empty() {
+        return Err(problems.join("; "));
+    }
+
+    let unrecognized = outcomes
+        .iter()
+        .filter(|o| matches!(o.result, Ok(FileChange::NothingRecognized)))
+        .count();
+    if unrecognized > 0 && unrecognized == outcomes.len() {
+        return Ok(format!(
+            "{detail} (no tweakable settings found in any config file)"
+        ));
+    }
+    Ok(detail)
+}
+
 #[cfg(windows)]
 fn verification_due(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
     last.map(|last| now.saturating_duration_since(last) >= std::time::Duration::from_secs(1))
@@ -877,19 +935,12 @@ impl App {
                         .iter()
                         .filter(|o| matches!(o.result, Ok(crate::gameconfig::FileChange::Restored)))
                         .count();
-                    let failures: Vec<String> = outcomes
-                        .iter()
-                        .filter_map(|o| o.result.as_ref().err().cloned())
-                        .collect();
-                    if failures.is_empty() {
-                        self.oneclick
-                            .steps
-                            .push((STEP.into(), Ok(format!("{restored} file(s) restored"))));
-                    } else {
-                        self.oneclick
-                            .steps
-                            .push((STEP.into(), Err(failures.join("; "))));
-                    }
+                    let result = config_step_result(
+                        &outcomes,
+                        &found.unreadable,
+                        format!("{restored} file(s) restored"),
+                    );
+                    self.oneclick.steps.push((STEP.into(), result));
                     self.gameconfig.outcomes = outcomes;
                     self.gameconfig.last_action = Some("restore");
                 }
@@ -956,16 +1007,6 @@ impl App {
             return;
         }
         let outcomes = crate::gameconfig::apply_files(&root, &found.files, &game_absent);
-        let failures: Vec<String> = outcomes
-            .iter()
-            .filter_map(|o| o.result.as_ref().err().cloned())
-            .collect();
-        if !failures.is_empty() {
-            self.oneclick
-                .steps
-                .push((STEP.into(), Err(failures.join("; "))));
-            return;
-        }
         let changed: usize = outcomes
             .iter()
             .filter_map(|o| match o.result {
@@ -978,7 +1019,8 @@ impl App {
         } else {
             format!("{changed} value(s) set across {} file(s)", outcomes.len())
         };
-        self.oneclick.steps.push((STEP.into(), Ok(detail)));
+        let result = config_step_result(&outcomes, &found.unreadable, detail);
+        self.oneclick.steps.push((STEP.into(), result));
         // Keep the detailed per-file view below in sync with what just ran.
         self.gameconfig.outcomes = outcomes;
         self.gameconfig.last_action = Some("apply");

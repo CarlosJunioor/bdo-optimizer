@@ -60,6 +60,20 @@ fn relaunch_path_as_admin(exe: &Path) -> RelaunchOutcome {
         Ok(exe) => exe,
         Err(error) => return RelaunchOutcome::Failed(error),
     };
+    // Pin the image for the whole elevation. Releases are unsigned and run from
+    // wherever the user unzipped them, so without this a same-user process could
+    // overwrite the executable while the UAC prompt is on screen — the prompt
+    // would still show our name, and the payload would receive the elevated
+    // token. `FILE_SHARE_READ` alone denies write, rename and delete while
+    // still letting the elevation service load the image (proved by
+    // `bdo_bench::capture::tests::a_locked_executable_still_runs_but_cannot_be_written`).
+    //
+    // Best-effort on purpose: if the handle cannot be taken we still elevate.
+    // Turning a hardening measure into a new way for "Restart as administrator"
+    // to fail would cost users more than it protects them, and this closes the
+    // race, not the underlying problem — code signing plus an install location
+    // under `Program Files` is the real fix. See [`validated_relaunch_target`].
+    let _pinned = pin_image(&exe);
     let verb_w = to_wide("runas");
     // Encode the path exactly rather than round-tripping through lossy UTF-8,
     // which would rewrite an unpaired surrogate to U+FFFD and hand ShellExecuteW
@@ -104,6 +118,19 @@ fn relaunch_path_as_admin(exe: &Path) -> RelaunchOutcome {
         );
     }
     RelaunchOutcome::Failed(format!("ShellExecuteW(runas) failed (code {code})"))
+}
+
+/// Open the image denying write, rename and delete for as long as the returned
+/// handle lives. `None` when it cannot be taken; see the call site for why that
+/// is not fatal.
+fn pin_image(exe: &Path) -> Option<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(exe)
+        .ok()
 }
 
 /// Resolve the exe path to relaunch, rejecting the obvious nonsense cases.

@@ -99,19 +99,45 @@ pub fn mask_to_cores(mask: u64) -> Vec<usize> {
 /// `&&` ensures `start` only runs if the `cd` succeeded. The empty `""` after
 /// `start` is the (ignored) window title, required so that `start` does not
 /// mistake a quoted program path for its title argument.
+///
+/// # Why the path is validated first
+///
+/// Double quotes protect `&`, `|` and the rest of cmd's metacharacters, but they
+/// do **not** stop environment-variable expansion: `cmd` substitutes `%NAME%`
+/// *before* it parses quotes. A path containing `%NAME%` therefore injects
+/// whatever that variable holds — and a same-user process can set the variable —
+/// straight into a command line that runs through `runas` and through the
+/// run-as-administrator shortcut. `%` is legal in a Windows filename, so this
+/// cannot be assumed away; such a path is rejected instead.
 pub fn build_cmd_arguments(
     mask_hex: &str,
     steam: bool,
     launcher_dir: &str,
     launcher_filename: &str,
-) -> String {
+) -> Result<String, LaunchError> {
+    reject_cmd_unsafe(launcher_dir)?;
+    reject_cmd_unsafe(launcher_filename)?;
     let mut args = format!(
         "/d /c cd /d \"{launcher_dir}\" && start \"\" /affinity {mask_hex} \"{launcher_filename}\""
     );
     if steam {
         args.push_str(" -steam");
     }
-    args
+    Ok(args)
+}
+
+/// Refuse a path component that `cmd.exe` would not treat as literal text
+/// inside double quotes.
+///
+/// Only two classes get through quoting: `%`, which triggers variable
+/// expansion, and control characters (a raw `\r` or `\n` ends the command and
+/// starts another). A double quote would also break out, but Windows forbids it
+/// in a filename — it is rejected here anyway rather than relied upon.
+pub fn reject_cmd_unsafe(path: &str) -> Result<(), LaunchError> {
+    if path.contains('%') || path.contains('"') || path.chars().any(|c| c.is_control()) {
+        return Err(LaunchError::UnsafeForCmd(path.to_string()));
+    }
+    Ok(())
 }
 
 /// Build the command line for a direct `CreateProcessW` launch: the quoted
@@ -273,7 +299,7 @@ mod tests {
     #[test]
     fn cmd_arguments_basic() {
         assert_eq!(
-            build_cmd_arguments("555", false, r"C:\Games\BDO", "BlackDesertLauncher.exe"),
+            build_cmd_arguments("555", false, r"C:\Games\BDO", "BlackDesertLauncher.exe").unwrap(),
             "/d /c cd /d \"C:\\Games\\BDO\" && start \"\" /affinity 555 \"BlackDesertLauncher.exe\""
         );
     }
@@ -281,7 +307,7 @@ mod tests {
     #[test]
     fn cmd_arguments_steam() {
         assert_eq!(
-            build_cmd_arguments("554", true, r"C:\Games\BDO", "BlackDesertLauncher.exe"),
+            build_cmd_arguments("554", true, r"C:\Games\BDO", "BlackDesertLauncher.exe").unwrap(),
             "/d /c cd /d \"C:\\Games\\BDO\" && start \"\" /affinity 554 \"BlackDesertLauncher.exe\" -steam"
         );
     }
@@ -295,7 +321,8 @@ mod tests {
             false,
             r"C:\BDO EUW\BlackDesert",
             "BlackDesertLauncher.exe",
-        );
+        )
+        .unwrap();
         assert!(
             args.starts_with("/d /c cd /d \"C:\\BDO EUW\\BlackDesert\" && "),
             "expected a self-contained cd /d prefix, got: {args}"
@@ -304,6 +331,39 @@ mod tests {
             args,
             "/d /c cd /d \"C:\\BDO EUW\\BlackDesert\" && start \"\" /affinity 555 \"BlackDesertLauncher.exe\""
         );
+    }
+
+    /// Quotes do not stop `cmd` expanding `%NAME%`, so a path carrying one
+    /// would splice an attacker-settable variable into a command line that runs
+    /// elevated. Ampersands and spaces *are* safe inside quotes and must keep
+    /// working — rejecting those would lock out ordinary install paths.
+    #[test]
+    fn cmd_arguments_reject_only_what_quoting_cannot_contain() {
+        let build = |dir: &str, file: &str| build_cmd_arguments("555", false, dir, file);
+
+        for dir in [
+            r"C:\Games\%APPDATA%\BDO",
+            "C:\\Games\\BDO\r\nstart calc",
+            "C:\\Games\\\"BDO",
+        ] {
+            assert!(
+                matches!(
+                    build(dir, "BlackDesertLauncher.exe"),
+                    Err(LaunchError::UnsafeForCmd(_))
+                ),
+                "must refuse to build a command for {dir:?}"
+            );
+        }
+        // The file name is interpolated too, so it gets the same check.
+        assert!(matches!(
+            build(r"C:\Games\BDO", "%X%.exe"),
+            Err(LaunchError::UnsafeForCmd(_))
+        ));
+
+        // Legal, common paths must still build: `&` and spaces are literal
+        // inside double quotes.
+        assert!(build(r"C:\Games & Mods\BDO", "BlackDesertLauncher.exe").is_ok());
+        assert!(build(r"D:\SteamLibrary\steamapps\common\Black Desert Online", "x.exe").is_ok());
     }
 
     #[test]
