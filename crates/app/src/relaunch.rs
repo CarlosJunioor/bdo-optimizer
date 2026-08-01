@@ -147,13 +147,23 @@ fn pin_image(exe: &Path) -> Option<std::fs::File> {
 
 /// Resolve the exe path to relaunch, rejecting the obvious nonsense cases.
 ///
-/// This is a sanity check, **not** an integrity guarantee: `ShellExecuteW`
-/// re-resolves the path independently, so this is inherently TOCTOU, and nothing
-/// here verifies a signature or that the containing directory is not
-/// user-writable. A portable unsigned build living in a writable folder can be
-/// overwritten by any process running as the same user, and the UAC prompt will
-/// still show the expected name. Code signing plus an install location under
-/// `Program Files` is the real fix.
+/// This is a sanity check, **not** an integrity guarantee. Nothing here
+/// verifies a signature or that the containing directory is not user-writable.
+///
+/// [`pin_image`] closes the narrow case — the executable itself being swapped
+/// while the UAC prompt is up — but it deliberately does not claim more than
+/// that. The elevated child still resolves its DLLs the ordinary way, starting
+/// with its own directory, so a same-user process that can write into the app
+/// folder can pre-place a DLL the child will load and get it running as
+/// administrator without touching the pinned image at all. Pinning every
+/// loadable file is not a real answer: the set is decided at runtime by the
+/// graphics backend, and the app's own layout requires the bundled tools to sit
+/// in that same folder.
+///
+/// The actual fix is code signing plus an install location under
+/// `Program Files`, where the folder is not user-writable in the first place.
+/// Until then this remains the honest boundary of what a portable unsigned
+/// build can defend, and it is documented rather than papered over.
 fn validated_relaunch_target(exe: &Path) -> Result<PathBuf, String> {
     let exe = exe
         .canonicalize()

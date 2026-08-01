@@ -990,9 +990,19 @@ impl App {
             }
 
             // Reset only what an apply actually wrote — see
-            // [`crate::video::restore_settings`].
+            // [`crate::video::restore_settings`]. With no record there is
+            // nothing this app can claim to have changed, so the profile is
+            // left alone rather than reset on a guess.
             let applied = crate::video::recorded_applied();
-            self.one_click_driver_profile(crate::video::restore_settings(&applied), "restore");
+            let settings = crate::video::restore_settings(&applied);
+            if settings.is_empty() {
+                self.oneclick.steps.push((
+                    "NVIDIA driver profile".into(),
+                    Ok("left alone — this app has no record of changing it".into()),
+                ));
+            } else {
+                self.one_click_driver_profile(settings, "restore");
+            }
         }
     }
 
@@ -1583,18 +1593,29 @@ impl App {
                                 }
                             }
                         }
+                        // Nothing recorded means this app has no evidence it
+                        // ever wrote the profile, and "restore" would then be a
+                        // guess at someone else's settings — so there is
+                        // nothing to offer.
+                        let applied = crate::video::recorded_applied();
+                        let restorable = !crate::video::restore_settings(&applied).is_empty();
                         if ui
-                            .add_enabled(!busy, egui::Button::new("Restore driver defaults"))
-                            .on_hover_text(
-                                "Resets only the settings this app applied, so a Low Latency \
-                                 setup you configured yourself is left alone.",
+                            .add_enabled(
+                                !busy && restorable,
+                                egui::Button::new("Restore driver defaults"),
                             )
+                            .on_hover_text(if restorable {
+                                "Resets only the settings this app applied, so a Low Latency \
+                                 setup you configured yourself is left alone."
+                            } else {
+                                "Nothing to restore — this app has no record of changing the \
+                                 driver profile on this machine."
+                            })
                             .clicked()
                         {
                             // The record is cleared by `poll_driver_worker`, and
                             // only once the restore verifies — a failed one
                             // must stay retryable.
-                            let applied = crate::video::recorded_applied();
                             self.video.last = None;
                             self.video.worker = Some(crate::video::worker::start(
                                 exe,

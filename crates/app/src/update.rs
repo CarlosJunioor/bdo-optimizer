@@ -302,7 +302,7 @@ fn apply(
     // pre-positioned the path — unlike `create_dir_all`, which happily accepts a
     // directory an attacker created first. That matters because everything
     // staged here is later copied next to the (elevated) executable and run.
-    let tmp = create_private_dir()?;
+    let tmp = crate::privdir::create("bdo-optimizer-update")?;
 
     progress("Downloading…");
     let zip = tmp.join("update.zip");
@@ -373,7 +373,13 @@ fn apply(
     progress("Installing…");
     let mut staged = staged_files(&inner)?;
     install_all(&mut staged, &app_dir)?;
-    // Release the pins before the staging directory is removed.
+    // The install folder is the portable app folder, which is user-writable in
+    // the layout this app ships in — so the pinned *source* handles say nothing
+    // about what is sitting at the destination now. Read the executable back
+    // through a pin that denies further writes and check it byte-for-byte
+    // against the verified staged copy before anything runs it.
+    verify_installed(&mut staged, &exe)?;
+    // Release the source pins before the staging directory is removed.
     drop(staged);
     let _ = std::fs::remove_dir_all(&tmp);
 
@@ -398,6 +404,60 @@ fn apply(
     drop(pinned_exe);
     let _ = tx.send(UpdateMsg::Restarting);
     ctx.request_repaint();
+    Ok(())
+}
+
+/// Confirm the installed executable is byte-for-byte the staged one that was
+/// verified against the release checksum.
+///
+/// Copying from a pinned source proves what was *written*; it proves nothing
+/// about what is at the destination a moment later, because the destination
+/// folder is writable by any process running as this user. Without this check
+/// a same-user process could overwrite the new executable in the gap before it
+/// is launched and have its bytes run with this app's administrator token.
+fn verify_installed(staged: &mut [StagedFile], exe: &Path) -> Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let name = exe
+        .file_name()
+        .ok_or("the executable path has no file name")?;
+    let source = staged
+        .iter_mut()
+        .find(|f| f.name == name)
+        .ok_or("the release did not contain the application executable")?;
+
+    source
+        .handle
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| format!("could not re-read the verified executable: {e}"))?;
+    let mut expected = Vec::new();
+    source
+        .handle
+        .read_to_end(&mut expected)
+        .map_err(|e| format!("could not re-read the verified executable: {e}"))?;
+
+    let mut installed = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(exe)
+            .map_err(|e| format!("could not lock the installed executable to check it: {e}"))?
+    };
+    let mut actual = Vec::with_capacity(expected.len());
+    installed
+        .read_to_end(&mut actual)
+        .map_err(|e| format!("could not read the installed executable: {e}"))?;
+
+    if actual != expected {
+        return Err(
+            "the installed executable does not match the verified download — something changed \
+             it during installation, so it was not started. Download the release manually from \
+             GitHub."
+                .to_string(),
+        );
+    }
     Ok(())
 }
 
@@ -455,152 +515,6 @@ fn verify_checksum(zip: &mut impl std::io::Read, published: &str) -> Result<(), 
         ));
     }
     Ok(())
-}
-
-/// Create a fresh, exclusively-owned staging directory under the temp dir.
-///
-/// `create_dir` is atomic and fails when the path exists, so the first name that
-/// succeeds is one nobody else holds. Same contract as the NVIDIA job directory
-/// in `video::worker`.
-fn create_private_dir() -> Result<PathBuf, String> {
-    let base = std::env::temp_dir();
-    let pid = std::process::id();
-    for attempt in 0..64u32 {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(attempt);
-        let dir = base.join(format!("bdo-optimizer-update-{pid}-{nanos}-{attempt}"));
-        match std::fs::create_dir(&dir) {
-            Ok(()) => {
-                protect_staging_dir(&dir)?;
-                return Ok(dir);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(format!("could not create {}: {e}", dir.display())),
-        }
-    }
-    Err("could not create a private staging directory".to_string())
-}
-
-/// Raise the staging directory to a high mandatory integrity level so lower
-/// integrity processes cannot write into it.
-///
-/// Winning `create_dir` only proves nobody got there *first*. The temp directory
-/// belongs to the user, so a medium-integrity process running as that same user
-/// can still replace the zip, the checksum, or an extracted file afterwards —
-/// and every one of those is later copied next to the elevated executable and
-/// run. A DACL cannot express this (same user, same SID); a mandatory label can,
-/// because integrity is checked before the DACL and medium cannot write up to
-/// high.
-///
-/// Only possible when this process is elevated — raising a label above your own
-/// integrity level needs `SeRelabelPrivilege`, so an unelevated attempt fails
-/// with `ERROR_PRIVILEGE_NOT_HELD`. That is also the only case that matters: an
-/// unelevated update installs with the same privileges an attacker at that
-/// integrity level already has, so there is nothing to escalate to.
-///
-/// Mandatory when elevated. The pinned handles cover everything *after* a file
-/// is opened, but `curl` and `tar` write into this directory by pathname, and
-/// the extracted files exist unpinned between `tar` closing them and
-/// [`staged_files`] opening them. The label is what covers those gaps, so an
-/// elevated update that cannot get it does not proceed — the alternative is
-/// installing and running attacker-substitutable bytes as administrator.
-///
-/// Unelevated it is skipped, not failed: raising a label above your own
-/// integrity level needs `SeRelabelPrivilege` (an unelevated attempt returns
-/// `ERROR_PRIVILEGE_NOT_HELD`), and an unelevated update installs with exactly
-/// the privileges an attacker at that level already has, so there is nothing to
-/// escalate to.
-fn protect_staging_dir(dir: &Path) -> Result<(), String> {
-    if !bdo_launch::is_elevated() {
-        return Ok(());
-    }
-    set_high_integrity(dir).map_err(|e| {
-        let _ = std::fs::remove_dir_all(dir);
-        format!(
-            "the update could not be staged in a folder protected from other programs on this \
-             machine ({e}), so it was not downloaded. Download the release manually from GitHub \
-             instead."
-        )
-    })
-}
-
-/// Apply a `High` mandatory label with no-write-up to `dir`.
-fn set_high_integrity(dir: &Path) -> Result<(), String> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{ERROR_SUCCESS, LocalFree, HLOCAL};
-    use windows::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
-        SE_FILE_OBJECT, SDDL_REVISION_1,
-    };
-    use windows::Win32::Security::{
-        GetSecurityDescriptorSacl, ACL, LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-    };
-
-    // SDDL for a system-access-control-list holding one mandatory label:
-    // no-write-up (NW) at the High integrity level (HI).
-    let sddl: Vec<u16> = "S:(ML;;NW;;;HI)"
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let mut descriptor = PSECURITY_DESCRIPTOR::default();
-
-    // SAFETY: `sddl` is a NUL-terminated wide string alive across the call, and
-    // `descriptor` is a valid out-parameter that the callee allocates.
-    unsafe {
-        ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            PCWSTR(sddl.as_ptr()),
-            SDDL_REVISION_1,
-            &mut descriptor,
-            None,
-        )
-        .map_err(|e| format!("could not build the integrity label: {e}"))?;
-    }
-
-    let mut sacl: *mut ACL = std::ptr::null_mut();
-    let mut present = false.into();
-    let mut defaulted = false.into();
-    // SAFETY: `descriptor` came from the call above and is still owned here.
-    let read = unsafe {
-        GetSecurityDescriptorSacl(descriptor, &mut present, &mut sacl, &mut defaulted)
-    };
-    let result = match read {
-        Ok(()) => {
-            let path: Vec<u16> = dir
-                .as_os_str()
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect();
-            // SAFETY: NUL-terminated path and a SACL borrowed from the
-            // descriptor, both alive for the duration of the call.
-            let status = unsafe {
-                SetNamedSecurityInfoW(
-                    PCWSTR(path.as_ptr()),
-                    SE_FILE_OBJECT,
-                    LABEL_SECURITY_INFORMATION,
-                    None,
-                    None,
-                    None,
-                    Some(sacl),
-                )
-            };
-            if status == ERROR_SUCCESS {
-                Ok(())
-            } else {
-                Err(format!("could not label the folder: {status:?}"))
-            }
-        }
-        Err(e) => Err(format!("could not read the built label: {e}")),
-    };
-
-    // SAFETY: the descriptor was allocated by the conversion above and is not
-    // used after this point.
-    unsafe {
-        let _ = LocalFree(Some(HLOCAL(descriptor.0)));
-    }
-    result
 }
 
 /// One staged file, held open so nothing can change it before it is installed.
@@ -872,26 +786,35 @@ fn recover_with_ledger(dir: &Path) {
         return;
     };
     let ledger = dir.join(INSTALL_LEDGER);
-    let names = match std::fs::read_to_string(&ledger) {
+    let (names, recovered) = match std::fs::read_to_string(&ledger) {
         // A ledger left on disk means the install never finished: put every
         // recorded file back before anything else runs.
         Ok(text) => {
             let names: Vec<String> = text.lines().map(str::to_string).collect();
+            let mut all_restored = true;
             for name in &names {
-                let dest = dir.join(name);
-                let old = dir.join(format!("{name}.old"));
-                if old.is_file() {
-                    let _ = std::fs::remove_file(&dest);
-                    let _ = std::fs::rename(&old, &dest);
+                if !restore_one(dir, name) {
+                    all_restored = false;
                 }
             }
-            let _ = std::fs::remove_file(&ledger);
-            names
+            // Keep the ledger when anything failed. Removing it would throw
+            // away the only description of a half-finished install, and the
+            // sweep below would then treat the surviving `.old` file as a
+            // completed install's leftover and delete it — losing the previous
+            // version outright. Next start retries instead.
+            if all_restored {
+                let _ = std::fs::remove_file(&ledger);
+            }
+            (names, all_restored)
         }
         // No ledger: the last install completed, so the backups it left are
         // safe to drop.
-        Err(_) => Vec::new(),
+        Err(_) => (Vec::new(), true),
     };
+
+    if !recovered {
+        return;
+    }
 
     // Only ever delete backups this updater is known to own. Sweeping every
     // `*.old` in the folder destroys unrelated files — users extract the app
@@ -908,6 +831,36 @@ fn recover_with_ledger(dir: &Path) {
             let _ = std::fs::remove_file(&old);
         }
     }
+}
+
+/// Put one recorded file back from its `.old` backup. Reports whether the file
+/// is now in a good state.
+///
+/// The destination may already exist — the crash could have happened after the
+/// replacement landed — and it may be *running*, in which case Windows refuses
+/// to delete it. Moving it aside instead of deleting is what makes recovery
+/// work in that case; failing to place the backup leaves both copies on disk
+/// rather than losing one.
+fn restore_one(dir: &Path, name: &str) -> bool {
+    let dest = dir.join(name);
+    let old = dir.join(format!("{name}.old"));
+    if !old.is_file() {
+        // Nothing was displaced for this entry (or it is already back), so the
+        // only bad state is the file being missing entirely.
+        return dest.is_file();
+    }
+    if dest.exists() {
+        let aside = dir.join(format!("{name}.interrupted"));
+        let _ = std::fs::remove_file(&aside);
+        if std::fs::rename(&dest, &aside).is_err() {
+            return false;
+        }
+    }
+    if std::fs::rename(&old, &dest).is_err() {
+        return false;
+    }
+    let _ = std::fs::remove_file(dir.join(format!("{name}.interrupted")));
+    true
 }
 
 /// The file names this app ships and therefore replaces on update. Used to
@@ -1052,6 +1005,44 @@ mod tests {
 
         drop(staged);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A recovery that cannot put a file back must keep both the ledger and the
+    /// backup. Dropping either would leave a half-updated install with the only
+    /// copy of the previous version deleted.
+    #[test]
+    fn a_failed_recovery_keeps_the_ledger_and_the_backup() {
+        let _serialised = installing();
+        let dir = std::env::temp_dir().join(format!("bdo-update-recfail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("bdo-optimizer.exe"), b"half-installed").unwrap();
+        std::fs::write(dir.join("bdo-optimizer.exe.old"), b"the real old exe").unwrap();
+        std::fs::write(dir.join(INSTALL_LEDGER), "bdo-optimizer.exe").unwrap();
+
+        // Hold the destination open exclusively so it cannot be moved aside —
+        // the same thing a still-running executable or an antivirus does.
+        let blocker = {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(dir.join("bdo-optimizer.exe"))
+                .unwrap()
+        };
+        recover_with_ledger(&dir);
+        drop(blocker);
+
+        assert!(
+            dir.join(INSTALL_LEDGER).exists(),
+            "a failed recovery must keep the ledger so the next start retries"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("bdo-optimizer.exe.old")).unwrap(),
+            b"the real old exe",
+            "the only copy of the previous version must survive"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A crash mid-install leaves the ledger behind; the next start must put

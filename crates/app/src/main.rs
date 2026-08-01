@@ -21,6 +21,7 @@ mod hardware;
 mod optimize;
 mod overlay;
 mod presentmon;
+mod privdir;
 #[cfg(windows)]
 mod relaunch;
 mod theme;

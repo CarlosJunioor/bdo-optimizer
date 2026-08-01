@@ -98,20 +98,19 @@ pub fn default_settings() -> Vec<(u32, u32)> {
 /// Restoring every setting in [`default_settings`] undoes work this app never
 /// did: with Ultra Low Latency left unticked — the default — apply never touches
 /// the three ULL entries, so a blanket restore wipes a Low Latency setup the
-/// user configured themselves in the NVIDIA control panel. `applied` is the id
-/// list recorded when the profile was written; an empty list means no record
-/// survived, in which case only the three settings apply *always* writes are
-/// reset.
+/// user configured themselves in the NVIDIA control panel.
+///
+/// `applied` is the id list recorded when the profile was written. An empty
+/// list is **not** "assume the usual three": it means this app has no evidence
+/// it ever changed the profile — a fresh install, or a deleted record — and the
+/// only honest scope for a restore then is nothing at all. Guessing there would
+/// let Restore overwrite a Black Desert profile the user built themselves,
+/// which is exactly what the button promises not to do. Callers surface the
+/// empty result rather than running an import that would change nothing.
 pub fn restore_settings(applied: &[u32]) -> Vec<(u32, u32)> {
-    let defaults = default_settings();
-    let touched: Vec<u32> = if applied.is_empty() {
-        guide_settings(8, false).iter().map(|(id, _)| *id).collect()
-    } else {
-        applied.to_vec()
-    };
-    defaults
+    default_settings()
         .into_iter()
-        .filter(|(id, _)| touched.contains(id))
+        .filter(|(id, _)| applied.contains(id))
         .collect()
 }
 
@@ -406,17 +405,20 @@ pub mod worker {
         // Exports land here too, which is why this file no longer needs to
         // stash and restore the user's own `CustomProfiles_*.nip` files: the
         // directory starts empty and belongs to this run alone.
-        let run_dir = create_private_dir()?;
-        let exe = match stage_inspector(&mut locked, &run_dir) {
-            Ok(path) => path,
+        let run_dir = crate::privdir::create("bdo-optimizer-nvidia-run")?;
+        // `staged_pin` is held for the whole run, not just the verification:
+        // dropping it would leave the copy replaceable in the moment before
+        // each spawn, which is the same check-then-use gap the pin exists to
+        // close. The integrity label on `run_dir` blocks a lower-integrity
+        // writer, the pin blocks an equal-integrity one.
+        let (exe, _staged_pin) = match stage_inspector(&mut locked, &run_dir) {
+            Ok(staged) => staged,
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&run_dir);
                 return Err(e);
             }
         };
-        let exe = exe.as_path();
-        let exe_dir = run_dir.clone();
-        let outcome = run_in(exe, &exe_dir, settings);
+        let outcome = run_in(&exe, &run_dir, settings);
         let _ = std::fs::remove_dir_all(&run_dir);
         outcome
     }
@@ -429,7 +431,10 @@ pub mod worker {
     /// than copied out of the app folder: it is five fixed lines that only pin
     /// the runtime version, and reading it from a user-writable location would
     /// reintroduce exactly the tampering this staging removes.
-    fn stage_inspector(locked: &mut std::fs::File, dir: &Path) -> Result<PathBuf, String> {
+    fn stage_inspector(
+        locked: &mut std::fs::File,
+        dir: &Path,
+    ) -> Result<(PathBuf, std::fs::File), String> {
         use std::io::{Read, Seek, SeekFrom, Write};
         use std::os::windows::fs::OpenOptionsExt;
 
@@ -464,7 +469,7 @@ pub mod worker {
         if !super::handle_is_trusted(&mut staged) {
             return Err("the staged Profile Inspector copy did not verify".to_string());
         }
-        Ok(dest)
+        Ok((dest, staged))
     }
 
     /// The import-and-verify sequence, with `exe` already staged in `exe_dir`.
@@ -474,7 +479,7 @@ pub mod worker {
         //    proves exclusive ownership: no other process can have pre-created
         //    the path and no shared, predictable file is handed to the elevated
         //    child for it to re-open.
-        let job_dir = create_private_dir()?;
+        let job_dir = crate::privdir::create("bdo-optimizer-nvidia-job")?;
         let nip = job_dir.join("profile.nip");
         let import = write_payload(&nip, settings).and_then(|payload| {
             // Hold the payload open with FILE_SHARE_READ for the whole import.
@@ -589,28 +594,6 @@ pub mod worker {
         Ok(reader)
     }
 
-    /// Create a fresh, exclusively-owned directory under the temp dir.
-    ///
-    /// `create_dir` is atomic and fails when the path exists, so the first name
-    /// that succeeds is one nobody else holds.
-    fn create_private_dir() -> Result<PathBuf, String> {
-        let base = std::env::temp_dir();
-        let pid = std::process::id();
-        for attempt in 0..64u32 {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(attempt);
-            let dir = base.join(format!("bdo-optimizer-nvidia-{pid}-{nanos}-{attempt}"));
-            match std::fs::create_dir(&dir) {
-                Ok(()) => return Ok(dir),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(format!("could not create {}: {e}", dir.display())),
-            }
-        }
-        Err("could not create a private temp directory".to_string())
-    }
-
     /// Every `CustomProfiles_*.nip` currently next to the inspector executable.
     fn export_files(dir: &Path) -> Vec<PathBuf> {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -685,7 +668,7 @@ pub mod worker {
             use std::os::windows::fs::OpenOptionsExt;
             const FILE_SHARE_READ: u32 = 0x0000_0001;
 
-            let dir = create_private_dir().expect("private dir");
+            let dir = crate::privdir::create("bdo-nvidia-test").expect("private dir");
             let nip = dir.join("profile.nip");
             let settings = super::super::guide_settings(8, true);
             let held = write_payload(&nip, &settings).expect("payload");
@@ -712,14 +695,6 @@ pub mod worker {
             let _ = std::fs::remove_dir_all(dir);
         }
 
-        #[test]
-        fn private_dirs_are_unique_per_call() {
-            let a = create_private_dir().expect("a");
-            let b = create_private_dir().expect("b");
-            assert_ne!(a, b);
-            let _ = std::fs::remove_dir_all(a);
-            let _ = std::fs::remove_dir_all(b);
-        }
     }
 }
 
@@ -765,10 +740,14 @@ mod tests {
         // With ULL on, all six were written, so all six come back.
         let with_ull: Vec<u32> = guide_settings(8, true).iter().map(|(id, _)| *id).collect();
         assert_eq!(restore_settings(&with_ull).len(), 6);
+    }
 
-        // No record survived: fall back to the settings apply always writes,
-        // never to the full set.
-        assert_eq!(restore_settings(&[]).len(), 3);
+    /// No record means no evidence this app ever wrote the profile. Assuming
+    /// the usual three would let Restore reset a Black Desert profile the user
+    /// configured entirely themselves.
+    #[test]
+    fn restore_without_a_record_touches_nothing() {
+        assert!(restore_settings(&[]).is_empty());
     }
 
     #[test]
