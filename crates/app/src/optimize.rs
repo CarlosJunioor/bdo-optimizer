@@ -339,6 +339,39 @@ impl App {
             return;
         }
 
+        // Elevating with a *different* administrator's credentials moves every
+        // per-user target — HKCU, Documents, AppData — to that account. The
+        // steps would all succeed and none of them would reach the profile the
+        // player actually uses, so say so rather than let it look like it
+        // worked.
+        #[cfg(windows)]
+        if let Some(origin) = crate::relaunch::elevated_into_another_account() {
+            ui.add_space(8.0);
+            crate::theme::section_card(ui, icons::WARNING, "Wrong Windows account", |ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "This window is running as {}, but you started it from {origin}. The \
+                         config-file edits, the Windows setting and the desktop shortcut all \
+                         apply to the account they run as — so they would land on the wrong \
+                         profile and Black Desert would not see them.",
+                        crate::relaunch::current_account()
+                    ))
+                    .color(WARN)
+                    .size(13.0),
+                );
+                ui.label(
+                    RichText::new(
+                        "Sign in as an administrator and run it there, or run it normally: \
+                         everything except the NVIDIA driver profile works without \
+                         administrator rights.",
+                    )
+                    .size(12.0)
+                    .weak(),
+                );
+            });
+            return;
+        }
+
         // Keep verification ticking regardless of which screen is up, so the
         // sidebar check and the "verified" footer stay live.
         self.poll_verification(ui.ctx());

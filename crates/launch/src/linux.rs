@@ -79,6 +79,14 @@ pub fn create_shortcut(_opts: ShortcutOptions) -> Result<PathBuf, LaunchError> {
     Err(LaunchError::UnsupportedPlatform)
 }
 
+/// Companion to [`read_process_affinity`], for API parity with Windows. BDO
+/// does not run here, so there is never a process to report.
+pub fn read_process_affinity_with_pid(
+    _process_name: &str,
+) -> Result<Option<(u32, u64)>, LaunchError> {
+    Ok(None)
+}
+
 /// BDO does not run on Linux, so there is no game process to verify.
 pub fn read_process_affinity(_process_name: &str) -> Result<Option<u64>, LaunchError> {
     Ok(None)

@@ -24,6 +24,30 @@ const SE_ERR_ACCESSDENIED: isize = 5;
 /// success and a small error code otherwise (a legacy Win16 convention).
 const SHELL_EXECUTE_SUCCESS_THRESHOLD: isize = 32;
 
+/// Environment variable carrying the account that asked for elevation.
+///
+/// `runas` lets a standard user supply *another* administrator's credentials,
+/// and the new process then runs as that administrator — with their `HKCU`,
+/// their Documents, their AppData. Everything this app calls "per-user" would
+/// silently target the wrong profile: the config edits, the undo records, the
+/// saved benchmark sessions. The elevated instance compares this against its
+/// own account so it can say so rather than quietly optimising a profile
+/// nobody is playing on.
+pub const ELEVATION_ORIGIN: &str = "BDO_OPTIMIZER_ELEVATION_ORIGIN";
+
+/// The account this process runs as, `DOMAIN\user` style, lowercased.
+pub fn current_account() -> String {
+    let user = std::env::var("USERNAME").unwrap_or_default();
+    let domain = std::env::var("USERDOMAIN").unwrap_or_default();
+    format!("{domain}\\{user}").to_ascii_lowercase()
+}
+
+/// The requesting account when elevation landed in a *different* one.
+pub fn elevated_into_another_account() -> Option<String> {
+    let origin = std::env::var(ELEVATION_ORIGIN).ok()?;
+    (origin.to_ascii_lowercase() != current_account()).then_some(origin)
+}
+
 /// Result of attempting to relaunch elevated.
 pub enum RelaunchOutcome {
     /// An elevated instance was started — the caller should close this one.
@@ -86,6 +110,10 @@ fn relaunch_path_as_admin(exe: &Path) -> RelaunchOutcome {
             )
         }
     };
+    // Record who asked. `ShellExecuteW` hands the child our environment, so the
+    // elevated instance can compare and warn if it landed elsewhere.
+    // SAFETY: single-threaded startup path; no other thread reads the env here.
+    unsafe { std::env::set_var(ELEVATION_ORIGIN, current_account()) };
     let verb_w = to_wide("runas");
     // Encode the path exactly rather than round-tripping through lossy UTF-8,
     // which would rewrite an unpaired surrogate to U+FFFD and hand ShellExecuteW

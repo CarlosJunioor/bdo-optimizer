@@ -128,16 +128,12 @@ pub struct DriverLock(windows::Win32::Foundation::HANDLE);
 impl DriverLock {
     /// Take the lock, waiting briefly for another instance to finish.
     pub fn acquire() -> Result<Self, String> {
-        use windows::core::PCWSTR;
         use windows::Win32::Foundation::WAIT_TIMEOUT;
-        use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+        use windows::Win32::System::Threading::WaitForSingleObject;
 
-        let name: Vec<u16> = r"Local\bdo-optimizer-driver-profile"
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        // SAFETY: `name` is a NUL-terminated wide string alive across the call.
-        let handle = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) }
+        // The driver profile is machine state, so the lock crosses logon
+        // sessions too — see `privdir::cross_session_mutex`.
+        let handle = crate::privdir::cross_session_mutex("bdo-optimizer-driver-profile")
             .map_err(|e| format!("could not create the driver lock: {e}"))?;
         // SAFETY: a live mutex handle from the call above.
         if unsafe { WaitForSingleObject(handle, 30_000) } == WAIT_TIMEOUT {
@@ -146,7 +142,8 @@ impl DriverLock {
                 let _ = windows::Win32::Foundation::CloseHandle(handle);
             }
             return Err(
-                "another copy of BDO Optimizer is changing the driver profile — wait for it                  to finish"
+                "another copy of BDO Optimizer is changing the driver profile — wait for it \
+                 to finish"
                     .to_string(),
             );
         }

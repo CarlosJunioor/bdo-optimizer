@@ -205,6 +205,35 @@ fn hidden(program: &str) -> Command {
     // travels the same redirected channel.
     if program.eq_ignore_ascii_case("curl.exe") {
         cmd.arg("-q");
+        // `-q` only stops curl reading `.curlrc`. It still honours proxy and
+        // certificate settings from the environment, and looks for
+        // `curl-ca-bundle.crt` in the *current directory* — which for an
+        // elevated relaunch is the app's own, user-writable folder. Clearing
+        // these and running from System32 removes both, so a same-user process
+        // cannot redirect the download or add a trusted CA and feed an elevated
+        // updater its own release. Release signing is the complete answer and
+        // needs a key this project does not yet have.
+        for var in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "CURL_CA_BUNDLE",
+            "CURL_CA_PATH",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+            "CURL_HOME",
+            "HOME",
+        ] {
+            cmd.env_remove(var);
+        }
+        cmd.arg("--noproxy").arg("*");
+        if let Some(dir) = system32("").parent() {
+            cmd.current_dir(dir);
+        }
     }
     cmd
 }
@@ -410,7 +439,14 @@ fn apply(
             // now would strand the rejected executable at the canonical path
             // with the good one only as `.old` — and the next start would clean
             // that backup away. Put the previous version back instead.
-            let _ = roll_back_completed_install(&app_dir);
+            // If the rollback itself cannot start, say so: the ledger then
+            // still reads `done` and the next launch would delete the previous
+            // version rather than restore it.
+            if let Err(rollback) = roll_back_completed_install(&app_dir) {
+                return Err(format!(
+                    "{e} The previous version could not be put back either ({rollback}) —                      reinstall from GitHub before starting the app again."
+                ));
+            }
             return Err(e);
         }
     };
@@ -627,9 +663,18 @@ fn install_all(staged: &mut [StagedFile], app_dir: &Path) -> Result<(), String> 
     // Write the ledger *before* touching anything, so a crash at any point from
     // here on is recoverable by the next start. See [`cleanup_old_files`].
     let ledger = app_dir.join(INSTALL_LEDGER);
+    // Mark entries the install *creates*: recovery removes those instead of
+    // hunting for a `.old` that was never made.
     let names: Vec<String> = staged
         .iter()
-        .map(|f| f.name.to_string_lossy().into_owned())
+        .map(|f| {
+            let name = f.name.to_string_lossy();
+            if app_dir.join(f.name.as_os_str()).exists() {
+                name.into_owned()
+            } else {
+                format!("{LEDGER_NEW}{name}")
+            }
+        })
         .collect();
     write_ledger(&ledger, LEDGER_PENDING, &names)
         .map_err(|e| format!("could not record the update for recovery: {e}"))?;
@@ -765,6 +810,13 @@ fn is_name_surrogate(handle: &std::fs::File) -> std::io::Result<bool> {
 const LEDGER_PENDING: &str = "pending";
 const LEDGER_DONE: &str = "done";
 
+/// Marks a ledger entry for a file that did not exist before the install.
+///
+/// Recovery deletes those instead of looking for a `.old` that was never made:
+/// leaving a brand-new file beside a rolled-back executable is a mixed-version
+/// install, which is exactly what the rollback exists to prevent.
+const LEDGER_NEW: char = '+';
+
 fn write_ledger(path: &Path, state: &str, names: &[String]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::windows::fs::OpenOptionsExt;
@@ -813,9 +865,11 @@ fn read_ledger(path: &Path) -> std::io::Result<String> {
 /// deleting it, and demanding it be present afterwards would keep a ledger
 /// describing an install that is already fully undone.
 fn rolled_back_cleanly(dir: &Path, names: &[String]) -> bool {
-    names
-        .iter()
-        .all(|name| !dir.join(format!("{name}.old")).exists())
+    names.iter().all(|entry| match entry.strip_prefix(LEDGER_NEW) {
+        // Created files are undone by deleting them.
+        Some(name) => !dir.join(name).exists(),
+        None => !dir.join(format!("{entry}.old")).exists(),
+    })
 }
 
 fn install_recorded(staged: &mut [StagedFile], app_dir: &Path) -> Result<(), String> {
@@ -934,16 +988,13 @@ struct UpdateLock(windows::Win32::Foundation::HANDLE);
 impl UpdateLock {
     /// Take the lock, or report that another instance is mid-update.
     fn acquire() -> Result<Self, String> {
-        use windows::core::PCWSTR;
         use windows::Win32::Foundation::WAIT_TIMEOUT;
-        use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+        use windows::Win32::System::Threading::WaitForSingleObject;
 
-        let name: Vec<u16> = "Local\\bdo-optimizer-update"
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        // SAFETY: `name` is a NUL-terminated wide string alive across the call.
-        let handle = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) }
+        // Cross-session where privileges allow: the ledger and the `.old` files
+        // belong to the folder, not to a logon session, so two users switched
+        // into the same portable install must not each hold "the" lock.
+        let handle = crate::privdir::cross_session_mutex("bdo-optimizer-update")
             .map_err(|e| format!("could not create the update lock: {e}"))?;
         // SAFETY: `handle` is a live mutex handle from the call above.
         let waited = unsafe { WaitForSingleObject(handle, 0) };
@@ -1054,7 +1105,8 @@ fn recover_with_ledger(dir: &Path) {
         .into_iter()
         .chain(packaged_names().map(str::to_string))
         .collect();
-    for name in &owned {
+    for entry in &owned {
+        let name = entry.strip_prefix(LEDGER_NEW).unwrap_or(entry);
         let old = dir.join(format!("{name}.old"));
         // Never drop a backup while the file it backs up is missing: that is
         // the only copy left.
@@ -1072,7 +1124,17 @@ fn recover_with_ledger(dir: &Path) {
 /// to delete it. Moving it aside instead of deleting is what makes recovery
 /// work in that case; failing to place the backup leaves both copies on disk
 /// rather than losing one.
-fn restore_one(dir: &Path, name: &str) -> bool {
+fn restore_one(dir: &Path, entry: &str) -> bool {
+    // A `+` prefix means the install created this file where none existed, so
+    // undoing it means removing it.
+    if let Some(name) = entry.strip_prefix(LEDGER_NEW) {
+        let dest = dir.join(name);
+        return match std::fs::remove_file(&dest) {
+            Ok(()) => true,
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        };
+    }
+    let name = entry;
     let dest = dir.join(name);
     let old = dir.join(format!("{name}.old"));
     if !old.is_file() {

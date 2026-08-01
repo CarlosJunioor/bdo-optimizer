@@ -51,6 +51,67 @@ pub fn create(prefix: &str) -> Result<PathBuf, String> {
     Err(format!("could not create a private {prefix} directory"))
 }
 
+/// A named mutex that spans Windows sessions where possible.
+///
+/// The state these locks protect — a portable install folder, the driver
+/// profile — is machine-wide, but a `Local\` mutex is per logon session, so
+/// under Fast User Switching or RDP two copies would each hold "the" lock and
+/// race anyway. `Global\` fixes that, at the cost of needing
+/// `SeCreateGlobalPrivilege`, which standard users do not hold. Falling back
+/// keeps an unelevated app working, while the elevated case — the one that can
+/// corrupt a shared install — always gets the cross-session object.
+pub fn cross_session_mutex(name: &str) -> Result<windows::Win32::Foundation::HANDLE, String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Threading::CreateMutexW;
+
+    for scope in [r"Global\", r"Local\"] {
+        let wide: Vec<u16> = format!("{scope}{name}")
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: `wide` is a NUL-terminated string alive across the call.
+        if let Ok(handle) = unsafe { CreateMutexW(None, false, PCWSTR(wide.as_ptr())) } {
+            return Ok(handle);
+        }
+    }
+    Err("could not create the lock".to_string())
+}
+
+/// A held named mutex, released on drop.
+pub struct MutexGuard(windows::Win32::Foundation::HANDLE);
+
+impl Drop for MutexGuard {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::ReleaseMutex;
+        // SAFETY: owned by this guard and released exactly once.
+        unsafe {
+            let _ = ReleaseMutex(self.0);
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+/// Take `name` cross-session, waiting up to 30 seconds for another instance.
+pub fn lock(name: &str) -> Result<MutexGuard, String> {
+    use windows::Win32::Foundation::WAIT_TIMEOUT;
+    use windows::Win32::System::Threading::WaitForSingleObject;
+
+    let handle = cross_session_mutex(name)?;
+    // SAFETY: a live mutex handle from the call above.
+    if unsafe { WaitForSingleObject(handle, 30_000) } == WAIT_TIMEOUT {
+        // SAFETY: closing a handle we own and do not use again.
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(handle);
+        }
+        return Err(
+            "another copy of BDO Optimizer is changing the same setting — wait for it to finish"
+                .to_string(),
+        );
+    }
+    Ok(MutexGuard(handle))
+}
+
 enum Create {
     /// The name was taken; try the next one.
     Exists,

@@ -281,6 +281,33 @@ mod imp {
             .map(|s| s.dir().join("windowed-optimizations-undo.txt"))
     }
 
+    /// Write a file without following a reparse point planted at its path.
+    ///
+    /// This record sits at a predictable name under the per-user data
+    /// directory, and the app may be elevated. `std::fs::write` follows a link,
+    /// so one planted here would be followed with the administrator token.
+    fn write_no_follow(path: &std::path::Path, text: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()
+    }
+
+    /// Serialise apply and restore of this setting across processes: both are
+    /// read-modify-write over one registry value plus one record file, and two
+    /// instances interleaving can leave the value changed with no provenance.
+    fn windowed_lock() -> Result<crate::privdir::MutexGuard, String> {
+        crate::privdir::lock("bdo-optimizer-windowed-optimizations")
+    }
+
     /// Enable the setting, writing an undo record first.
     ///
     /// Returns `Ok(true)` if it changed something, `Ok(false)` if it was already
@@ -288,6 +315,7 @@ mod imp {
     /// does not already exist — the oldest record is the one that describes the
     /// user's real original state.
     pub fn enable_windowed_optimizations_recording_undo() -> Result<bool, String> {
+        let _serialised = windowed_lock()?;
         let previous = read_dx_settings()?;
         let current = match &previous {
             Previous::Absent => String::new(),
@@ -311,7 +339,7 @@ mod imp {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            std::fs::write(&path, previous.encode())
+            write_no_follow(&path, &previous.encode())
                 .map_err(|e| format!("could not save the undo record: {e}"))?;
         }
         let merged = super::merge_dx_setting(&current, SWAP_EFFECT_UPGRADE, "1");
@@ -322,11 +350,23 @@ mod imp {
     /// Put our setting back as it was, leaving every other entry in the shared
     /// value exactly as it stands today.
     pub fn restore_windowed_optimizations() -> Result<bool, String> {
+        let _serialised = windowed_lock()?;
         let Some(path) = undo_record_path() else {
             return Err("no place to look for an undo record".to_string());
         };
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return Ok(false); // nothing was ever changed by us
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            // Only a missing record means "we never changed anything". A
+            // sharing violation or an I/O error is not that, and reporting it
+            // as "nothing to undo" would leave the setting on with the user
+            // told it was never touched.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => {
+                return Err(format!(
+                    "the undo record at {} could not be read ({e}) — leaving the setting alone",
+                    path.display()
+                ))
+            }
         };
         let Some(previous) = Previous::decode(&text) else {
             return Err(format!(
