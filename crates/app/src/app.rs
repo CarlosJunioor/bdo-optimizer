@@ -84,6 +84,10 @@ pub struct VideoState {
     pub worker: Option<crate::video::worker::DriverWorker>,
     /// Outcome of the last finished job (message to show).
     pub last: Option<Result<String, String>>,
+    /// The recorded applied-setting ids as they stood before the in-flight
+    /// apply added to them, so a failure that never reached the driver can be
+    /// rewound. See `video::restore_applied_record`.
+    pub applied_before: Vec<u32>,
 }
 
 /// State for the game-config-files section of the Optimize tab.
@@ -499,6 +503,19 @@ impl eframe::App for App {
     /// window is opaque and fully covered by its panels, so this does not affect it.
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         [0.0, 0.0, 0.0, 0.0]
+    }
+
+    /// Shut a running capture down before the process goes away.
+    ///
+    /// PresentMon is a separate elevated process holding an ETW trace session,
+    /// and `CaptureHandle` deliberately does not kill it on drop — so exiting
+    /// mid-capture would leave it running with nothing left to stop it, and
+    /// discard the session the user was recording. This gives the worker its
+    /// ordinary stop path instead.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(worker) = self.benchmark.worker.as_mut() {
+            worker.stop_and_join();
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {

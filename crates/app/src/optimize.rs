@@ -794,7 +794,7 @@ impl App {
     pub fn poll_driver_worker(&mut self) {
         use std::sync::mpsc::TryRecvError;
 
-        let restoring = self.video.worker.as_ref().is_some_and(|w| w.label == "restore");
+        let label = self.video.worker.as_ref().map(|w| w.label);
         let finished = match self.video.worker.as_ref().map(|worker| worker.rx.try_recv()) {
             Some(Ok(result)) => Some(result),
             // The worker thread ended without sending — a panic inside the job.
@@ -809,12 +809,20 @@ impl App {
             Some(Err(TryRecvError::Empty)) | None => None,
         };
         if let Some(result) = finished {
-            // Only a *verified* restore may forget which settings were applied.
-            // Clearing it when the job merely started would leave a failed
-            // restore with nothing to retry from, and the settings it did not
-            // reach would stay applied with no record that they ever were.
-            if restoring && result.is_ok() {
-                crate::video::clear_applied_record();
+            match (label, result.is_ok()) {
+                // Only a *verified* restore may forget which settings were
+                // applied. Clearing it when the job merely started would leave
+                // a failed restore with nothing to retry from, and the settings
+                // it did not reach would stay applied with no record of it.
+                (Some("restore"), true) => crate::video::clear_applied_record(),
+                // An apply that failed did not necessarily change anything —
+                // the inspector may never have started. Rewind the ids this run
+                // added so a later Restore cannot reset values the app never
+                // wrote. See [`crate::video::restore_applied_record`].
+                (Some("apply"), false) => {
+                    crate::video::restore_applied_record(&self.video.applied_before)
+                }
+                _ => {}
             }
             self.video.last = Some(result);
             self.video.worker = None;
@@ -923,6 +931,7 @@ impl App {
         // reports a verified success (see `poll_driver_worker`): clearing it up
         // front would leave a failed restore with nothing to retry from.
         if label == "apply" {
+            self.video.applied_before = crate::video::recorded_applied();
             if let Err(e) = crate::video::record_applied(&settings) {
                 self.oneclick.steps.push((
                     STEP.into(),
@@ -1575,6 +1584,7 @@ impl App {
                                 crate::video::guide_settings(physical_cores, self.video.ull);
                             // Same contract as the one-click path: no record,
                             // no change — the button promises a reversible edit.
+                            self.video.applied_before = crate::video::recorded_applied();
                             match crate::video::record_applied(&settings) {
                                 Ok(()) => {
                                     self.video.last = None;
@@ -1659,13 +1669,41 @@ impl App {
         }
         ui.label(
             RichText::new(
-                "Turns off PostFilter (forced sharpening) and Tessellation in GameOption.txt and \
-                 every UserCache gamevariable.xml, exactly as the guide describes. The original \
-                 of each file is backed up next to it the first time it is changed.",
+                "Applies the guide's settings in GameOption.txt and every UserCache \
+                 gamevariable.xml. The original of each file is backed up next to it the first \
+                 time it is changed.",
             )
             .size(12.0)
             .weak(),
         );
+        // Spell out every setting that gets written. Naming only the two most
+        // famous ones while quietly changing four more is not consent, and a
+        // couple of these (low-power mode, far-effect culling) are visible
+        // changes someone might not want.
+        ui.add_space(2.0);
+        for (setting, effect) in [
+            ("PostFilter", "off — removes the forced post-process sharpening"),
+            ("Tessellation", "off — the FPS gain the guide notes on High and above"),
+            (
+                "Auto Frame Optimization",
+                "off — the guide says it cancels out the settings below it",
+            ),
+            ("Low power mode", "off — the guide calls this one a big deal"),
+            (
+                "Remove faraway effects",
+                "on — culls distant particle effects",
+            ),
+            (
+                "Character optimization",
+                "off — the guide does not use it",
+            ),
+        ] {
+            ui.label(
+                RichText::new(format!("• {setting}: {effect}"))
+                    .size(12.0)
+                    .weak(),
+            );
+        }
         // The guide calls this out explicitly, and it is the one way these edits
         // silently revert — worth saying where the button is, not just in a
         // readme the user will not have open while playing.

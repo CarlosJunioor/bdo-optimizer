@@ -201,16 +201,21 @@ own "Black Desert" profile:
 
 ## 📝 Game config files (optional)
 
-**2 Apply** also offers the guide's config-file edits, which disable the forced
-post-process sharpening and (on High presets and above) tessellation:
+**2 Apply** also offers the guide's config-file edits. Six settings are written,
+in `Documents\Black Desert\GameOption.txt` and in every UserCache
+`gamevariable.xml`:
 
-| File | Change |
-|---|---|
-| `Documents\Black Desert\GameOption.txt` | `postFilter = 0` and `Tessellation = 0` |
-| Every UserCache `gamevariable.xml` | Each `<PostFilter Value="0"/>` and `<Tessellation Value="false"/>` entry |
+| Setting | Value | Why |
+| --- | --- | --- |
+| `postFilter` | off | Removes the forced post-process sharpening. |
+| `Tessellation` | off | The FPS gain the guide notes on High presets and above. |
+| `autoOptimization` | off | The guide says Auto Frame Optimization cancels out the settings below it. |
+| `sleepModeEnable` | off | Low power mode — the guide calls this one a big deal. |
+| `useNearestEffectOnly` | on | Culls distant particle effects. |
+| `useFarPlayerOptimization` | off | Character optimization, which the guide does not use. |
 
 The XML files use `true`/`false` where the text file uses `1`/`0`; each is
-written in its own format.
+written in its own format. The same list is shown in the app before you apply.
 
 **Notes:**
 

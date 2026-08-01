@@ -167,6 +167,27 @@ pub fn clear_applied_record() {
     }
 }
 
+/// Put the record back to `previous`, used when an apply is recorded and then
+/// never reaches the driver.
+///
+/// The record has to be written *before* the job runs — a crash mid-import must
+/// not leave settings changed with no note of which ones. But a job that fails
+/// before the import (staging, spawning, an inspector that never starts) leaves
+/// ids attributed to this app that it never wrote, and a later Restore would
+/// then reset the user's own values for them. Rewinding on a failure that is
+/// known to precede the import keeps the record honest in both directions.
+pub fn restore_applied_record(previous: &[u32]) {
+    if previous.is_empty() {
+        clear_applied_record();
+        return;
+    }
+    let Some(path) = applied_record_path() else {
+        return;
+    };
+    let text: Vec<String> = previous.iter().map(u32::to_string).collect();
+    let _ = std::fs::write(path, text.join("\n"));
+}
+
 /// Render the `.nip` XML for the Black Desert profile with the given settings.
 ///
 /// Mirrors the element order Profile Inspector's own exporter produces, since

@@ -586,15 +586,53 @@ fn install_all(staged: &mut [StagedFile], app_dir: &Path) -> Result<(), String> 
         .iter()
         .map(|f| f.name.to_string_lossy().into_owned())
         .collect();
-    std::fs::write(&ledger, names.join("\n"))
+    write_ledger(&ledger, LEDGER_PENDING, &names)
         .map_err(|e| format!("could not record the update for recovery: {e}"))?;
 
-    let result = install_recorded(staged, app_dir);
-    // Only clear the ledger once the swap is settled either way: on success
-    // nothing needs recovering, and on a returned error the rollback below has
-    // already put everything back.
-    let _ = std::fs::remove_file(&ledger);
-    result
+    match install_recorded(staged, app_dir) {
+        Ok(()) => {
+            // Mark it finished rather than deleting it. The ledger is also the
+            // list of `.old` files this install created — the shipped set is
+            // larger than the handful of names hard-coded in `packaged_names`
+            // (README, licenses, the inspector `.config`) — so the next start
+            // needs it to clean up after itself instead of leaving a stale
+            // backup beside every file forever.
+            let _ = write_ledger(&ledger, LEDGER_DONE, &names);
+            Ok(())
+        }
+        Err(e) => {
+            // Only drop the ledger when the rollback is known to have put
+            // everything back. If it did not, this is the only record of a
+            // half-finished install, and the next start would otherwise read
+            // the leftover `.old` files as a completed update's litter and
+            // delete the previous version.
+            if rolled_back_cleanly(app_dir, &names) {
+                let _ = std::fs::remove_file(&ledger);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// First line of the ledger: whether the install it describes finished.
+const LEDGER_PENDING: &str = "pending";
+const LEDGER_DONE: &str = "done";
+
+fn write_ledger(path: &Path, state: &str, names: &[String]) -> std::io::Result<()> {
+    let mut text = String::from(state);
+    for name in names {
+        text.push('\n');
+        text.push_str(name);
+    }
+    std::fs::write(path, text)
+}
+
+/// Whether every recorded file is back to a single, present copy — i.e. the
+/// rollback left nothing for startup recovery to do.
+fn rolled_back_cleanly(dir: &Path, names: &[String]) -> bool {
+    names
+        .iter()
+        .all(|name| dir.join(name).is_file() && !dir.join(format!("{name}.old")).exists())
 }
 
 fn install_recorded(staged: &mut [StagedFile], app_dir: &Path) -> Result<(), String> {
@@ -787,14 +825,20 @@ fn recover_with_ledger(dir: &Path) {
     };
     let ledger = dir.join(INSTALL_LEDGER);
     let (names, recovered) = match std::fs::read_to_string(&ledger) {
-        // A ledger left on disk means the install never finished: put every
-        // recorded file back before anything else runs.
         Ok(text) => {
-            let names: Vec<String> = text.lines().map(str::to_string).collect();
+            let mut lines = text.lines();
+            let state = lines.next().unwrap_or_default().trim().to_string();
+            let names: Vec<String> = lines.map(str::to_string).collect();
+            // `done` means the install finished and the ledger is only a
+            // cleanup list. `pending` (or anything unrecognised, which is the
+            // safe reading) means it was interrupted: put every recorded file
+            // back before anything else runs.
             let mut all_restored = true;
-            for name in &names {
-                if !restore_one(dir, name) {
-                    all_restored = false;
+            if state != LEDGER_DONE {
+                for name in &names {
+                    if !restore_one(dir, name) {
+                        all_restored = false;
+                    }
                 }
             }
             // Keep the ledger when anything failed. Removing it would throw
@@ -1017,7 +1061,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("bdo-optimizer.exe"), b"half-installed").unwrap();
         std::fs::write(dir.join("bdo-optimizer.exe.old"), b"the real old exe").unwrap();
-        std::fs::write(dir.join(INSTALL_LEDGER), "bdo-optimizer.exe").unwrap();
+        write_ledger(&dir.join(INSTALL_LEDGER), LEDGER_PENDING, &["bdo-optimizer.exe".to_string()]).unwrap();
 
         // Hold the destination open exclusively so it cannot be moved aside —
         // the same thing a still-running executable or an antivirus does.
@@ -1054,7 +1098,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         // Simulate a crash after the executable was renamed aside.
         std::fs::write(dir.join("bdo-optimizer.exe.old"), b"old exe").unwrap();
-        std::fs::write(dir.join(INSTALL_LEDGER), "bdo-optimizer.exe").unwrap();
+        write_ledger(&dir.join(INSTALL_LEDGER), LEDGER_PENDING, &["bdo-optimizer.exe".to_string()]).unwrap();
         // An unrelated backup that is none of our business.
         std::fs::write(dir.join("settings.old"), b"someone else's").unwrap();
 
@@ -1070,6 +1114,42 @@ mod tests {
             dir.join("settings.old").exists(),
             "an unrelated .old file must not be swept up"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A ledger marked `done` describes a *finished* install, so recovery must
+    /// not put the old files back — it must clear the backups that install
+    /// left, including shipped files `packaged_names` does not list.
+    #[test]
+    fn a_completed_ledger_only_cleans_up() {
+        let _serialised = installing();
+        let dir = std::env::temp_dir().join(format!("bdo-update-done-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("bdo-optimizer.exe"), b"new exe").unwrap();
+        std::fs::write(dir.join("bdo-optimizer.exe.old"), b"old exe").unwrap();
+        std::fs::write(dir.join("README.md"), b"new readme").unwrap();
+        std::fs::write(dir.join("README.md.old"), b"old readme").unwrap();
+        write_ledger(
+            &dir.join(INSTALL_LEDGER),
+            LEDGER_DONE,
+            &["bdo-optimizer.exe".to_string(), "README.md".to_string()],
+        )
+        .unwrap();
+
+        recover_with_ledger(&dir);
+
+        assert_eq!(
+            std::fs::read(dir.join("bdo-optimizer.exe")).unwrap(),
+            b"new exe",
+            "a finished install must not be rolled back"
+        );
+        assert!(!dir.join("bdo-optimizer.exe.old").exists());
+        assert!(
+            !dir.join("README.md.old").exists(),
+            "a shipped file outside packaged_names must still get its backup cleaned"
+        );
+        assert!(!dir.join(INSTALL_LEDGER).exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

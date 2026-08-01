@@ -38,49 +38,58 @@ pub fn create(prefix: &str) -> Result<PathBuf, String> {
             .map(|d| d.subsec_nanos())
             .unwrap_or(attempt);
         let dir = base.join(format!("{prefix}-{pid}-{nanos}-{attempt}"));
-        // `create_dir` is atomic and fails when the path exists, so the first
-        // name that succeeds is one nobody else holds.
-        match std::fs::create_dir(&dir) {
-            Ok(()) => {
-                if let Err(e) = protect(&dir) {
-                    let _ = std::fs::remove_dir_all(&dir);
-                    return Err(e);
-                }
-                return Ok(dir);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(format!("could not create {}: {e}", dir.display())),
+        // `CreateDirectoryW` is atomic and fails when the path exists, so the
+        // first name that succeeds is one nobody else holds — *and* the label
+        // is part of the same call, so the directory is never briefly writable
+        // under a name someone else can see.
+        match create_labelled(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(Create::Exists) => continue,
+            Err(Create::Failed(e)) => return Err(e),
         }
     }
     Err(format!("could not create a private {prefix} directory"))
 }
 
-/// Label `dir` high-integrity when elevated. See the module docs for why this
-/// is mandatory there and skipped otherwise.
-fn protect(dir: &Path) -> Result<(), String> {
-    if !bdo_launch::is_elevated() {
-        return Ok(());
-    }
-    set_high_integrity(dir).map_err(|e| {
-        format!(
-            "a folder protected from other programs on this machine could not be created \
-             ({e}), so this step was not run"
-        )
-    })
+enum Create {
+    /// The name was taken; try the next one.
+    Exists,
+    Failed(String),
 }
 
-/// Apply a `High` mandatory label with no-write-up to `dir`.
-fn set_high_integrity(dir: &Path) -> Result<(), String> {
+/// Create `dir` carrying a `High` mandatory label from the moment it exists.
+///
+/// Applying the label as a second step would publish the path first, and a
+/// medium-integrity process watching the temp folder could plant a file — or
+/// take a writable handle, which relabelling does not revoke — in between.
+/// `CreateDirectoryW` takes the security descriptor up front, so there is no
+/// such moment.
+///
+/// Unelevated the label is skipped: raising one above your own integrity level
+/// needs `SeRelabelPrivilege`, and unelevated there is nothing to escalate to
+/// because whatever is staged runs with the privileges an attacker at that
+/// level already has.
+fn create_labelled(dir: &Path) -> Result<(), Create> {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{HLOCAL, LocalFree, ERROR_SUCCESS};
+    use windows::Win32::Foundation::{HLOCAL, LocalFree};
     use windows::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
-        SDDL_REVISION_1, SE_FILE_OBJECT,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
-    use windows::Win32::Security::{
-        GetSecurityDescriptorSacl, ACL, LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-    };
+    use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    use windows::Win32::Storage::FileSystem::CreateDirectoryW;
+
+    let path: Vec<u16> = dir
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    if !bdo_launch::is_elevated() {
+        // SAFETY: NUL-terminated path alive across the call; no attributes.
+        let made = unsafe { CreateDirectoryW(PCWSTR(path.as_ptr()), None) };
+        return finish(made, dir);
+    }
 
     // SDDL for a system-access-control-list holding one mandatory label:
     // no-write-up (NW) at the High integrity level (HI).
@@ -89,9 +98,8 @@ fn set_high_integrity(dir: &Path) -> Result<(), String> {
         .chain(std::iter::once(0))
         .collect();
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
-
-    // SAFETY: `sddl` is a NUL-terminated wide string alive across the call, and
-    // `descriptor` is a valid out-parameter the callee allocates.
+    // SAFETY: `sddl` is NUL-terminated and alive across the call; `descriptor`
+    // is a valid out-parameter the callee allocates.
     unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
             PCWSTR(sddl.as_ptr()),
@@ -99,49 +107,43 @@ fn set_high_integrity(dir: &Path) -> Result<(), String> {
             &mut descriptor,
             None,
         )
-        .map_err(|e| format!("could not build the integrity label: {e}"))?;
+        .map_err(|e| Create::Failed(format!("could not build the integrity label: {e}")))?;
     }
 
-    let mut sacl: *mut ACL = std::ptr::null_mut();
-    let mut present = false.into();
-    let mut defaulted = false.into();
-    // SAFETY: `descriptor` came from the call above and is still owned here.
-    let read =
-        unsafe { GetSecurityDescriptorSacl(descriptor, &mut present, &mut sacl, &mut defaulted) };
-    let result = match read {
-        Ok(()) => {
-            let path: Vec<u16> = dir
-                .as_os_str()
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect();
-            // SAFETY: NUL-terminated path and a SACL borrowed from the
-            // descriptor, both alive for the duration of the call.
-            let status = unsafe {
-                SetNamedSecurityInfoW(
-                    PCWSTR(path.as_ptr()),
-                    SE_FILE_OBJECT,
-                    LABEL_SECURITY_INFORMATION,
-                    None,
-                    None,
-                    None,
-                    Some(sacl),
-                )
-            };
-            if status == ERROR_SUCCESS {
-                Ok(())
-            } else {
-                Err(format!("could not label the folder: {status:?}"))
-            }
-        }
-        Err(e) => Err(format!("could not read the built label: {e}")),
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: false.into(),
     };
-
+    // SAFETY: both the path and the descriptor outlive the call, and
+    // `attributes` describes the descriptor built above.
+    let made = unsafe { CreateDirectoryW(PCWSTR(path.as_ptr()), Some(&attributes)) };
     // SAFETY: allocated by the conversion above, not used after this point.
     unsafe {
         let _ = LocalFree(Some(HLOCAL(descriptor.0)));
     }
-    result
+    finish(made, dir)
+}
+
+/// Classify a `CreateDirectoryW` result, keeping "the name is taken" separate
+/// from a real failure so the caller can try the next name.
+fn finish(made: windows::core::Result<()>, dir: &Path) -> Result<(), Create> {
+    use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    match made {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // SAFETY: reading the calling thread's last-error value.
+            if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+                Err(Create::Exists)
+            } else {
+                Err(Create::Failed(format!(
+                    "a folder protected from other programs could not be created at {} ({e}), \
+                     so this step was not run",
+                    dir.display()
+                )))
+            }
+        }
+    }
 }
 
 #[cfg(test)]

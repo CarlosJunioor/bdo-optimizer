@@ -21,6 +21,9 @@ mod hardware;
 mod optimize;
 mod overlay;
 mod presentmon;
+// Windows-only: the whole point of this module is a mandatory integrity label,
+// which has no equivalent elsewhere. Its two callers are Windows-gated too.
+#[cfg(windows)]
 mod privdir;
 #[cfg(windows)]
 mod relaunch;

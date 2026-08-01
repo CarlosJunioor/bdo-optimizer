@@ -132,6 +132,9 @@ impl Drop for RawCaptureCleanup {
 /// Handle to an in-flight capture worker.
 pub struct CaptureWorker {
     stop_flag: Arc<AtomicBool>,
+    /// Kept so the app can wait for the worker to shut PresentMon down before
+    /// the process exits. See [`CaptureWorker::stop_and_join`].
+    thread: Option<std::thread::JoinHandle<()>>,
     pub rx: Receiver<CaptureMsg>,
 }
 
@@ -141,13 +144,43 @@ impl CaptureWorker {
         let (tx, rx) = channel();
         let stop_flag = Arc::new(AtomicBool::new(false));
         let flag = stop_flag.clone();
-        std::thread::spawn(move || run(params, flag, tx, ctx));
-        Self { stop_flag, rx }
+        let thread = std::thread::spawn(move || run(params, flag, tx, ctx));
+        Self {
+            stop_flag,
+            thread: Some(thread),
+            rx,
+        }
     }
 
     /// Ask the worker to stop at its next poll.
     pub fn request_stop(&self) {
         self.stop_flag.store(true, Ordering::SeqCst);
+    }
+
+    /// Stop the capture and wait for the worker to finish tearing it down.
+    ///
+    /// Called when the window closes. Without it the process exits while the
+    /// worker is mid-poll: `CaptureHandle` deliberately does not kill
+    /// PresentMon on drop, so its elevated child and its ETW trace session
+    /// would keep running with nothing left to stop them, and the raw CSV would
+    /// stay in the temp folder. The wait is bounded — a session that cannot be
+    /// saved is worth a moment, but not a hung shutdown.
+    pub fn stop_and_join(&mut self) {
+        self.request_stop();
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = done.clone();
+        // `JoinHandle` has no timed join, so watch a flag the joiner sets.
+        std::thread::spawn(move || {
+            let _ = thread.join();
+            flag.store(true, Ordering::SeqCst);
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 }
 
