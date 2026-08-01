@@ -16,7 +16,10 @@ use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
 use windows::core::{Interface, HRESULT, PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, ERROR_ELEVATION_REQUIRED, HANDLE};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_CANCELLED, ERROR_ELEVATION_REQUIRED, HANDLE, WAIT_EVENT, WAIT_OBJECT_0,
+    WAIT_TIMEOUT,
+};
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER,
@@ -24,9 +27,9 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows::Win32::System::Threading::{
-    CreateProcessW, GetCurrentProcess, GetProcessAffinityMask, OpenProcess, OpenProcessToken,
-    ResumeThread, SetProcessAffinityMask, TerminateProcess, WaitForSingleObject, CREATE_SUSPENDED,
-    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
+    CreateProcessW, GetCurrentProcess, GetExitCodeProcess, GetProcessAffinityMask, OpenProcess,
+    OpenProcessToken, ResumeThread, SetProcessAffinityMask, TerminateProcess, WaitForSingleObject,
+    CREATE_SUSPENDED, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
 };
 use windows::Win32::UI::Shell::{
     IShellLinkDataList, IShellLinkW, ShellExecuteExW, ShellLink, SEE_MASK_NOCLOSEPROCESS,
@@ -38,6 +41,7 @@ use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 /// already initialized on this thread with a different apartment model. Not a
 /// real failure for our purposes.
 const RPC_E_CHANGED_MODE: i32 = -2_147_417_850;
+const ELEVATED_SHELL_TIMEOUT_MS: u32 = 30_000;
 
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -50,6 +54,22 @@ fn system_cmd() -> Result<PathBuf, LaunchError> {
         return Err(LaunchError::Os("GetSystemDirectoryW failed".to_string()));
     }
     Ok(PathBuf::from(OsString::from_wide(&buffer[..len])).join("cmd.exe"))
+}
+
+fn pin_launcher(path: &Path) -> Result<std::fs::File, LaunchError> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(path)
+        .map_err(|e| {
+            LaunchError::Os(format!(
+                "could not lock {} against modification before elevation: {e}",
+                path.display()
+            ))
+        })
 }
 
 /// Launch `BlackDesertLauncher.exe` with `mask` applied so the game inherits it.
@@ -93,6 +113,9 @@ pub fn launch_with_affinity(
     if !launcher_path.exists() {
         return Err(LaunchError::PathNotFound(launcher_path.to_path_buf()));
     }
+    // The elevated shell reopens this path after the UAC prompt. Denying write,
+    // rename and delete until cmd exits prevents a same-user swap in that gap.
+    let _pinned_launcher = pin_launcher(launcher_path)?;
     let workdir = launcher_path
         .parent()
         .ok_or_else(|| LaunchError::NoParentDir(launcher_path.to_path_buf()))?;
@@ -216,6 +239,26 @@ fn elevated_shell_params(
     build_cmd_arguments(&mask_to_hex(mask), steam, launcher_dir, launcher_filename)
 }
 
+fn elevated_shell_completion(wait: WAIT_EVENT, exit_code: u32) -> Result<(), LaunchError> {
+    if wait == WAIT_TIMEOUT {
+        return Err(LaunchError::Os(
+            "elevated launch command did not finish within 30 seconds".to_string(),
+        ));
+    }
+    if wait != WAIT_OBJECT_0 {
+        return Err(LaunchError::Os(format!(
+            "waiting for elevated launch command failed with status {:#x}",
+            wait.0
+        )));
+    }
+    if exit_code != 0 {
+        return Err(LaunchError::Os(format!(
+            "elevated launch command exited with status {exit_code}"
+        )));
+    }
+    Ok(())
+}
+
 /// Elevated-shell fallback: `ShellExecuteExW` verb `runas` on `cmd.exe` running
 /// `cd /d "<launcher dir>" && start /affinity <mask> "<launcher>"`. Triggers one
 /// UAC prompt.
@@ -257,10 +300,30 @@ fn launch_via_elevated_shell(
     unsafe {
         match ShellExecuteExW(&mut info) {
             Ok(()) => {
-                // We requested SEE_MASK_NOCLOSEPROCESS, so close cmd's handle.
-                if !info.hProcess.is_invalid() {
-                    let _ = CloseHandle(info.hProcess);
+                if info.hProcess.is_invalid() {
+                    return Err(LaunchError::Os(
+                        "ShellExecuteExW returned no process handle".to_string(),
+                    ));
                 }
+                let wait = WaitForSingleObject(info.hProcess, ELEVATED_SHELL_TIMEOUT_MS);
+                let completion = if wait == WAIT_OBJECT_0 {
+                    let mut exit_code = 0;
+                    GetExitCodeProcess(info.hProcess, &mut exit_code)
+                        .map_err(|e| {
+                            LaunchError::Os(format!(
+                                "GetExitCodeProcess for elevated launch failed: {e}"
+                            ))
+                        })
+                        .and_then(|()| elevated_shell_completion(wait, exit_code))
+                } else {
+                    // Do not leave a hidden elevated shell running after the UI
+                    // reports that launch failed or timed out.
+                    let _ = TerminateProcess(info.hProcess, 1);
+                    let _ = WaitForSingleObject(info.hProcess, 5_000);
+                    elevated_shell_completion(wait, 0)
+                };
+                let _ = CloseHandle(info.hProcess);
+                completion?;
                 Ok(LaunchMethod::ElevatedShell)
             }
             Err(e) => {
@@ -865,6 +928,27 @@ mod tests {
             elevated_shell_params(0x555, false, r"C:\%TMP%\BDO", "BlackDesertLauncher.exe"),
             Err(LaunchError::UnsafeForCmd(_))
         ));
+    }
+
+    #[test]
+    fn elevated_shell_completion_requires_successful_exit() {
+        assert!(elevated_shell_completion(WAIT_OBJECT_0, 0).is_ok());
+        assert!(elevated_shell_completion(WAIT_OBJECT_0, 1).is_err());
+        assert!(elevated_shell_completion(WAIT_TIMEOUT, 0).is_err());
+    }
+
+    #[test]
+    fn launcher_pin_denies_replacement() {
+        let path = std::env::temp_dir().join(format!("bdo-launch-pin-{}.exe", std::process::id()));
+        std::fs::write(&path, b"launcher").unwrap();
+        let pin = pin_launcher(&path).unwrap();
+        assert!(std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .is_err());
+        drop(pin);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

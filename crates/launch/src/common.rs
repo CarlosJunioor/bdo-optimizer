@@ -278,8 +278,7 @@ pub fn generate_taskset_command(cores: &[usize], cmd: &str) -> String {
 /// without spaces or specials unquoted keeps the common case readable.
 pub fn desktop_quote(path: &str) -> String {
     const NEEDS_QUOTING: &[char] = &[
-        ' ', '\t', '"', '\'', '\\', '>', '<', '~', '|', '&', ';', '$', '*', '?', '#', '(', ')',
-        '`',
+        ' ', '\t', '"', '\'', '\\', '>', '<', '~', '|', '&', ';', '$', '*', '?', '#', '(', ')', '`',
     ];
     if !path.contains(NEEDS_QUOTING) {
         return path.to_string();
@@ -442,7 +441,11 @@ mod tests {
         // Legal, common paths must still build: `&` and spaces are literal
         // inside double quotes.
         assert!(build(r"C:\Games & Mods\BDO", "BlackDesertLauncher.exe").is_ok());
-        assert!(build(r"D:\SteamLibrary\steamapps\common\Black Desert Online", "x.exe").is_ok());
+        assert!(build(
+            r"D:\SteamLibrary\steamapps\common\Black Desert Online",
+            "x.exe"
+        )
+        .is_ok());
     }
 
     #[test]

@@ -222,7 +222,7 @@ pub fn core_map(ui: &mut egui::Ui, cpu: &bdo_hw::CpuInfo, lit: &[usize]) {
 
     // Partition physical cores into L3 groups (a core belongs where its first
     // thread lives); one group when the topology reports fewer than two.
-    let vcache_first = bdo_hw::vcache_ccd(&cpu.l3_domains).map(|d| d.logical_cores.clone());
+    let vcache_first = bdo_hw::vcache_ccd_for_cpu(cpu).map(|d| d.logical_cores.clone());
     let groups: Vec<(String, bool, Vec<&Vec<usize>>)> = if cpu.l3_domains.len() >= 2 {
         let mut domains: Vec<_> = cpu.l3_domains.iter().collect();
         domains.sort_by_key(|d| d.logical_cores.first().copied());
@@ -291,9 +291,11 @@ pub fn core_map(ui: &mut egui::Ui, cpu: &bdo_hw::CpuInfo, lit: &[usize]) {
                 lerp_color(ACCENT_DIM, ACCENT, pulse),
             );
             ui.label(
-                RichText::new("The game runs on the glowing cores — dim ones stay free for Windows.")
-                    .small()
-                    .color(INK_3),
+                RichText::new(
+                    "The game runs on the glowing cores — dim ones stay free for Windows.",
+                )
+                .small()
+                .color(INK_3),
             );
         });
     }
@@ -329,7 +331,12 @@ fn chip(ui: &mut egui::Ui, index: usize, threads: &[usize], lit: &[usize]) {
         painter.rect_filled(
             rect.expand(2.0),
             CornerRadius::same(8),
-            Color32::from_rgba_unmultiplied(ACCENT.r(), ACCENT.g(), ACCENT.b(), (26.0 * pulse) as u8),
+            Color32::from_rgba_unmultiplied(
+                ACCENT.r(),
+                ACCENT.g(),
+                ACCENT.b(),
+                (26.0 * pulse) as u8,
+            ),
         );
     }
     painter.rect(

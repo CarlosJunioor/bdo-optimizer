@@ -178,10 +178,31 @@ impl SessionStore {
     /// [`BenchError::Io`] / [`BenchError::Serde`] on filesystem or serialisation failure.
     pub fn save(&self, session: &Session) -> Result<PathBuf, BenchError> {
         use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
         fs::create_dir_all(&self.dir)?;
         let json = serde_json::to_string_pretty(session)?;
         let stem = session.file_stem();
+        let temp = self.dir.join(format!(
+            ".{stem}-{}-{}.tmp",
+            std::process::id(),
+            TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        if let Err(error) = file
+            .write_all(json.as_bytes())
+            .and_then(|()| file.sync_all())
+        {
+            drop(file);
+            let _ = fs::remove_file(&temp);
+            return Err(error.into());
+        }
+        drop(file);
 
         // Never overwrite. Timestamps have one-second resolution, so two short
         // captures with the same label — or two app instances — collide, and
@@ -195,16 +216,19 @@ impl SessionStore {
                 format!("{stem}-{attempt}.json")
             };
             let path = self.dir.join(name);
-            match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(mut file) => {
-                    file.write_all(json.as_bytes())?;
-                    file.sync_all()?;
+            match fs::hard_link(&temp, &path) {
+                Ok(()) => {
+                    let _ = fs::remove_file(&temp);
                     return Ok(path);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e.into()),
+                Err(e) => {
+                    let _ = fs::remove_file(&temp);
+                    return Err(e.into());
+                }
             }
         }
+        let _ = fs::remove_file(&temp);
         Err(BenchError::Io(format!(
             "could not find a free file name for the session in {}",
             self.dir.display()
@@ -355,6 +379,19 @@ mod tests {
         assert!(store.list().unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_publishes_only_complete_json() {
+        let dir = TempDir::new().unwrap();
+        let store = SessionStore::new(dir.path());
+        let path = store.save(&sample()).unwrap();
+
+        let saved = std::fs::read_to_string(path).unwrap();
+        serde_json::from_str::<Session>(&saved).unwrap();
+        assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+            entry.unwrap().path().extension().and_then(|x| x.to_str()) != Some("tmp")
+        }));
     }
 
     #[test]

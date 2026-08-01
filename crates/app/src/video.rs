@@ -78,10 +78,9 @@ pub fn guide_settings(physical_cores: usize, ull: bool) -> Vec<(u32, u32)> {
     settings
 }
 
-/// Driver-default values for every setting [`guide_settings`] can touch.
+/// Driver-default values used to migrate legacy id-only undo records.
 ///
-/// True "remove the override" is not reachable through a .nip import, so restore
-/// writes the documented driver defaults explicitly — behaviorally identical.
+/// New applies store and replace-import the complete pre-apply profile instead.
 pub fn default_settings() -> Vec<(u32, u32)> {
     vec![
         (THREADED_OPTIMIZATION, 0),
@@ -93,24 +92,56 @@ pub fn default_settings() -> Vec<(u32, u32)> {
     ]
 }
 
-/// The defaults for exactly the settings a previous apply actually wrote.
+/// The original values for exactly the settings a previous apply wrote.
 ///
 /// Restoring every setting in [`default_settings`] undoes work this app never
 /// did: with Ultra Low Latency left unticked — the default — apply never touches
 /// the three ULL entries, so a blanket restore wipes a Low Latency setup the
 /// user configured themselves in the NVIDIA control panel.
 ///
-/// `applied` is the id list recorded when the profile was written. An empty
+/// `originals` is the id/value list recorded before the profile was written. An empty
 /// list is **not** "assume the usual three": it means this app has no evidence
 /// it ever changed the profile — a fresh install, or a deleted record — and the
 /// only honest scope for a restore then is nothing at all. Guessing there would
 /// let Restore overwrite a Black Desert profile the user built themselves,
 /// which is exactly what the button promises not to do. Callers surface the
 /// empty result rather than running an import that would change nothing.
-pub fn restore_settings(applied: &[u32]) -> Vec<(u32, u32)> {
+pub fn restore_settings(originals: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    originals.to_vec()
+}
+
+fn default_value(id: u32) -> Option<u32> {
     default_settings()
         .into_iter()
-        .filter(|(id, _)| applied.contains(id))
+        .find_map(|(candidate, value)| (candidate == id).then_some(value))
+}
+
+fn profile_setting_value(exported_xml: &str, id: u32) -> Option<u32> {
+    let compact: String = exported_xml
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let profile_name: String = format!("<ProfileName>{PROFILE_NAME}</ProfileName>")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let profile = compact.find(&profile_name)?;
+    let block = &compact[profile..];
+    let block = &block[..block.find("</Profile>").unwrap_or(block.len())];
+    let setting = block.find(&format!("<SettingID>{id}</SettingID>"))?;
+    let value = &block[setting..];
+    let value = &value[value.find("<SettingValue>")? + "<SettingValue>".len()..];
+    value[..value.find("</SettingValue>")?].parse().ok()
+}
+
+fn original_settings(exported_xml: &str, settings: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    settings
+        .iter()
+        .filter_map(|(id, _)| {
+            profile_setting_value(exported_xml, *id)
+                .or_else(|| default_value(*id))
+                .map(|value| (*id, value))
+        })
         .collect()
 }
 
@@ -171,43 +202,189 @@ fn applied_record_path() -> Option<PathBuf> {
         .map(|s| s.dir().join("nvidia-applied-settings.txt"))
 }
 
-/// Record which setting ids an apply wrote, so undo can reverse exactly those.
+fn profile_backup_path() -> Option<PathBuf> {
+    bdo_bench::SessionStore::default_store()
+        .ok()
+        .map(|s| s.dir().join("nvidia-profile-before-apply.nip"))
+}
+
+const PROFILE_ABSENT: &str = "BDO_OPTIMIZER_PROFILE_ABSENT\n";
+
+enum ProfileBackup {
+    Absent,
+    Xml(String),
+}
+
+impl ProfileBackup {
+    fn stored(&self) -> &str {
+        match self {
+            Self::Absent => PROFILE_ABSENT,
+            Self::Xml(xml) => xml,
+        }
+    }
+
+    fn payload(&self) -> String {
+        match self {
+            Self::Absent => nip_xml(&[]),
+            Self::Xml(xml) => xml.clone(),
+        }
+    }
+}
+
+fn black_desert_profile_block(xml: &str) -> Option<&str> {
+    let mut rest = xml;
+    while let Some(start) = rest.find("<Profile>") {
+        rest = &rest[start..];
+        let end = rest.find("</Profile>")? + "</Profile>".len();
+        let block = &rest[..end];
+        let compact: String = block.chars().filter(|c| !c.is_whitespace()).collect();
+        let name: String = format!("<ProfileName>{PROFILE_NAME}</ProfileName>")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        if compact.contains(&name) {
+            return Some(block);
+        }
+        rest = &rest[end..];
+    }
+    None
+}
+
+fn backup_from_export(exported_xml: &str) -> ProfileBackup {
+    match black_desert_profile_block(exported_xml) {
+        Some(block) => ProfileBackup::Xml(format!(
+            "<?xml version=\"1.0\" encoding=\"utf-16\"?>\r\n<ArrayOfProfile>\r\n{block}\r\n</ArrayOfProfile>\r\n"
+        )),
+        None => ProfileBackup::Absent,
+    }
+}
+
+fn profile_backup_matches(backup: &ProfileBackup, exported_xml: &str) -> bool {
+    let compact = |block: &str| {
+        block
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+    };
+    match backup {
+        ProfileBackup::Absent => default_settings()
+            .into_iter()
+            .all(|(id, _)| profile_setting_value(exported_xml, id).is_none()),
+        ProfileBackup::Xml(expected) => {
+            let Some(expected) = black_desert_profile_block(expected) else {
+                return false;
+            };
+            black_desert_profile_block(exported_xml)
+                .is_some_and(|actual| compact(actual) == compact(expected))
+        }
+    }
+}
+
+fn read_profile_backup() -> Result<Option<ProfileBackup>, String> {
+    let path = profile_backup_path()
+        .ok_or_else(|| "the app data folder could not be located".to_string())?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("could not read {}: {error}", path.display())),
+    };
+    if text == PROFILE_ABSENT {
+        return Ok(Some(ProfileBackup::Absent));
+    }
+    let Some(block) = black_desert_profile_block(&text) else {
+        return Err(format!(
+            "{} is not a Black Desert profile backup",
+            path.display()
+        ));
+    };
+    let without = text.replacen(block, "", 1);
+    if without.contains("<Profile>") {
+        return Err(format!("{} contains more than one profile", path.display()));
+    }
+    Ok(Some(ProfileBackup::Xml(text)))
+}
+
+pub fn has_restore_record() -> bool {
+    [applied_record_path(), profile_backup_path()]
+        .into_iter()
+        .flatten()
+        .any(|path| path.exists())
+}
+
+/// Record each setting's pre-apply value so undo restores the user's state.
 ///
-/// The record accumulates: it is the union of every id written since the last
-/// verified restore, not just the latest apply. Applying once with Ultra Low
-/// Latency on and again with it off would otherwise shrink the record to three
-/// ids — and because the import is a *merge*, the earlier ULL overrides are
-/// still sitting in the driver profile, so undo would walk away leaving
-/// settings this app wrote behind.
+/// A pending snapshot must be restored before another apply. That keeps a
+/// cleanup failure from turning an old snapshot into the undo point for a new
+/// cycle after the user has changed the profile themselves.
 ///
 /// Returns an error the caller can report: silently failing to record makes a
 /// change the UI calls reversible into one that is not.
-pub fn record_applied(settings: &[(u32, u32)]) -> Result<(), String> {
+pub fn record_applied(settings: &[(u32, u32)], exported_xml: &str) -> Result<(), String> {
     let path = applied_record_path()
         .ok_or_else(|| "the app data folder could not be located".to_string())?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
     }
-    let mut ids: Vec<u32> = recorded_applied();
-    for (id, _) in settings {
-        if !ids.contains(id) {
-            ids.push(*id);
+    if has_restore_record() {
+        return Err(
+            "restore the previous NVIDIA profile before applying another driver change".to_string(),
+        );
+    }
+    let backup_path = profile_backup_path()
+        .ok_or_else(|| "the app data folder could not be located".to_string())?;
+    let backup = backup_from_export(exported_xml);
+    crate::gameconfig::write_new_only(&backup_path, backup.stored().as_bytes())
+        .map_err(|e| format!("could not save {}: {e}", backup_path.display()))?;
+    read_profile_backup()?.ok_or_else(|| {
+        format!(
+            "{} disappeared before it could be verified",
+            backup_path.display()
+        )
+    })?;
+    let mut originals = recorded_applied();
+    for (id, value) in original_settings(exported_xml, settings) {
+        if !originals.iter().any(|(recorded, _)| *recorded == id) {
+            originals.push((id, value));
         }
     }
-    let text: Vec<String> = ids.iter().map(u32::to_string).collect();
+    let text: Vec<String> = originals
+        .iter()
+        .map(|(id, value)| format!("{id}={value}"))
+        .collect();
     write_no_follow(&path, &text.join("\n"))
         .map_err(|e| format!("could not save {}: {e}", path.display()))
 }
 
-/// Read back the ids recorded by [`record_applied`]; empty when none survived.
-pub fn recorded_applied() -> Vec<u32> {
+/// Read back original values recorded by [`record_applied`]. Legacy id-only
+/// records fall back to the old documented-default behavior.
+pub fn recorded_applied() -> Vec<(u32, u32)> {
     let Some(path) = applied_record_path() else {
         return Vec::new();
     };
     std::fs::read_to_string(path)
-        .map(|text| text.lines().filter_map(|l| l.trim().parse().ok()).collect())
+        .map(|text| parse_applied_record(&text))
         .unwrap_or_default()
+}
+
+fn parse_applied_record(text: &str) -> Vec<(u32, u32)> {
+    let mut originals = Vec::new();
+    for line in text.lines().map(str::trim) {
+        let parsed = if let Some((id, value)) = line.split_once('=') {
+            id.parse().ok().zip(value.parse().ok())
+        } else {
+            line.parse()
+                .ok()
+                .and_then(|id| default_value(id).map(|value| (id, value)))
+        };
+        let Some((id, value)) = parsed else {
+            continue;
+        };
+        if default_value(id).is_some() && !originals.iter().any(|(recorded, _)| *recorded == id) {
+            originals.push((id, value));
+        }
+    }
+    originals
 }
 
 /// Write a file without following a reparse point planted at its path.
@@ -217,64 +394,26 @@ pub fn recorded_applied() -> Vec<u32> {
 /// planted here would be followed with the administrator token and truncate
 /// whatever it points at.
 pub fn write_no_follow(path: &Path, text: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    #[cfg(windows)]
-    use std::os::windows::fs::OpenOptionsExt;
+    crate::gameconfig::write_atomic_bytes(path, text.as_bytes())
+}
 
-    // Write a sibling and replace, rather than truncating in place. This file
-    // is the *only* record of which driver settings this app changed: a
-    // truncate that then fails to finish — disk full, a killed process, power
-    // loss — would leave the overrides applied with an empty or half-written
-    // list, and Undo could no longer reverse them. The replace is the last
-    // step, so the old contents survive every failure before it.
-    let tmp = path.with_extension("tmp");
+/// Forget the undo records once the profile has been restored.
+pub fn clear_applied_record() -> Result<(), String> {
+    // Remove the legacy id list first. If either deletion fails, apply remains
+    // blocked by `has_restore_record`, so no stale state can seed a new cycle.
+    for path in [applied_record_path(), profile_backup_path()]
+        .into_iter()
+        .flatten()
     {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(windows)]
-        {
-            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-        }
-        let mut file = options.open(&tmp)?;
-        file.write_all(text.as_bytes())?;
-        file.sync_all()?;
-    }
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!("could not remove {}: {error}", path.display()));
+            }
         }
     }
-}
-
-/// Forget the applied-settings record once the profile has been restored.
-pub fn clear_applied_record() {
-    if let Some(path) = applied_record_path() {
-        let _ = std::fs::remove_file(path);
-    }
-}
-
-/// Put the record back to `previous`, used when an apply is recorded and then
-/// never reaches the driver.
-///
-/// The record has to be written *before* the job runs — a crash mid-import must
-/// not leave settings changed with no note of which ones. But a job that fails
-/// before the import (staging, spawning, an inspector that never starts) leaves
-/// ids attributed to this app that it never wrote, and a later Restore would
-/// then reset the user's own values for them. Rewinding on a failure that is
-/// known to precede the import keeps the record honest in both directions.
-pub fn restore_applied_record(previous: &[u32]) {
-    if previous.is_empty() {
-        clear_applied_record();
-        return;
-    }
-    let Some(path) = applied_record_path() else {
-        return;
-    };
-    let text: Vec<String> = previous.iter().map(u32::to_string).collect();
-    let _ = write_no_follow(&path, &text.join("\n"));
+    Ok(())
 }
 
 /// Render the `.nip` XML for the Black Desert profile with the given settings.
@@ -487,14 +626,6 @@ pub mod worker {
     /// What a finished driver job reports.
     pub struct DriverOutcome {
         pub result: Result<String, String>,
-        /// Whether the merge-import actually ran.
-        ///
-        /// A failure is *not* proof the profile is untouched: the import
-        /// completes before the verification export, so an export timeout or a
-        /// mismatch fails a job whose settings did land. Callers use this to
-        /// decide whether the applied-settings record may be rewound — doing
-        /// that after a real write would leave changed values with no undo.
-        pub imported: bool,
     }
 
     impl DriverWorker {
@@ -529,7 +660,7 @@ pub mod worker {
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = cancel.clone();
         let thread = std::thread::spawn(move || {
-            let _ = tx.send(run(&exe, &settings, &flag));
+            let _ = tx.send(run(&exe, &settings, label, &flag));
         });
         DriverWorker {
             rx,
@@ -542,18 +673,18 @@ pub mod worker {
     fn run(
         exe: &Path,
         settings: &[(u32, u32)],
+        label: &'static str,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> DriverOutcome {
-        let mut imported = false;
-        let result = run_job(exe, settings, cancel, &mut imported);
-        DriverOutcome { result, imported }
+        let result = run_job(exe, settings, label, cancel);
+        DriverOutcome { result }
     }
 
     fn run_job(
         exe: &Path,
         settings: &[(u32, u32)],
+        label: &'static str,
         cancel: &std::sync::atomic::AtomicBool,
-        imported: &mut bool,
     ) -> Result<String, String> {
         // In-process serialisation only. The *machine-wide* `DriverLock` is
         // held by the caller for the whole transaction — from before the
@@ -601,7 +732,18 @@ pub mod worker {
                 return Err(e);
             }
         };
-        let outcome = run_in(&exe, &run_dir, settings, cancel, imported);
+        let outcome = if label == "apply" {
+            export_profile(&exe, &run_dir, cancel)
+                .and_then(|exported| {
+                    super::record_applied(settings, &super::decode_export(&exported))
+                })
+                .and_then(|()| run_in(&exe, &run_dir, settings, cancel))
+        } else {
+            match super::read_profile_backup()? {
+                Some(backup) => run_restore_in(&exe, &run_dir, &backup, cancel),
+                None => run_in(&exe, &run_dir, settings, cancel),
+            }
+        };
         // Release the pin *before* clearing up. It is opened `FILE_SHARE_READ`
         // only, which denies delete — so leaving it open made `remove_dir_all`
         // fail silently and every apply or restore left a copy of the inspector,
@@ -666,34 +808,10 @@ pub mod worker {
         exe_dir: &Path,
         settings: &[(u32, u32)],
         cancel: &std::sync::atomic::AtomicBool,
-        imported: &mut bool,
     ) -> Result<String, String> {
-        // 1. Write the .nip into a private directory and merge-import it.
-        //    `create_dir` fails if the name already exists, so winning that call
-        //    proves exclusive ownership: no other process can have pre-created
-        //    the path and no shared, predictable file is handed to the elevated
-        //    child for it to re-open.
-        let job_dir = crate::privdir::create("bdo-optimizer-nvidia-job")?;
-        let nip = job_dir.join("profile.nip");
-        let import = write_payload(&nip, settings).and_then(|payload| {
-            // Hold the payload open with FILE_SHARE_READ for the whole import.
-            // Writing then closing it would leave a window in which another
-            // process could swap the file the elevated child re-opens by path;
-            // this handle lets the child read it and nobody rewrite it.
-            let nip_arg = nip.to_string_lossy().into_owned();
-            let result = run_inspector_cancellable(
-                exe,
-                &["-mergeImport", "-silentImport", &nip_arg],
-                cancel,
-            );
-            drop(payload);
-            result
-        });
-        let _ = std::fs::remove_dir_all(&job_dir);
-        import?;
+        import_xml(exe, &super::nip_xml(settings), "-mergeImport", cancel)?;
         // Past this point the driver profile has been written. A later failure
         // is a *verification* failure, not proof that nothing changed.
-        *imported = true;
         if cancelled(cancel) {
             return Err("cancelled after the profile was written".to_string());
         }
@@ -707,21 +825,7 @@ pub mod worker {
         // private directory removes the problem instead of managing it: this
         // folder was created empty moments ago and nothing else can see it, so
         // whatever is here now came from the call above.
-        run_inspector_cancellable(exe, &["-exportCustomized"], cancel)?;
-        let created = export_files(exe_dir);
-        let export = match created.as_slice() {
-            [only] => only,
-            [] => return Err("verification export produced no file".to_string()),
-            many => {
-                return Err(format!(
-                    "Profile Inspector wrote {} exports into its own private folder, so this \
-                     run's export could not be identified.",
-                    many.len()
-                ))
-            }
-        };
-        let bytes = std::fs::read(export)
-            .map_err(|e| format!("could not read {}: {e}", export.display()))?;
+        let bytes = export_profile(exe, exe_dir, cancel)?;
 
         if super::export_confirms(&super::decode_export(&bytes), settings) {
             Ok(format!(
@@ -747,6 +851,72 @@ pub mod worker {
         }
     }
 
+    fn run_restore_in(
+        exe: &Path,
+        exe_dir: &Path,
+        backup: &super::ProfileBackup,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<String, String> {
+        // Replace-import resets only the Black Desert profile, then imports its
+        // complete pre-apply snapshot. Unlike a merge, that restores settings
+        // which were absent and inherited globally instead of pinning defaults.
+        import_xml(exe, &backup.payload(), "-replaceImport", cancel)?;
+        if cancelled(cancel) {
+            return Err("cancelled after the profile was restored".to_string());
+        }
+        let bytes = export_profile(exe, exe_dir, cancel)?;
+        if super::profile_backup_matches(backup, &super::decode_export(&bytes)) {
+            Ok("Verified: the complete pre-apply Black Desert profile was restored.".to_string())
+        } else {
+            Err("Restore ran but the exported Black Desert profile does not match the saved pre-apply state.".to_string())
+        }
+    }
+
+    fn import_xml(
+        exe: &Path,
+        xml: &str,
+        mode: &str,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), String> {
+        // `create_dir` fails if the name already exists, so no shared,
+        // predictable payload is handed to the elevated child.
+        let job_dir = crate::privdir::create("bdo-optimizer-nvidia-job")?;
+        let nip = job_dir.join("profile.nip");
+        let import = write_payload(&nip, xml).and_then(|payload| {
+            let nip_arg = nip.to_string_lossy().into_owned();
+            let result = run_inspector_cancellable(exe, &[mode, "-silentImport", &nip_arg], cancel);
+            drop(payload);
+            result
+        });
+        let _ = std::fs::remove_dir_all(&job_dir);
+        import
+    }
+
+    fn export_profile(
+        exe: &Path,
+        exe_dir: &Path,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Vec<u8>, String> {
+        run_inspector_cancellable(exe, &["-exportCustomized"], cancel)?;
+        let created = export_files(exe_dir);
+        let export = match created.as_slice() {
+            [only] => only,
+            [] => return Err("Profile Inspector export produced no file".to_string()),
+            many => {
+                return Err(format!(
+                    "Profile Inspector wrote {} exports into its private folder, so this \
+                     run's export could not be identified.",
+                    many.len()
+                ))
+            }
+        };
+        let bytes = std::fs::read(export)
+            .map_err(|e| format!("could not read {}: {e}", export.display()))?;
+        std::fs::remove_file(export)
+            .map_err(|e| format!("could not remove {}: {e}", export.display()))?;
+        Ok(bytes)
+    }
+
     /// Create the import payload and return a **read** handle to hold while the
     /// child runs.
     ///
@@ -761,12 +931,12 @@ pub mod worker {
     /// bytes are compared against what was written, which closes the brief
     /// close-then-reopen window: a swap in between fails the comparison instead
     /// of being imported.
-    fn write_payload(nip: &Path, settings: &[(u32, u32)]) -> Result<std::fs::File, String> {
+    fn write_payload(nip: &Path, xml: &str) -> Result<std::fs::File, String> {
         use std::io::{Read, Write};
         use std::os::windows::fs::OpenOptionsExt;
         const FILE_SHARE_READ: u32 = 0x0000_0001;
 
-        let expected = super::utf16le_bytes(&super::nip_xml(settings));
+        let expected = super::utf16le_bytes(xml);
         {
             let mut writer = std::fs::OpenOptions::new()
                 .write(true)
@@ -893,7 +1063,7 @@ pub mod worker {
             let dir = crate::privdir::create("bdo-nvidia-test").expect("private dir");
             let nip = dir.join("profile.nip");
             let settings = super::super::guide_settings(8, true);
-            let held = write_payload(&nip, &settings).expect("payload");
+            let held = write_payload(&nip, &super::super::nip_xml(&settings)).expect("payload");
 
             // Mirrors how a .NET reader opens a file: read access, shared for
             // reading only.
@@ -916,7 +1086,6 @@ pub mod worker {
             drop(held);
             let _ = std::fs::remove_dir_all(dir);
         }
-
     }
 }
 
@@ -949,7 +1118,7 @@ mod tests {
     /// user had set up themselves.
     #[test]
     fn restore_covers_only_what_was_applied() {
-        let applied: Vec<u32> = guide_settings(8, false).iter().map(|(id, _)| *id).collect();
+        let applied = original_settings(&nip_xml(&default_settings()), &guide_settings(8, false));
         let restore = restore_settings(&applied);
         assert_eq!(restore.len(), 3, "{restore:?}");
         for id in [ULL_ENABLED, ULL_CPL_STATE, MAX_PRERENDERED_FRAMES] {
@@ -960,8 +1129,51 @@ mod tests {
         }
 
         // With ULL on, all six were written, so all six come back.
-        let with_ull: Vec<u32> = guide_settings(8, true).iter().map(|(id, _)| *id).collect();
+        let with_ull = original_settings(&nip_xml(&default_settings()), &guide_settings(8, true));
         assert_eq!(restore_settings(&with_ull).len(), 6);
+    }
+
+    #[test]
+    fn restore_preserves_custom_values_from_the_pre_apply_export() {
+        let settings = guide_settings(8, false);
+        let export = nip_xml(&[
+            (THREADED_OPTIMIZATION, 2),
+            (ANSEL_ENABLE, 1),
+            (POWER_MANAGEMENT_MODE, 3),
+        ]);
+
+        assert_eq!(
+            original_settings(&export, &settings),
+            vec![
+                (THREADED_OPTIMIZATION, 2),
+                (ANSEL_ENABLE, 1),
+                (POWER_MANAGEMENT_MODE, 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn full_profile_backup_preserves_presence_and_absence() {
+        let export = nip_xml(&[(POWER_MANAGEMENT_MODE, 3)]);
+        let present = backup_from_export(&export);
+        assert!(profile_backup_matches(&present, &export));
+        assert!(!profile_backup_matches(
+            &present,
+            &nip_xml(&[(POWER_MANAGEMENT_MODE, 5)])
+        ));
+
+        let absent = backup_from_export("<ArrayOfProfile />");
+        assert!(profile_backup_matches(&absent, "<ArrayOfProfile />"));
+        assert!(!profile_backup_matches(&absent, &export));
+    }
+
+    #[test]
+    fn applied_record_rejects_unknown_and_duplicate_ids() {
+        let known = THREADED_OPTIMIZATION;
+        assert_eq!(
+            parse_applied_record(&format!("999=1\n{known}=2\n{known}=9\nbad")),
+            vec![(known, 2)]
+        );
     }
 
     /// No record means no evidence this app ever wrote the profile. Assuming
@@ -1040,7 +1252,7 @@ mod tests {
         assert_eq!(cands[0], PathBuf::from("/opt/bdo").join(INSPECTOR_EXE));
     }
 
-    /// Full pipeline against the real driver database: restore defaults, verify,
+    /// Full pipeline against the real driver database: restore a legacy default set, verify,
     /// then re-apply the guide profile (with ULL) and verify again. Both legs
     /// really change driver values, so this proves imports write — and it ends
     /// on the guide configuration. Requires an NVIDIA GPU and elevation:

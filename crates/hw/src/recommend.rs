@@ -10,7 +10,7 @@
 //! classes, L3 domains, and SMT siblings. The table is the guide's voice; the
 //! derivation is what keeps the app useful on hardware the guide never saw.
 
-use crate::cpu::{vcache_ccd, CpuInfo};
+use crate::cpu::{vcache_ccd_for_cpu, CpuInfo};
 use crate::mask::{cores_to_mask, mask_to_cores, normalize_hex};
 
 /// A recommended affinity configuration for BDO.
@@ -141,7 +141,7 @@ fn apply_x3d_topology(rec: &mut Recommendation, cpu: &CpuInfo) {
         return;
     }
 
-    match vcache_ccd(&cpu.l3_domains) {
+    match vcache_ccd_for_cpu(cpu) {
         Some(ccd) => {
             // One thread per physical core within the V-Cache CCD. Real SMT
             // sibling data is used when available; the fallback assumes evens
@@ -506,7 +506,7 @@ fn derive_from_topology(cpu: &CpuInfo) -> Option<Recommendation> {
     }
 
     // --- X3D-style V-Cache: one L3 domain far larger than the rest. ---
-    if let Some(ccd) = vcache_ccd(&cpu.l3_domains) {
+    if let Some(ccd) = vcache_ccd_for_cpu(cpu) {
         let cores = one_thread_per_core(cpu, Some(&ccd.logical_cores));
         return from_cores(
             cores,
@@ -742,7 +742,11 @@ mod tests {
             "every selected processor must exist: {:?}",
             rec.cores
         );
-        assert!(rec.explanation.contains("does not fit"), "{}", rec.explanation);
+        assert!(
+            rec.explanation.contains("does not fit"),
+            "{}",
+            rec.explanation
+        );
     }
 
     #[test]

@@ -6,7 +6,9 @@
 //! file writing. The BDO-specific apply/verify entry points return
 //! [`LaunchError::UnsupportedPlatform`].
 
-use crate::common::{desktop_file_content, generate_taskset_command, mask_to_cores, LaunchMethod};
+use crate::common::{
+    desktop_file_content, generate_taskset_command, mask_to_cores, validate_mask, LaunchMethod,
+};
 use crate::error::LaunchError;
 use crate::ShortcutOptions;
 use std::path::{Path, PathBuf};
@@ -22,6 +24,7 @@ pub fn launch_with_affinity(
     mask: u64,
     _steam: bool,
 ) -> Result<LaunchMethod, LaunchError> {
+    validate_mask(mask, None)?;
     if !launcher_path.exists() {
         return Err(LaunchError::PathNotFound(launcher_path.to_path_buf()));
     }
@@ -31,22 +34,22 @@ pub fn launch_with_affinity(
     // become three arguments and `taskset` would try to execute `/home/me/My`.
     // `generate_taskset_command` still exists for the `.desktop` `Exec=` line,
     // which genuinely is text.
-    let child = if cores.is_empty() {
-        Command::new(launcher_path).spawn()
-    } else {
-        let list = cores
-            .iter()
-            .map(|c| c.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        Command::new("taskset")
-            .arg("-c")
-            .arg(list)
-            .arg(launcher_path)
-            .spawn()
-    }
-    .map_err(|e| LaunchError::Os(format!("failed to spawn: {e}")))?;
-    Ok(LaunchMethod::Direct { pid: child.id() })
+    let list = cores
+        .iter()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut child = Command::new("taskset")
+        .arg("-c")
+        .arg(list)
+        .arg(launcher_path)
+        .spawn()
+        .map_err(|e| LaunchError::Os(format!("failed to spawn: {e}")))?;
+    let pid = child.id();
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(LaunchMethod::Direct { pid })
 }
 
 /// Write a `.desktop` entry that launches the target with the mask's cores

@@ -627,7 +627,9 @@ fn staged_files(inner: &Path) -> Result<Vec<StagedFile>, String> {
     const FILE_SHARE_READ: u32 = 0x0000_0001;
 
     let mut files = Vec::new();
-    for entry in std::fs::read_dir(inner).map_err(|e| format!("could not read extracted folder: {e}"))? {
+    for entry in
+        std::fs::read_dir(inner).map_err(|e| format!("could not read extracted folder: {e}"))?
+    {
         // Never `.flatten()` here: a dropped entry is a file that silently does
         // not get installed, and the result is a new executable running beside
         // a stale PresentMon or inspector whose hash no longer matches.
@@ -658,7 +660,10 @@ fn staged_files(inner: &Path) -> Result<Vec<StagedFile>, String> {
     // a partial one commits the swap and only then discovers that capture or
     // the driver profile no longer works.
     for required in packaged_names() {
-        if !files.iter().any(|f| f.name == std::ffi::OsStr::new(required)) {
+        if !files
+            .iter()
+            .any(|f| f.name == std::ffi::OsStr::new(required))
+        {
             return Err(format!(
                 "the downloaded release is missing {required}, so it was not installed"
             ));
@@ -912,11 +917,13 @@ fn safe_ledger_entry(entry: &str) -> Option<&str> {
 /// deleting it, and demanding it be present afterwards would keep a ledger
 /// describing an install that is already fully undone.
 fn rolled_back_cleanly(dir: &Path, names: &[String]) -> bool {
-    names.iter().all(|entry| match entry.strip_prefix(LEDGER_NEW) {
-        // Created files are undone by deleting them.
-        Some(name) => !dir.join(name).exists(),
-        None => !dir.join(format!("{entry}.old")).exists(),
-    })
+    names
+        .iter()
+        .all(|entry| match entry.strip_prefix(LEDGER_NEW) {
+            // Created files are undone by deleting them.
+            Some(name) => !dir.join(name).exists(),
+            None => !dir.join(format!("{entry}.old")).exists(),
+        })
 }
 
 fn install_recorded(staged: &mut [StagedFile], app_dir: &Path) -> Result<(), String> {
@@ -1398,7 +1405,10 @@ mod tests {
             );
         }
         // Ordinary entries still pass, with and without the created marker.
-        assert_eq!(safe_ledger_entry("bdo-optimizer.exe"), Some("bdo-optimizer.exe"));
+        assert_eq!(
+            safe_ledger_entry("bdo-optimizer.exe"),
+            Some("bdo-optimizer.exe")
+        );
         assert_eq!(safe_ledger_entry("+README.md"), Some("+README.md"));
     }
 
@@ -1412,7 +1422,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("bdo-optimizer.exe"), b"half-installed").unwrap();
         std::fs::write(dir.join("bdo-optimizer.exe.old"), b"the real old exe").unwrap();
-        write_ledger(&dir.join(INSTALL_LEDGER), LEDGER_PENDING, &["bdo-optimizer.exe".to_string()]).unwrap();
+        write_ledger(
+            &dir.join(INSTALL_LEDGER),
+            LEDGER_PENDING,
+            &["bdo-optimizer.exe".to_string()],
+        )
+        .unwrap();
 
         // Hold the destination open exclusively so it cannot be moved aside —
         // the same thing a still-running executable or an antivirus does.
@@ -1449,7 +1464,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         // Simulate a crash after the executable was renamed aside.
         std::fs::write(dir.join("bdo-optimizer.exe.old"), b"old exe").unwrap();
-        write_ledger(&dir.join(INSTALL_LEDGER), LEDGER_PENDING, &["bdo-optimizer.exe".to_string()]).unwrap();
+        write_ledger(
+            &dir.join(INSTALL_LEDGER),
+            LEDGER_PENDING,
+            &["bdo-optimizer.exe".to_string()],
+        )
+        .unwrap();
         // An unrelated backup that is none of our business.
         std::fs::write(dir.join("settings.old"), b"someone else's").unwrap();
 

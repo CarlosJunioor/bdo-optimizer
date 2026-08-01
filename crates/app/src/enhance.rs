@@ -5,7 +5,7 @@
 //! enhancement tier, and PEN is a fully applied setup. A failed step fails
 //! the enhance; a clean run means the optimization succeeded.
 
-use egui::{Color32, FontId, Pos2, Rect, RichText, Sense, Shape, Stroke, pos2, vec2};
+use egui::{pos2, vec2, Color32, FontId, Pos2, Rect, RichText, Sense, Shape, Stroke};
 use egui_phosphor::regular as icons;
 
 use crate::theme::ERR;
@@ -121,7 +121,15 @@ fn arc(p: &egui::Painter, c: Pos2, r: f32, start: f32, sweep: f32, stroke: Strok
     p.add(Shape::line(pts, stroke));
 }
 
-fn dashed_circle(p: &egui::Painter, c: Pos2, r: f32, stroke: Stroke, dash: f32, gap: f32, phase: f32) {
+fn dashed_circle(
+    p: &egui::Painter,
+    c: Pos2,
+    r: f32,
+    stroke: Stroke,
+    dash: f32,
+    gap: f32,
+    phase: f32,
+) {
     let step = dash + gap;
     let n = ((TAU * r) / step).max(4.0) as usize;
     let da = TAU / n as f32;
@@ -176,7 +184,13 @@ fn slot(
 fn material_icon(p: &egui::Painter, c: Pos2) {
     let s = |dx: f32, dy: f32| pos2(c.x + dx, c.y + dy);
     p.add(Shape::convex_polygon(
-        vec![s(0.0, -11.0), s(9.0, -4.0), s(5.5, 11.0), s(-5.5, 11.0), s(-9.0, -4.0)],
+        vec![
+            s(0.0, -11.0),
+            s(9.0, -4.0),
+            s(5.5, 11.0),
+            s(-5.5, 11.0),
+            s(-9.0, -4.0),
+        ],
         Color32::from_rgb(0xCA, 0xA3, 0x38),
         Stroke::NONE,
     ));
@@ -195,8 +209,16 @@ fn material_icon(p: &egui::Painter, c: Pos2) {
 /// The "protection" stone: teal orb, like a cron/valks item.
 fn protection_icon(p: &egui::Painter, c: Pos2) {
     p.circle_filled(c, 10.0, TEAL);
-    p.circle_filled(c + vec2(-3.0, -3.5), 4.0, Color32::from_rgb(0x8F, 0xF0, 0xDD));
-    p.circle_stroke(c, 10.0, Stroke::new(1.5, Color32::from_rgb(0x1D, 0x7A, 0x6B)));
+    p.circle_filled(
+        c + vec2(-3.0, -3.5),
+        4.0,
+        Color32::from_rgb(0x8F, 0xF0, 0xDD),
+    );
+    p.circle_stroke(
+        c,
+        10.0,
+        Stroke::new(1.5, Color32::from_rgb(0x1D, 0x7A, 0x6B)),
+    );
 }
 
 /// Short coin label for a real step name.
@@ -262,13 +284,7 @@ pub(crate) fn draw(ui: &mut egui::Ui, logo: &egui::TextureHandle, view: &Enhance
     }
     for frac in [0.26, 0.74] {
         let x = rect.left() + rect.width() * frac;
-        diamond(
-            p,
-            pos2(x, rail_y),
-            6.0,
-            BRONZE,
-            Stroke::new(1.0, GOLD),
-        );
+        diamond(p, pos2(x, rail_y), 6.0, BRONZE, Stroke::new(1.0, GOLD));
     }
     // Flame diamond at the far right of the rail.
     let flame_c = pos2(rect.right() - 30.0, rail_y);
@@ -343,12 +359,23 @@ pub(crate) fn draw(ui: &mut egui::Ui, logo: &egui::TextureHandle, view: &Enhance
     // Progress arc, glow underneath.
     let sweep = TAU * view.progress.clamp(0.0, 1.0);
     let start = -TAU / 4.0;
-    arc(p, center, 108.0, start, sweep, Stroke::new(7.0, alpha(AMBER, 0.25)));
+    arc(
+        p,
+        center,
+        108.0,
+        start,
+        sweep,
+        Stroke::new(7.0, alpha(AMBER, 0.25)),
+    );
     arc(p, center, 108.0, start, sweep, Stroke::new(3.0, AMBER));
 
     // Emblem: glow cloud, rotated-diamond frame, gold square, the app mask.
     let pulse = 0.5 + 0.5 * (t * 2.6).sin();
-    let glow = if view.finale > 0.0 && !view.failed { 1.0 } else { pulse };
+    let glow = if view.finale > 0.0 && !view.failed {
+        1.0
+    } else {
+        pulse
+    };
     for (r, a) in [(66.0, 0.08), (50.0, 0.12), (40.0, 0.10)] {
         p.circle_filled(center, r, alpha(GOLD_HI, a * (0.7 + 0.6 * glow)));
     }
@@ -413,7 +440,10 @@ pub(crate) fn draw(ui: &mut egui::Ui, logo: &egui::TextureHandle, view: &Enhance
     // Bottom-right of the core: the top corners are taken by the chance block
     // and the protection slot.
     let pill = Rect::from_center_size(
-        pos2((center.x + 172.0).min(rect.right() - 90.0), center.y + 108.0),
+        pos2(
+            (center.x + 172.0).min(rect.right() - 90.0),
+            center.y + 108.0,
+        ),
         galley.size() + vec2(28.0, 14.0),
     );
     p.rect(
@@ -423,7 +453,11 @@ pub(crate) fn draw(ui: &mut egui::Ui, logo: &egui::TextureHandle, view: &Enhance
         Stroke::new(1.5, BRONZE),
         egui::StrokeKind::Inside,
     );
-    p.galley(pill.center() - galley.size() / 2.0, galley, crate::theme::INK);
+    p.galley(
+        pill.center() - galley.size() / 2.0,
+        galley,
+        crate::theme::INK,
+    );
 
     p.text(
         pos2(center.x, center.y - 66.0),
@@ -446,14 +480,23 @@ pub(crate) fn draw(ui: &mut egui::Ui, logo: &egui::TextureHandle, view: &Enhance
     p.text(
         pos2(ch_x, ch_top),
         egui::Align2::CENTER_TOP,
-        if view.undoing { "EXTRACTION CHANCE" } else { "OPTIMIZATION CHANCE" },
+        if view.undoing {
+            "EXTRACTION CHANCE"
+        } else {
+            "OPTIMIZATION CHANCE"
+        },
         display(12.0),
         GOLD_SOFT,
     );
     p.text(
         pos2(ch_x, ch_top + 22.0),
         egui::Align2::CENTER_TOP,
-        format!("{} {} CORES · 0x{}", icons::CPU, view.mask_cores, view.mask_hex.to_uppercase()),
+        format!(
+            "{} {} CORES · 0x{}",
+            icons::CPU,
+            view.mask_cores,
+            view.mask_hex.to_uppercase()
+        ),
         mono(11.5),
         crate::theme::INK,
     );
@@ -524,7 +567,10 @@ pub(crate) fn draw(ui: &mut egui::Ui, logo: &egui::TextureHandle, view: &Enhance
             let c = pos2(x, cy);
             if i > 0 {
                 p.line_segment(
-                    [pos2(x - coin_d / 2.0 - link, cy), pos2(x - coin_d / 2.0, cy)],
+                    [
+                        pos2(x - coin_d / 2.0 - link, cy),
+                        pos2(x - coin_d / 2.0, cy),
+                    ],
                     Stroke::new(2.0, alpha(BRONZE, 0.8)),
                 );
             }
@@ -550,7 +596,13 @@ pub(crate) fn draw(ui: &mut egui::Ui, logo: &egui::TextureHandle, view: &Enhance
             p.circle_stroke(c, r, Stroke::new(1.5, ring));
             match (revealed, outcome) {
                 (true, Some(true)) => {
-                    p.text(c, egui::Align2::CENTER_CENTER, icons::CHECK, body(16.0), YELLOW);
+                    p.text(
+                        c,
+                        egui::Align2::CENTER_CENTER,
+                        icons::CHECK,
+                        body(16.0),
+                        YELLOW,
+                    );
                 }
                 (true, Some(false)) => {
                     p.text(c, egui::Align2::CENTER_CENTER, icons::X, body(16.0), ERR);
@@ -671,11 +723,11 @@ mod tests {
         failed_run[1] = ("Game config files".into(), Err("locked".into()));
 
         let paint = |steps: &[(String, Result<String, String>)],
-                         pending: Option<&str>,
-                         visible: usize,
-                         progress: f32,
-                         finale: f32,
-                         undoing: bool| {
+                     pending: Option<&str>,
+                     visible: usize,
+                     progress: f32,
+                     finale: f32,
+                     undoing: bool| {
             let view = EnhanceView {
                 steps,
                 pending_driver: pending,

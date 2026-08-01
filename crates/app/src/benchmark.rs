@@ -287,7 +287,10 @@ impl App {
             } else {
                 verified
             };
-            let can_start = !capturing && self.benchmark.presentmon.is_some() && mode_ready;
+            let can_start = !capturing
+                && self.benchmark.elevated
+                && self.benchmark.presentmon.is_some()
+                && mode_ready;
             let start_label = if self.benchmark.baseline_capture {
                 "Start baseline capture"
             } else {
@@ -578,6 +581,10 @@ impl App {
                 .weak(),
         );
 
+        if let Some(error) = &self.benchmark.store_error {
+            ui.label(RichText::new(format!("Session storage error: {error}")).color(ERR));
+        }
+
         if self.benchmark.sessions.is_empty() {
             ui.add_space(4.0);
             ui.label(
@@ -707,8 +714,10 @@ impl App {
         );
 
         if let Some(stem) = delete_stem {
-            let _ = SessionStore::new(&self.benchmark.store_dir).delete(&stem);
-            self.benchmark.reload();
+            match SessionStore::new(&self.benchmark.store_dir).delete(&stem) {
+                Ok(()) => self.benchmark.reload(),
+                Err(error) => self.benchmark.store_error = Some(error.to_string()),
+            }
         }
     }
 

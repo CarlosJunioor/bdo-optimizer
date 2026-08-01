@@ -76,8 +76,6 @@ jobs:
           "zip=$dir.zip"    >> $env:GITHUB_OUTPUT
           "sha256=$hash"    >> $env:GITHUB_OUTPUT
 
-      # The "What's new" section is a placeholder: fill it with short bullets
-      # after publishing (gh release edit <tag> --notes-file ...).
       - name: Write release notes
         shell: pwsh
         env:
@@ -87,7 +85,10 @@ jobs:
           @'
           ## What's new in __TAG__
 
-          - _Changelog pending — see the commit history for now._
+          - Hardened the updater, release workflow, and privileged Windows operations.
+          - Made NVIDIA profile changes reversible without losing existing custom values.
+          - Fixed CPU topology and V-Cache detection across processor groups.
+          - Improved benchmark CSV parsing, session error reporting, and launch reliability.
 
           ## How to download
 
@@ -98,7 +99,7 @@ jobs:
           **Good to know:**
 
           - Keep all files in the same folder — FPS capture and NVIDIA tweaks need the bundled tools next to the exe.
-          - FPS capture needs **Run as administrator**. Everything else works without it.
+          - FPS capture and NVIDIA profile tweaks need **Run as administrator**.
           - SmartScreen warning on first run? The build is unsigned: click *More info* -> *Run anyway*.
 
           <details>

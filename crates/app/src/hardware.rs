@@ -2,7 +2,7 @@
 
 use egui::RichText;
 
-use bdo_hw::{vcache_ccd, GpuDeviceType, GpuVendor};
+use bdo_hw::{vcache_ccd_for_cpu, GpuDeviceType, GpuVendor};
 
 use crate::app::{App, Tab};
 use crate::format;
@@ -90,7 +90,7 @@ impl App {
                     });
             }
 
-            let vcache = vcache_ccd(&det.cpu.l3_domains);
+            let vcache = vcache_ccd_for_cpu(&det.cpu);
             if !det.cpu.l3_domains.is_empty() {
                 ui.add_space(8.0);
                 ui.label(RichText::new("L3 domains / CCDs").strong());

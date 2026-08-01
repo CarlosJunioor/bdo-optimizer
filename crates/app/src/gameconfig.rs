@@ -371,7 +371,13 @@ pub fn patch_game_variable_to(
         // `managed_values` reads them in — these files carry one copy per
         // in-game settings preset, each with its own value.
         let mut nth = 0;
-        text = set_attr_values(&text, &element, &mut nth, &|i| value_for(tweak, i), &mut stats);
+        text = set_attr_values(
+            &text,
+            &element,
+            &mut nth,
+            &|i| value_for(tweak, i),
+            &mut stats,
+        );
         text = set_game_option_values(
             &text,
             tweak.xml_key,
@@ -944,7 +950,7 @@ fn encode_latin1(text: &str) -> Vec<u8> {
         .collect()
 }
 
-fn write_atomic_bytes(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_atomic_bytes(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
     let (mut file, tmp) = create_temp_sibling(path)?;
@@ -1002,7 +1008,7 @@ fn backup_is_readable(backup: &Path) -> bool {
 /// Write `contents` to `path` only if nothing is there, leaving any existing
 /// file untouched. Used for the one-time backup, where an existing copy is
 /// always the more valuable one.
-fn write_new_only(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_new_only(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
     let (mut file, tmp) = create_temp_sibling(path)?;
@@ -1557,8 +1563,7 @@ mod tests {
             "our settings must be reverted to their originals: {restored}"
         );
         assert!(
-            restored.contains("Resolution = 2560x1440")
-                && restored.contains("MasterVolume = 80"),
+            restored.contains("Resolution = 2560x1440") && restored.contains("MasterVolume = 80"),
             "changes made after the apply must survive the undo: {restored}"
         );
 

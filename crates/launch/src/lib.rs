@@ -49,10 +49,9 @@ mod common;
 mod error;
 
 pub use common::{
-    ProcessAffinity,
     build_cmd_arguments, build_launch_command_line, desktop_file_content, generate_taskset_command,
     mask_to_cores, mask_to_hex, parse_mask_hex, shortcut_description, validate_mask, LaunchMethod,
-    ShortcutOptions, DEFAULT_SHORTCUT_NAME, GAME_EXE, LAUNCHER_EXE,
+    ProcessAffinity, ShortcutOptions, DEFAULT_SHORTCUT_NAME, GAME_EXE, LAUNCHER_EXE,
 };
 pub use error::LaunchError;
 
@@ -60,15 +59,16 @@ pub use error::LaunchError;
 mod win;
 #[cfg(windows)]
 pub use win::{
-    create_shortcut, find_bdo_install, is_elevated, launch_with_affinity, read_process_affinity, read_process_affinity_with_pid,
+    create_shortcut, find_bdo_install, is_elevated, launch_with_affinity, read_process_affinity,
+    read_process_affinity_with_pid,
 };
 
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::{
-    create_shortcut, find_bdo_install, launch_with_affinity, read_process_affinity, read_process_affinity_with_pid,
-    write_desktop_file,
+    create_shortcut, find_bdo_install, launch_with_affinity, read_process_affinity,
+    read_process_affinity_with_pid, write_desktop_file,
 };
 
 #[cfg(target_os = "macos")]

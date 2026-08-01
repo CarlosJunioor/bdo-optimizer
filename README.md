@@ -58,7 +58,7 @@ The affinity recommendations are based on
 | 🛡️ **Applies affinity without touching the running game** | BDO inherits the mask from `BlackDesertLauncher.exe`. |
 | ✅ **Verifies before measuring** | The app reads the running process affinity and blocks an optimized capture until it matches the selected mask. |
 | 📊 **Compares against a real baseline** | Saved runs contain raw frame times and locally calculated average FPS, P1 low, and time-weighted low metrics. |
-| 🟩 **Applies the guide's NVIDIA driver-profile tweaks** *(optional)* | Merge-imports the per-game "Black Desert" profile through the bundled NVIDIA Profile Inspector and verifies the result against the driver database. Nothing global changes, and one click restores driver defaults. |
+| 🟩 **Applies the guide's NVIDIA driver-profile tweaks** *(optional)* | Merge-imports the per-game "Black Desert" profile through the bundled NVIDIA Profile Inspector and verifies the result against the driver database. Nothing global changes, and one click restores the previous profile. |
 | 🟥 **Guides AMD Radeon users through the guide's driver settings** | On AMD GPUs the app shows the exact Adrenalin steps (Enhanced Sync on, Wait for Vertical Refresh off, per-game). Manual by design — AMD offers no safe way for an external app to write per-game driver profiles. |
 | 📝 **Applies the guide's config-file tweaks** *(optional)* | Sets PostFilter and Tessellation off in `GameOption.txt` and every UserCache `gamevariable.xml`, backing each file up first, with a one-click restore. |
 | ⚡ **Applies the safe settings in one click** | The config-file tweaks, Windows' "Optimizations for windowed games", and — when the app runs as administrator on an NVIDIA GPU — the driver profile, each reported as its own step and reversed by one **Undo all of it**. Memory compression and HAGS stay on their own buttons: one needs a reboot, the other affects every application. |
@@ -161,7 +161,7 @@ Affinity is applied only to that launch chain. To restore the default:
 > driver settings, global Windows settings, registry priority tweaks, or the
 > running game process. The only driver change it can make is the optional,
 > user-initiated NVIDIA per-game "Black Desert" profile described below — and
-> that has its own **Restore driver defaults** button.
+> that has its own **Restore previous settings** button.
 
 ---
 
@@ -187,8 +187,9 @@ own "Black Desert" profile:
   alone.
 - Every apply is **verified**: the app exports the driver database afterwards
   and confirms the profile really carries the expected values.
-- **Restore driver defaults** writes the documented default values back to the
-  same settings.
+- **Restore previous settings** replace-imports the complete Black Desert
+  profile snapshot saved before apply, including settings that previously
+  inherited a global value rather than carrying an explicit override.
 - Profile Inspector requires administrator rights, so the section offers the
   same **Restart as administrator** flow the Benchmark tab uses.
 

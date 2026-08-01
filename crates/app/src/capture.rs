@@ -127,11 +127,20 @@ pub struct CaptureParams {
 }
 
 /// Best-effort cleanup for the transient raw CSV on every worker exit path.
-struct RawCaptureCleanup(PathBuf);
+struct RawCaptureCleanup(Option<PathBuf>);
+
+impl RawCaptureCleanup {
+    fn keep(&mut self) {
+        self.0 = None;
+    }
+}
 
 impl Drop for RawCaptureCleanup {
     fn drop(&mut self) {
-        match std::fs::remove_file(&self.0) {
+        let Some(path) = &self.0 else {
+            return;
+        };
+        match std::fs::remove_file(path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => {}
@@ -239,7 +248,7 @@ fn run(p: CaptureParams, stop: Arc<AtomicBool>, tx: Sender<CaptureMsg>, ctx: egu
             return;
         }
     };
-    let _raw_capture_cleanup = RawCaptureCleanup(p.output_csv.clone());
+    let mut raw_capture_cleanup = RawCaptureCleanup(Some(p.output_csv.clone()));
 
     // Tail the growing CSV for live stats. Same process filter as the final parse,
     // so the running numbers match the saved session.
@@ -402,7 +411,11 @@ fn run(p: CaptureParams, stop: Arc<AtomicBool>, tx: Sender<CaptureMsg>, ctx: egu
             let _ = tx.send(CaptureMsg::Saved { frames: count });
         }
         Err(e) => {
-            let _ = tx.send(CaptureMsg::Error(format!("Failed to save session: {e}")));
+            raw_capture_cleanup.keep();
+            let _ = tx.send(CaptureMsg::Error(format!(
+                "Failed to save session: {e}. The raw capture was kept at {}",
+                p.output_csv.display()
+            )));
         }
     }
     ctx.request_repaint();
@@ -454,7 +467,19 @@ mod tests {
             std::process::id()
         ));
         std::fs::write(&path, "frame data").unwrap();
-        drop(RawCaptureCleanup(path.clone()));
+        drop(RawCaptureCleanup(Some(path.clone())));
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn raw_capture_cleanup_can_keep_a_failed_save() {
+        let path =
+            std::env::temp_dir().join(format!("bdo-capture-keep-test-{}.csv", std::process::id()));
+        std::fs::write(&path, "frame data").unwrap();
+        let mut cleanup = RawCaptureCleanup(Some(path.clone()));
+        cleanup.keep();
+        drop(cleanup);
+        assert!(path.exists());
+        std::fs::remove_file(path).unwrap();
     }
 }

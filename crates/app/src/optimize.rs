@@ -404,9 +404,12 @@ impl App {
                 crate::theme::section_card(ui, icons::CIRCUITRY, "Affinity", |ui| {
                     self.mask_section(ui)
                 });
-                crate::theme::section_card(ui, icons::ROCKET_LAUNCH, "Apply for this launch", |ui| {
-                    self.actions_section(ui)
-                });
+                crate::theme::section_card(
+                    ui,
+                    icons::ROCKET_LAUNCH,
+                    "Apply for this launch",
+                    |ui| self.actions_section(ui),
+                );
                 crate::theme::section_card(ui, icons::SEAL_CHECK, "Automatic verification", |ui| {
                     self.verify_section(ui)
                 });
@@ -476,8 +479,7 @@ impl App {
         }
         let blockers = self.one_click_blockers();
         let ready = blockers.is_empty();
-        let needs_admin =
-            cfg!(windows) && self.show_nvidia_section() && !self.benchmark.elevated;
+        let needs_admin = cfg!(windows) && self.show_nvidia_section() && !self.benchmark.elevated;
 
         ui.add_space(28.0);
         let clicked = ui
@@ -506,7 +508,11 @@ impl App {
             ui.add_space(10.0);
             ui.vertical_centered(|ui| {
                 for blocker in &blockers {
-                    ui.label(RichText::new(format!("🔒 {blocker}")).color(WARN).size(13.0));
+                    ui.label(
+                        RichText::new(format!("🔒 {blocker}"))
+                            .color(WARN)
+                            .size(13.0),
+                    );
                 }
             });
         }
@@ -538,7 +544,8 @@ impl App {
                     ui.small_button("Undo a previous optimization")
                         .on_hover_text(
                             "Restores the config files from their backups, puts the Windows \
-                             setting back exactly as it was, and resets the driver profile.",
+                             setting back exactly as it was, and restores the previous driver \
+                             profile.",
                         )
                         .clicked()
                 })
@@ -746,7 +753,11 @@ impl App {
             ui.add_space(14.0);
             ui.vertical_centered(|ui| {
                 if ui
-                    .button(if failures == 0 { "Back" } else { "Fix and retry" })
+                    .button(if failures == 0 {
+                        "Back"
+                    } else {
+                        "Fix and retry"
+                    })
                     .clicked()
                 {
                     self.oneclick.phase = ApplyPhase::Idle;
@@ -763,8 +774,7 @@ impl App {
         let mut blockers = Vec::new();
         if !cfg!(windows) {
             blockers.push(
-                "Windows only — Black Desert and these optimizations require Windows."
-                    .to_string(),
+                "Windows only — Black Desert and these optimizations require Windows.".to_string(),
             );
             return blockers;
         }
@@ -797,6 +807,15 @@ impl App {
         {
             blockers.push(
                 "The affinity mask is invalid — fix it in the Affinity section below.".to_string(),
+            );
+        }
+        if self.show_nvidia_section()
+            && self.benchmark.elevated
+            && crate::video::has_restore_record()
+        {
+            blockers.push(
+                "Restore the previous NVIDIA profile before applying another driver change."
+                    .to_string(),
             );
         }
         // The NVIDIA profile is deliberately *not* a blocker. It is one step of
@@ -851,39 +870,38 @@ impl App {
         use std::sync::mpsc::TryRecvError;
 
         let label = self.video.worker.as_ref().map(|w| w.label);
-        let finished = match self.video.worker.as_ref().map(|worker| worker.rx.try_recv()) {
+        let finished = match self
+            .video
+            .worker
+            .as_ref()
+            .map(|worker| worker.rx.try_recv())
+        {
             Some(Ok(result)) => Some(result),
             // The worker thread ended without sending — a panic inside the job.
             // Treating that as "still running" leaves the one-click screen
             // waiting forever on a result that can never arrive, with the
             // Advanced section hidden and no way out but restarting the app.
             Some(Err(TryRecvError::Disconnected)) => Some(crate::video::worker::DriverOutcome {
-                result: Err("the driver-profile job stopped unexpectedly — try again, and run \
+                result: Err(
+                    "the driver-profile job stopped unexpectedly — try again, and run \
                              the app as administrator if it keeps failing"
-                    .to_string()),
-                // A panicked job may have got as far as the import, so this
-                // must not be treated as "nothing was written".
-                imported: true,
+                        .to_string(),
+                ),
             }),
             Some(Err(TryRecvError::Empty)) | None => None,
         };
-        if let Some(outcome) = finished {
-            match (label, outcome.result.is_ok()) {
-                // Only a *verified* restore may forget which settings were
-                // applied. Clearing it when the job merely started would leave
-                // a failed restore with nothing to retry from, and the settings
-                // it did not reach would stay applied with no record of it.
-                (Some("restore"), true) => crate::video::clear_applied_record(),
-                // An apply that failed *before the import ran* changed nothing,
-                // so the ids it optimistically recorded are rewound — otherwise
-                // a later Restore would reset values this app never wrote. A
-                // failure after the import is a verification failure: the
-                // settings did land, and dropping their record would leave real
-                // changes with no way back. `imported` tells the two apart.
-                (Some("apply"), false) if !outcome.imported => {
-                    crate::video::restore_applied_record(&self.video.applied_before)
+        if let Some(mut outcome) = finished {
+            // Only a *verified* restore may forget which settings were
+            // applied. Clearing it when the job merely started would leave
+            // a failed restore with nothing to retry from, and the settings
+            // it did not reach would stay applied with no record of it.
+            if matches!((label, outcome.result.is_ok()), (Some("restore"), true)) {
+                if let Err(error) = crate::video::clear_applied_record() {
+                    outcome.result = Err(format!(
+                        "The profile was restored, but its undo record could not be cleared: \
+                         {error}. Retry Restore before applying again."
+                    ));
                 }
-                _ => {}
             }
             self.video.last = Some(outcome.result);
             self.video.worker = None;
@@ -990,37 +1008,15 @@ impl App {
             ));
             return;
         }
-        // Record before the job runs, not after: a crash mid-import must not
-        // leave settings written with no record of which ones, or undo would
-        // reset the wrong set. The record is a union, so a job that fails
-        // before touching anything only ever *over*-records — undo then resets
-        // a setting to its default that was already at its default.
-        //
-        // Restore does the opposite and keeps the record until the worker
-        // reports a verified success (see `poll_driver_worker`): clearing it up
-        // front would leave a failed restore with nothing to retry from.
         if label == "apply" {
-            // Take the machine-wide lock before reading the record and keep it
-            // until `poll_driver_worker` finishes the bookkeeping.
+            // Keep the lock while the worker snapshots the old values, imports,
+            // verifies, and records them for an exact restore.
             match crate::video::DriverLock::acquire() {
                 Ok(lock) => self.video.driver_lock = Some(lock),
                 Err(e) => {
                     self.oneclick.steps.push((STEP.into(), Err(e)));
                     return;
                 }
-            }
-            self.video.applied_before = crate::video::recorded_applied();
-            if let Err(e) = crate::video::record_applied(&settings) {
-                self.oneclick.steps.push((
-                    STEP.into(),
-                    Err(format!(
-                        "could not save which driver settings are being changed, so this could \
-                         not be made undoable ({e}) — the profile was left alone"
-                    )),
-                ));
-                // No worker starts, so nothing downstream releases this.
-                self.video.driver_lock = None;
-                return;
             }
         }
         self.video.last = None;
@@ -1085,13 +1081,15 @@ impl App {
             match crate::video::DriverLock::acquire() {
                 Ok(lock) => self.video.driver_lock = Some(lock),
                 Err(e) => {
-                    self.oneclick.steps.push(("NVIDIA driver profile".into(), Err(e)));
+                    self.oneclick
+                        .steps
+                        .push(("NVIDIA driver profile".into(), Err(e)));
                     return;
                 }
             }
             let applied = crate::video::recorded_applied();
             let settings = crate::video::restore_settings(&applied);
-            if settings.is_empty() {
+            if !crate::video::has_restore_record() {
                 self.oneclick.steps.push((
                     "NVIDIA driver profile".into(),
                     Ok("left alone — this app has no record of changing it".into()),
@@ -1656,7 +1654,7 @@ impl App {
                     ui.label(if worker.label == "apply" {
                         "Applying and verifying the driver profile…"
                     } else {
-                        "Restoring driver defaults…"
+                        "Restoring previous driver settings…"
                     });
                 });
                 ui.ctx()
@@ -1666,15 +1664,17 @@ impl App {
             let busy = self.video.worker.is_some();
             match self.video.inspector.clone() {
                 Some(exe) => {
+                    let restorable = crate::video::has_restore_record();
                     ui.horizontal(|ui| {
                         if ui
-                            .add_enabled(!busy, egui::Button::new("Apply guide profile"))
+                            .add_enabled(
+                                !busy && !restorable,
+                                egui::Button::new("Apply guide profile"),
+                            )
                             .clicked()
                         {
                             let settings =
                                 crate::video::guide_settings(physical_cores, self.video.ull);
-                            // Same contract as the one-click path: no record,
-                            // no change — the button promises a reversible edit.
                             match crate::video::DriverLock::acquire() {
                                 Ok(lock) => self.video.driver_lock = Some(lock),
                                 Err(e) => {
@@ -1682,39 +1682,22 @@ impl App {
                                     return;
                                 }
                             }
-                            self.video.applied_before = crate::video::recorded_applied();
-                            match crate::video::record_applied(&settings) {
-                                Ok(()) => {
-                                    self.video.last = None;
-                                    self.video.worker = Some(crate::video::worker::start(
-                                        exe.clone(),
-                                        settings,
-                                        "apply",
-                                    ));
-                                }
-                                Err(e) => {
-                                    self.video.last = Some(Err(format!(
-                                        "could not save which settings are being changed, so \
-                                         this could not be made undoable ({e}) — the profile \
-                                         was left alone"
-                                    )));
-                                }
-                            }
+                            self.video.last = None;
+                            self.video.worker =
+                                Some(crate::video::worker::start(exe.clone(), settings, "apply"));
                         }
                         // Nothing recorded means this app has no evidence it
                         // ever wrote the profile, and "restore" would then be a
                         // guess at someone else's settings — so there is
                         // nothing to offer.
-                        let applied = crate::video::recorded_applied();
-                        let restorable = !crate::video::restore_settings(&applied).is_empty();
                         if ui
                             .add_enabled(
                                 !busy && restorable,
-                                egui::Button::new("Restore driver defaults"),
+                                egui::Button::new("Restore previous settings"),
                             )
                             .on_hover_text(if restorable {
-                                "Resets only the settings this app applied, so a Low Latency \
-                                 setup you configured yourself is left alone."
+                                "Restores the exact values present before this app changed the \
+                                 profile."
                             } else {
                                 "Nothing to restore — this app has no record of changing the \
                                  driver profile on this machine."
@@ -1738,7 +1721,7 @@ impl App {
                             }
                             let applied = crate::video::recorded_applied();
                             let settings = crate::video::restore_settings(&applied);
-                            if settings.is_empty() {
+                            if !crate::video::has_restore_record() {
                                 self.video.last = Some(Ok(
                                     "nothing to restore — no record of this app changing the \
                                      profile"
@@ -1800,21 +1783,27 @@ impl App {
         // changes someone might not want.
         ui.add_space(2.0);
         for (setting, effect) in [
-            ("PostFilter", "off — removes the forced post-process sharpening"),
-            ("Tessellation", "off — the FPS gain the guide notes on High and above"),
+            (
+                "PostFilter",
+                "off — removes the forced post-process sharpening",
+            ),
+            (
+                "Tessellation",
+                "off — the FPS gain the guide notes on High and above",
+            ),
             (
                 "Auto Frame Optimization",
                 "off — the guide says it cancels out the settings below it",
             ),
-            ("Low power mode", "off — the guide calls this one a big deal"),
+            (
+                "Low power mode",
+                "off — the guide calls this one a big deal",
+            ),
             (
                 "Remove faraway effects",
                 "on — culls distant particle effects",
             ),
-            (
-                "Character optimization",
-                "off — the guide does not use it",
-            ),
+            ("Character optimization", "off — the guide does not use it"),
         ] {
             ui.label(
                 RichText::new(format!("• {setting}: {effect}"))

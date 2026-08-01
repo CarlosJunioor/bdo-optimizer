@@ -92,10 +92,6 @@ pub struct VideoState {
     pub worker: Option<crate::video::worker::DriverWorker>,
     /// Outcome of the last finished job (message to show).
     pub last: Option<Result<String, String>>,
-    /// The recorded applied-setting ids as they stood before the in-flight
-    /// apply added to them, so a failure that never reached the driver can be
-    /// rewound. See `video::restore_applied_record`.
-    pub applied_before: Vec<u32>,
     /// The machine-wide driver lock, held from *before* the applied-settings
     /// record is read until the job's bookkeeping is done. Dropping it after
     /// spawning the worker left the record's read-modify-write and the
@@ -195,6 +191,8 @@ pub struct BenchmarkState {
     pub metrics: Vec<Option<Metrics>>,
     /// Directory the session store reads/writes.
     pub store_dir: PathBuf,
+    /// Last session-store error; the existing in-memory history stays visible.
+    pub store_error: Option<String>,
     /// Current capture state.
     pub status: CaptureStatus,
     /// The in-flight capture worker, if any.
@@ -222,10 +220,17 @@ pub struct BenchmarkState {
 
 impl BenchmarkState {
     fn new() -> Self {
-        let store_dir = SessionStore::default_store()
-            .map(|s| s.dir().to_path_buf())
-            .unwrap_or_else(|_| PathBuf::from("sessions"));
-        let sessions = SessionStore::new(&store_dir).list().unwrap_or_default();
+        let (store_dir, mut store_error) = match SessionStore::default_store() {
+            Ok(store) => (store.dir().to_path_buf(), None),
+            Err(error) => (PathBuf::from("sessions"), Some(error.to_string())),
+        };
+        let sessions = match SessionStore::new(&store_dir).list() {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                store_error = Some(error.to_string());
+                Vec::new()
+            }
+        };
         let selected = vec![false; sessions.len()];
         let metrics = session_metrics(&sessions);
         // Check elevation once at startup so the Benchmark tab can warn up front
@@ -245,6 +250,7 @@ impl BenchmarkState {
             selected,
             metrics,
             store_dir,
+            store_error,
             status: CaptureStatus::Idle,
             worker: None,
             presentmon: None,
@@ -260,11 +266,15 @@ impl BenchmarkState {
 
     /// Reload the session list from disk, resetting selection.
     pub fn reload(&mut self) {
-        self.sessions = SessionStore::new(&self.store_dir)
-            .list()
-            .unwrap_or_default();
-        self.selected = vec![false; self.sessions.len()];
-        self.metrics = session_metrics(&self.sessions);
+        match SessionStore::new(&self.store_dir).list() {
+            Ok(sessions) => {
+                self.sessions = sessions;
+                self.selected = vec![false; self.sessions.len()];
+                self.metrics = session_metrics(&self.sessions);
+                self.store_error = None;
+            }
+            Err(error) => self.store_error = Some(error.to_string()),
+        }
     }
 }
 

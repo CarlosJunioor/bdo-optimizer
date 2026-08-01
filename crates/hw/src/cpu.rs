@@ -122,9 +122,34 @@ pub fn vcache_ccd(domains: &[L3Domain]) -> Option<&L3Domain> {
     }
 }
 
+/// Identify a V-Cache CCD only when both topology and the CPU model support
+/// that interpretation. Unequal L3 domains alone are not an X3D signature on
+/// Intel or non-X3D processors.
+pub fn vcache_ccd_for_cpu(cpu: &CpuInfo) -> Option<&L3Domain> {
+    let model = cpu.model.to_uppercase();
+    ((model.contains("AMD") || model.contains("RYZEN")) && model.contains("X3D"))
+        .then(|| vcache_ccd(&cpu.l3_domains))
+        .flatten()
+}
+
 // ---------------------------------------------------------------------------
 // Windows: GetLogicalProcessorInformationEx(RelationProcessorCore)
 // ---------------------------------------------------------------------------
+#[cfg(windows)]
+fn logical_cores_from_group_masks(masks: impl IntoIterator<Item = (u16, u64)>) -> Vec<usize> {
+    let mut logical = Vec::new();
+    for (group, mask) in masks {
+        let group_base = group as usize * 64;
+        logical.extend(
+            (0..64u32)
+                .filter(|bit| mask & (1u64 << bit) != 0)
+                .map(|bit| group_base + bit as usize),
+        );
+    }
+    logical.sort_unstable();
+    logical
+}
+
 #[cfg(windows)]
 fn detect_core_topology() -> Vec<CoreTopo> {
     use windows::Win32::System::SystemInformation::{
@@ -176,22 +201,16 @@ fn detect_core_topology() -> Vec<CoreTopo> {
                 let masks_at =
                     offset + HEADER + std::mem::offset_of!(PROCESSOR_RELATIONSHIP, GroupMask);
                 let ga_size = std::mem::size_of::<GROUP_AFFINITY>();
-                let mut logical = Vec::new();
+                let mut group_masks = Vec::new();
                 for i in 0..core.GroupCount.max(1) as usize {
                     let at = masks_at + i * ga_size;
                     if at + ga_size > offset + size {
                         break;
                     }
                     let ga = std::ptr::read_unaligned(base.add(at) as *const GROUP_AFFINITY);
-                    let group_base = ga.Group as usize * 64;
-                    let mask = ga.Mask as u64;
-                    logical.extend(
-                        (0..64u32)
-                            .filter(|b| mask & (1u64 << b) != 0)
-                            .map(|b| group_base + b as usize),
-                    );
+                    group_masks.push((ga.Group, ga.Mask as u64));
                 }
-                logical.sort_unstable();
+                let logical = logical_cores_from_group_masks(group_masks);
                 if !logical.is_empty() {
                     cores.push(CoreTopo {
                         logical_cores: logical,
@@ -254,7 +273,7 @@ fn detect_core_topology() -> Vec<CoreTopo> {
 #[cfg(windows)]
 fn detect_caches() -> (Vec<L3Domain>, Vec<CacheInfo>) {
     use windows::Win32::System::SystemInformation::{
-        GetLogicalProcessorInformationEx, RelationCache, CACHE_RELATIONSHIP,
+        GetLogicalProcessorInformationEx, RelationCache, CACHE_RELATIONSHIP, GROUP_AFFINITY,
         LOGICAL_PROCESSOR_RELATIONSHIP, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
     };
 
@@ -309,13 +328,19 @@ fn detect_caches() -> (Vec<L3Domain>, Vec<CacheInfo>) {
                 let cache = std::ptr::read_unaligned(
                     base.add(offset + HEADER) as *const CACHE_RELATIONSHIP
                 );
-                let group = cache.Anonymous.GroupMask;
-                let base = group.Group as usize * 64;
-                let mask = group.Mask as u64;
-                let cores: Vec<usize> = (0..64u32)
-                    .filter(|i| mask & (1u64 << i) != 0)
-                    .map(|i| base + i as usize)
-                    .collect();
+                let masks_at =
+                    offset + HEADER + std::mem::offset_of!(CACHE_RELATIONSHIP, Anonymous);
+                let ga_size = std::mem::size_of::<GROUP_AFFINITY>();
+                let mut group_masks = Vec::new();
+                for i in 0..cache.GroupCount.max(1) as usize {
+                    let at = masks_at + i * ga_size;
+                    if at + ga_size > offset + size {
+                        break;
+                    }
+                    let ga = std::ptr::read_unaligned(base.add(at) as *const GROUP_AFFINITY);
+                    group_masks.push((ga.Group, ga.Mask as u64));
+                }
+                let cores = logical_cores_from_group_masks(group_masks);
                 if !cores.is_empty() {
                     let level = cache.Level;
                     let summary = levels.entry(level).or_default();
@@ -528,6 +553,31 @@ mod tests {
         // 48 MB vs 32 MB is only 1.5x -> not a clear X3D split.
         let domains = vec![dom(48, vec![0, 1]), dom(32, vec![2, 3])];
         assert!(vcache_ccd(&domains).is_none());
+    }
+
+    #[test]
+    fn vcache_classification_requires_an_amd_x3d_model() {
+        let domains = vec![dom(96, vec![0, 1]), dom(32, vec![2, 3])];
+        let cpu = |model: &str| CpuInfo {
+            model: model.into(),
+            physical_cores: 2,
+            logical_cores: 4,
+            l3_domains: domains.clone(),
+            caches: Vec::new(),
+            cores: Vec::new(),
+        };
+
+        assert!(vcache_ccd_for_cpu(&cpu("Intel Example")).is_none());
+        assert!(vcache_ccd_for_cpu(&cpu("AMD Ryzen 9 7950X3D")).is_some());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn group_masks_include_all_processor_groups() {
+        assert_eq!(
+            logical_cores_from_group_masks([(0, 0b101), (1, 0b10)]),
+            vec![0, 2, 65]
+        );
     }
 
     #[cfg(any(windows, target_os = "linux"))]

@@ -131,12 +131,20 @@ impl LiveReader {
         if line.is_empty() {
             return;
         }
-        let fields: Vec<&str> = line.split(',').collect();
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .flexible(true)
+            .from_reader(line.as_bytes());
+        let mut fields = csv::StringRecord::new();
+        if !matches!(reader.read_record(&mut fields), Ok(true)) {
+            return;
+        }
 
         let Some(layout) = self.layout else {
             // Still looking for the header row; a line that does not resolve is
             // pre-header noise and is simply skipped.
-            self.layout = HeaderLayout::resolve(&fields);
+            let headers: Vec<_> = fields.iter().collect();
+            self.layout = HeaderLayout::resolve(&headers);
             return;
         };
 
@@ -148,10 +156,7 @@ impl LiveReader {
             }
         }
 
-        if let Some(v) = fields
-            .get(layout.frame_time)
-            .and_then(|f| parse_frame_time(f))
-        {
+        if let Some(v) = fields.get(layout.frame_time).and_then(parse_frame_time) {
             self.frames.push(v);
         }
     }
@@ -251,6 +256,19 @@ mod tests {
             &path,
             "chrome.exe,8.0\nBlackDesert64.exe,16.6\nchrome.exe,8.1\n",
         );
+        assert_eq!(r.poll().unwrap(), 1);
+        assert_eq!(r.frames(), &[16.6]);
+    }
+
+    #[test]
+    fn quoted_process_names_match_the_batch_parser() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quoted.csv");
+        let mut r = LiveReader::new(&path, Some("Black,Desert.exe".to_string()));
+
+        append(&path, "Application,MsBetweenPresents\n");
+        append(&path, "\"Black,Desert.exe\",16.6\n");
+
         assert_eq!(r.poll().unwrap(), 1);
         assert_eq!(r.frames(), &[16.6]);
     }
