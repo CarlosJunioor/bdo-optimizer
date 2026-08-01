@@ -864,6 +864,24 @@ fn read_ledger(path: &Path) -> std::io::Result<String> {
     Ok(text)
 }
 
+/// Accept a ledger entry only if it names a single file in the install folder.
+///
+/// Anything with a separator, a drive letter, a `..`, or a leading root is
+/// refused outright rather than sanitised — a ledger that contains one is not a
+/// ledger this app wrote, and guessing what it meant is how a traversal check
+/// becomes a traversal.
+fn safe_ledger_entry(entry: &str) -> Option<&str> {
+    let name = entry.strip_prefix(LEDGER_NEW).unwrap_or(entry);
+    if name.is_empty()
+        || name.contains(['/', '\\', ':'])
+        || name.contains("..")
+        || Path::new(name).components().count() != 1
+    {
+        return None;
+    }
+    Some(entry)
+}
+
 /// Whether the rollback left nothing for startup recovery to do.
 ///
 /// A leftover `.old` is the only thing recovery acts on, so its absence is the
@@ -1113,6 +1131,9 @@ fn recover_with_ledger(dir: &Path) {
         .chain(packaged_names().map(str::to_string))
         .collect();
     for entry in &owned {
+        let Some(entry) = safe_ledger_entry(entry) else {
+            continue;
+        };
         let name = entry.strip_prefix(LEDGER_NEW).unwrap_or(entry);
         let old = dir.join(format!("{name}.old"));
         // Never drop a backup while the file it backs up is missing: that is
@@ -1132,6 +1153,14 @@ fn recover_with_ledger(dir: &Path) {
 /// work in that case; failing to place the backup leaves both copies on disk
 /// rather than losing one.
 fn restore_one(dir: &Path, entry: &str) -> bool {
+    // The ledger sits in the user-writable app folder under a predictable name,
+    // and recovery runs at startup — elevated, if the app is. An entry is a
+    // *file name*, never a path: without this check a planted ledger holding
+    // `+..\victim`, or an absolute path, would have `remove_file` delete
+    // whatever it named with the administrator token.
+    let Some(entry) = safe_ledger_entry(entry) else {
+        return false;
+    };
     // A `+` prefix means the install created this file where none existed, so
     // undoing it means removing it.
     if let Some(name) = entry.strip_prefix(LEDGER_NEW) {
@@ -1325,6 +1354,30 @@ mod tests {
 
         drop(staged);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The ledger lives in a user-writable folder and recovery runs at startup,
+    /// elevated. An entry naming anything but a file in that folder must be
+    /// refused, or a planted ledger turns startup into arbitrary deletion.
+    #[test]
+    fn a_planted_ledger_cannot_escape_the_install_folder() {
+        for evil in [
+            "+..\\victim.txt",
+            "..\\victim.txt",
+            "+C:\\Windows\\System32\\drivers\\etc\\hosts",
+            "+/etc/passwd",
+            "sub\\dir.exe",
+            "",
+            "+",
+        ] {
+            assert!(
+                safe_ledger_entry(evil).is_none(),
+                "must refuse ledger entry {evil:?}"
+            );
+        }
+        // Ordinary entries still pass, with and without the created marker.
+        assert_eq!(safe_ledger_entry("bdo-optimizer.exe"), Some("bdo-optimizer.exe"));
+        assert_eq!(safe_ledger_entry("+README.md"), Some("+README.md"));
     }
 
     /// A recovery that cannot put a file back must keep both the ledger and the

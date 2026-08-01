@@ -258,6 +258,7 @@ pub fn shortcut_description(mask_hex: &str) -> String {
 /// Note: Black Desert Online does **not** run on Linux — its anti-cheat blocks
 /// Proton. This helper exists for generic-game CPU pinning on Linux, not BDO.
 pub fn generate_taskset_command(cores: &[usize], cmd: &str) -> String {
+    let cmd = &desktop_quote(cmd);
     if cores.is_empty() {
         return cmd.to_string();
     }
@@ -267,6 +268,33 @@ pub fn generate_taskset_command(cores: &[usize], cmd: &str) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("taskset -c {list} {cmd}")
+}
+
+/// Quote a path for a freedesktop `Exec=` line if it needs it.
+///
+/// `Exec` is split on whitespace, so `/home/me/My Games/run.sh` would be read
+/// as three arguments and the launcher would try to run `/home/me/My`. The spec
+/// quotes with `"` and escapes a backslash-prefixed set inside; leaving a path
+/// without spaces or specials unquoted keeps the common case readable.
+pub fn desktop_quote(path: &str) -> String {
+    const NEEDS_QUOTING: &[char] = &[
+        ' ', '\t', '"', '\'', '\\', '>', '<', '~', '|', '&', ';', '$', '*', '?', '#', '(', ')',
+        '`',
+    ];
+    if !path.contains(NEEDS_QUOTING) {
+        return path.to_string();
+    }
+    let mut out = String::with_capacity(path.len() + 2);
+    out.push('"');
+    for c in path.chars() {
+        // The spec requires these four to be backslash-escaped inside quotes.
+        if matches!(c, '"' | '`' | '$' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
 }
 
 /// Render the text of a freedesktop `.desktop` launcher entry.
@@ -432,11 +460,27 @@ mod tests {
     #[test]
     fn taskset_command() {
         assert_eq!(
-            generate_taskset_command(&[0, 2, 4], "mygame --opt"),
-            "taskset -c 0,2,4 mygame --opt"
+            generate_taskset_command(&[0, 2, 4], "mygame"),
+            "taskset -c 0,2,4 mygame"
         );
         assert_eq!(generate_taskset_command(&[], "mygame"), "mygame");
         assert_eq!(generate_taskset_command(&[3], "g"), "taskset -c 3 g");
+    }
+
+    /// `Exec=` is split on whitespace, so an unquoted path with a space runs
+    /// the wrong program — a very ordinary Linux home directory does this.
+    #[test]
+    fn desktop_exec_quotes_paths_that_need_it() {
+        assert_eq!(desktop_quote("/opt/game/run.sh"), "/opt/game/run.sh");
+        assert_eq!(
+            desktop_quote("/home/me/My Games/run.sh"),
+            "\"/home/me/My Games/run.sh\""
+        );
+        assert_eq!(desktop_quote("/a/b$c"), "\"/a/b\\$c\"");
+        assert_eq!(
+            generate_taskset_command(&[0, 2], "/home/me/My Games/run.sh"),
+            "taskset -c 0,2 \"/home/me/My Games/run.sh\""
+        );
     }
 
     #[test]

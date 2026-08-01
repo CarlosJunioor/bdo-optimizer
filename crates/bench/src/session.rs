@@ -163,11 +163,38 @@ impl SessionStore {
     /// # Errors
     /// [`BenchError::Io`] / [`BenchError::Serde`] on filesystem or serialisation failure.
     pub fn save(&self, session: &Session) -> Result<PathBuf, BenchError> {
+        use std::io::Write;
+
         fs::create_dir_all(&self.dir)?;
-        let path = self.dir.join(format!("{}.json", session.file_stem()));
         let json = serde_json::to_string_pretty(session)?;
-        fs::write(&path, json)?;
-        Ok(path)
+        let stem = session.file_stem();
+
+        // Never overwrite. Timestamps have one-second resolution, so two short
+        // captures with the same label — or two app instances — collide, and
+        // `fs::write` would silently replace a run the user just spent minutes
+        // recording. `create_new` fails on a taken name instead, and the suffix
+        // keeps both.
+        for attempt in 0..1_000u32 {
+            let name = if attempt == 0 {
+                format!("{stem}.json")
+            } else {
+                format!("{stem}-{attempt}.json")
+            };
+            let path = self.dir.join(name);
+            match fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(mut file) => {
+                    file.write_all(json.as_bytes())?;
+                    file.sync_all()?;
+                    return Ok(path);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(BenchError::Io(format!(
+            "could not find a free file name for the session in {}",
+            self.dir.display()
+        )))
     }
 
     /// List all stored sessions, sorted by timestamp descending (newest first).
@@ -275,6 +302,26 @@ mod tests {
     /// A label long enough to blow the filesystem's component limit must not
     /// be able to fail the save — the capture is already finished by then and
     /// its raw CSV is deleted on the way out.
+    /// Two captures finishing in the same second under the same label must
+    /// both survive: the timestamp only has second resolution, and a silent
+    /// overwrite costs the user a run they just spent minutes recording.
+    #[test]
+    fn a_second_session_never_overwrites_the_first() {
+        let dir = std::env::temp_dir().join(format!("bdo-session-clash-{}", std::process::id()));
+        let store = SessionStore::new(&dir);
+        let mut a = Session::new("same label", "cpu", "gpu", vec![16.6]);
+        a.timestamp = "2026-01-01T00:00:00Z".to_string();
+        let mut b = Session::new("same label", "cpu", "gpu", vec![33.2]);
+        b.timestamp = a.timestamp.clone();
+
+        let first = store.save(&a).unwrap();
+        let second = store.save(&b).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(store.list().unwrap().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn file_stem_is_bounded_however_long_the_label() {
         let mut s = Session::new("x".repeat(4000), "cpu", "gpu", vec![16.6]);

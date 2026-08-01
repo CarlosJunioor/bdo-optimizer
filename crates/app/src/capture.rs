@@ -247,7 +247,11 @@ fn run(p: CaptureParams, stop: Arc<AtomicBool>, tx: Sender<CaptureMsg>, ctx: egu
             (None, seen) => seen.is_some(),
         };
         if let (Some(verified), Some(seen)) = (p.verified_pid, current) {
-            if seen != verified && game_seen {
+            // Any mismatch aborts, including on the very first poll: PresentMon
+            // targets the process *name*, so a replacement that appeared before
+            // we looked would be captured and then saved under the verified
+            // instance's mask. `game_seen` says nothing about which instance.
+            if seen != verified {
                 // The verified instance is gone and a different one is up. The
                 // provenance this session would be saved with no longer
                 // describes what is on screen, so stop rather than attribute

@@ -498,7 +498,13 @@ impl App {
             .unwrap_or(0);
         let observed_mask = running_mask(self.optimize.verify.as_ref());
         let expected_mask = if self.benchmark.baseline_capture {
-            full_affinity_mask(logical_cores)
+            // The same yardstick the button used. Deriving it from the
+            // machine-wide count instead would reject the very mask the UI just
+            // called ready on a multi-group machine, so baseline capture could
+            // be enabled and then refuse to start.
+            self.optimize
+                .system_mask
+                .or_else(|| full_affinity_mask(logical_cores))
         } else {
             bdo_launch::parse_mask_hex(&self.optimize.mask_input).ok()
         };
