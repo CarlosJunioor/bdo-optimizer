@@ -183,10 +183,17 @@ fn pin_image(exe: &Path) -> Option<std::fs::File> {
 /// that. The elevated child still resolves its DLLs the ordinary way, starting
 /// with its own directory, so a same-user process that can write into the app
 /// folder can pre-place a DLL the child will load and get it running as
-/// administrator without touching the pinned image at all. Pinning every
-/// loadable file is not a real answer: the set is decided at runtime by the
-/// graphics backend, and the app's own layout requires the bundled tools to sit
-/// in that same folder.
+/// administrator without touching the pinned image at all.
+///
+/// The obvious in-process fix does not work, and this was measured rather than
+/// assumed: calling `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)`
+/// first thing in `main` does remove the application directory from the search
+/// order, and the app then starts to a blank window — the graphics backend
+/// cannot load, because a GPU driver's ICD and its dependencies live outside
+/// `System32` and are found through exactly the search path that call
+/// suppresses. Windows offers no "everything except the application directory"
+/// mode, and pinning every loadable file is not an answer either: the set is
+/// decided at runtime by whichever backend `wgpu` selects.
 ///
 /// The actual fix is code signing plus an install location under
 /// `Program Files`, where the folder is not user-writable in the first place.
