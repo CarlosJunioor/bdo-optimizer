@@ -9,15 +9,25 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# Read-only by default, so a compromised dependency or action cannot reach a
+# token that writes releases. Only `publish` raises it, and that job runs no
+# third-party code beyond checkout — see the note there.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  windows:
+  build:
     runs-on: windows-latest
+    outputs:
+      tag: ${{ steps.package.outputs.tag }}
+      zip: ${{ steps.package.outputs.zip }}
+      sha256: ${{ steps.package.outputs.sha256 }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Actions are pinned to a commit, not a tag or branch: a tag can be moved
+      # to point at different code, and this workflow compiles and publishes the
+      # binary the in-app updater installs automatically.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
 
       - name: Test
         run: cargo test --workspace --release
@@ -29,6 +39,7 @@ jobs:
       # beside itself (and at vendor/ in dev builds). A bare .exe download would
       # start but fail every capture, so the artifact is always a zip.
       - name: Stage package
+        id: package
         shell: pwsh
         run: |
           $tag = if ($env:GITHUB_REF -like 'refs/tags/*') { $env:GITHUB_REF -replace 'refs/tags/','' }
@@ -47,19 +58,17 @@ jobs:
           Compress-Archive -Path $dir -DestinationPath "$dir.zip"
           $hash = (Get-FileHash "$dir.zip" -Algorithm SHA256).Hash
           "$hash  $dir.zip" | Out-File -Encoding ascii "$dir.zip.sha256"
-          "TAG=$tag"        >> $env:GITHUB_ENV
-          "ZIP=$dir.zip"    >> $env:GITHUB_ENV
-          "SHA256=$hash"    >> $env:GITHUB_ENV
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.ZIP }}
-          path: ${{ env.ZIP }}
+          "tag=$tag"        >> $env:GITHUB_OUTPUT
+          "zip=$dir.zip"    >> $env:GITHUB_OUTPUT
+          "sha256=$hash"    >> $env:GITHUB_OUTPUT
 
       # The "What's new" section is a placeholder: fill it with short bullets
       # after publishing (gh release edit <tag> --notes-file ...).
       - name: Write release notes
         shell: pwsh
+        env:
+          TAG: ${{ steps.package.outputs.tag }}
+          SHA256: ${{ steps.package.outputs.sha256 }}
         run: |
           @'
           ## What's new in __TAG__
@@ -87,11 +96,33 @@ jobs:
           </details>
           '@ -replace '__SHA256__', $env:SHA256 -replace '__TAG__', $env:TAG | Out-File -Encoding utf8 notes.md
 
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-package
+          path: |
+            ${{ steps.package.outputs.zip }}
+            ${{ steps.package.outputs.zip }}.sha256
+            notes.md
+
+  # Separated from `build` so the release-write token is never present while
+  # compiling, testing, or running the toolchain action — the steps that execute
+  # by far the most third-party code.
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-package
+
       - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/')
-        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.build.outputs.tag }}
+          ZIP: ${{ needs.build.outputs.zip }}
         run: >
-          gh release create "$env:TAG" "$env:ZIP" "$env:ZIP.sha256"
-          --title "BDO Optimizer $env:TAG" --notes-file notes.md
+          gh release create "$TAG" "$ZIP" "$ZIP.sha256"
+          --title "BDO Optimizer $TAG" --notes-file notes.md

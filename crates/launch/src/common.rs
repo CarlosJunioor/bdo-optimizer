@@ -100,15 +100,22 @@ pub fn mask_to_cores(mask: u64) -> Vec<usize> {
 /// `start` is the (ignored) window title, required so that `start` does not
 /// mistake a quoted program path for its title argument.
 ///
-/// # Why the path is validated first
+/// # Why the path is validated, and why `/v:off` is explicit
 ///
 /// Double quotes protect `&`, `|` and the rest of cmd's metacharacters, but they
-/// do **not** stop environment-variable expansion: `cmd` substitutes `%NAME%`
-/// *before* it parses quotes. A path containing `%NAME%` therefore injects
-/// whatever that variable holds — and a same-user process can set the variable —
-/// straight into a command line that runs through `runas` and through the
-/// run-as-administrator shortcut. `%` is legal in a Windows filename, so this
-/// cannot be assumed away; such a path is rejected instead.
+/// do **not** stop variable expansion, which happens *before* quotes are parsed:
+///
+/// * `%NAME%` is always expanded, so a path containing one splices in whatever
+///   that variable holds — and a same-user process can set the user's variables
+///   — straight into a command line that runs through `runas` and through the
+///   run-as-administrator shortcut.
+/// * `!NAME!` is expanded too whenever delayed expansion is on, which `HKCU`
+///   can enable for every `cmd` on the machine. `/v:off` in the command line
+///   overrides that per invocation and is the authoritative fix.
+///
+/// Both characters are legal in Windows filenames, so neither can be assumed
+/// away; `/v:off` closes the `!` case and the validation refuses both rather
+/// than resting the elevated path on a single mechanism.
 pub fn build_cmd_arguments(
     mask_hex: &str,
     steam: bool,
@@ -118,7 +125,8 @@ pub fn build_cmd_arguments(
     reject_cmd_unsafe(launcher_dir)?;
     reject_cmd_unsafe(launcher_filename)?;
     let mut args = format!(
-        "/d /c cd /d \"{launcher_dir}\" && start \"\" /affinity {mask_hex} \"{launcher_filename}\""
+        "/d /v:off /c cd /d \"{launcher_dir}\" && start \"\" /affinity {mask_hex} \
+         \"{launcher_filename}\""
     );
     if steam {
         args.push_str(" -steam");
@@ -129,12 +137,12 @@ pub fn build_cmd_arguments(
 /// Refuse a path component that `cmd.exe` would not treat as literal text
 /// inside double quotes.
 ///
-/// Only two classes get through quoting: `%`, which triggers variable
-/// expansion, and control characters (a raw `\r` or `\n` ends the command and
-/// starts another). A double quote would also break out, but Windows forbids it
-/// in a filename — it is rejected here anyway rather than relied upon.
+/// Three classes get through quoting: `%` and `!` (variable expansion, see
+/// [`build_cmd_arguments`]) and control characters — a raw `\r` or `\n` ends the
+/// command and starts another. A double quote would also break out, but Windows
+/// forbids it in a filename; it is rejected here anyway rather than relied upon.
 pub fn reject_cmd_unsafe(path: &str) -> Result<(), LaunchError> {
-    if path.contains('%') || path.contains('"') || path.chars().any(|c| c.is_control()) {
+    if path.contains(['%', '!', '"']) || path.chars().any(|c| c.is_control()) {
         return Err(LaunchError::UnsafeForCmd(path.to_string()));
     }
     Ok(())
@@ -300,7 +308,7 @@ mod tests {
     fn cmd_arguments_basic() {
         assert_eq!(
             build_cmd_arguments("555", false, r"C:\Games\BDO", "BlackDesertLauncher.exe").unwrap(),
-            "/d /c cd /d \"C:\\Games\\BDO\" && start \"\" /affinity 555 \"BlackDesertLauncher.exe\""
+            "/d /v:off /c cd /d \"C:\\Games\\BDO\" && start \"\" /affinity 555 \"BlackDesertLauncher.exe\""
         );
     }
 
@@ -308,7 +316,7 @@ mod tests {
     fn cmd_arguments_steam() {
         assert_eq!(
             build_cmd_arguments("554", true, r"C:\Games\BDO", "BlackDesertLauncher.exe").unwrap(),
-            "/d /c cd /d \"C:\\Games\\BDO\" && start \"\" /affinity 554 \"BlackDesertLauncher.exe\" -steam"
+            "/d /v:off /c cd /d \"C:\\Games\\BDO\" && start \"\" /affinity 554 \"BlackDesertLauncher.exe\" -steam"
         );
     }
 
@@ -324,12 +332,12 @@ mod tests {
         )
         .unwrap();
         assert!(
-            args.starts_with("/d /c cd /d \"C:\\BDO EUW\\BlackDesert\" && "),
+            args.starts_with("/d /v:off /c cd /d \"C:\\BDO EUW\\BlackDesert\" && "),
             "expected a self-contained cd /d prefix, got: {args}"
         );
         assert_eq!(
             args,
-            "/d /c cd /d \"C:\\BDO EUW\\BlackDesert\" && start \"\" /affinity 555 \"BlackDesertLauncher.exe\""
+            "/d /v:off /c cd /d \"C:\\BDO EUW\\BlackDesert\" && start \"\" /affinity 555 \"BlackDesertLauncher.exe\""
         );
     }
 

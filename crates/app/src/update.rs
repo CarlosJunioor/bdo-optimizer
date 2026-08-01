@@ -94,6 +94,7 @@ impl App {
 
     /// Sidebar row: update button / progress / result.
     pub fn update_row(&mut self, ui: &mut egui::Ui) {
+        let capturing = self.benchmark.worker.is_some();
         egui::Frame::new()
             .inner_margin(egui::Margin::symmetric(10, 6))
             .show(ui, |ui| match &self.update.status {
@@ -116,15 +117,28 @@ impl App {
                     ))
                     .size(13.0)
                     .color(theme::BG);
+                    // Installing ends with `process::exit`, which would kill an
+                    // in-flight capture without saving its session and leave
+                    // PresentMon running (dropping the handle does not stop it).
+                    // A benchmark is minutes of the user's play time; the update
+                    // can wait for it.
                     let clicked = ui
-                        .add_sized(
-                            [ui.available_width(), 30.0],
-                            egui::Button::new(text)
-                                .fill(theme::ACCENT)
-                                .corner_radius(egui::CornerRadius::same(8)),
-                        )
-                        .on_hover_text("Downloads the new version and restarts the app")
-                        .clicked();
+                        .add_enabled_ui(!capturing, |ui| {
+                            ui.add_sized(
+                                [ui.available_width(), 30.0],
+                                egui::Button::new(text)
+                                    .fill(theme::ACCENT)
+                                    .corner_radius(egui::CornerRadius::same(8)),
+                            )
+                            .on_hover_text(if capturing {
+                                "Finish or stop the running capture first — updating restarts \
+                                 the app and would discard it"
+                            } else {
+                                "Downloads the new version and restarts the app"
+                            })
+                            .clicked()
+                        })
+                        .inner;
                     if clicked {
                         if let UpdateStatus::Available(info) =
                             std::mem::replace(&mut self.update.status, UpdateStatus::Checking)
@@ -311,7 +325,21 @@ fn apply(
         sha.to_str().ok_or("temp path is not valid UTF-8")?,
         sha_url,
     ]))?;
-    verify_checksum(&zip, &sha)?;
+    // Pin the archive before hashing it and keep the pin through extraction, so
+    // the bytes tar unpacks are provably the bytes that matched the checksum.
+    // Verifying a path and then handing that path to another program is the
+    // same check-then-use gap the rest of this file closes; `tar` opens it for
+    // reading, which `FILE_SHARE_READ` still allows.
+    let pinned_zip = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&zip)
+            .map_err(|e| format!("could not lock the download for verification: {e}"))?
+    };
+    verify_checksum(&mut &pinned_zip, &sha)?;
 
     progress("Extracting…");
     // Windows' tar.exe is bsdtar, which reads zip archives natively.
@@ -321,6 +349,8 @@ fn apply(
         "-C",
         tmp.to_str().ok_or("temp path is not valid UTF-8")?,
     ]))?;
+    // Extraction is done; the archive no longer needs pinning.
+    drop(pinned_zip);
 
     // The zip contains a single versioned folder with all the files in it.
     // Requiring *exactly* one is the point: picking "the first directory" would
@@ -344,8 +374,10 @@ fn apply(
     };
 
     progress("Installing…");
-    let staged = staged_files(&inner)?;
-    install_all(&staged, &app_dir)?;
+    let mut staged = staged_files(&inner)?;
+    install_all(&mut staged, &app_dir)?;
+    // Release the pins before the staging directory is removed.
+    drop(staged);
     let _ = std::fs::remove_dir_all(&tmp);
 
     progress("Restarting…");
@@ -358,6 +390,22 @@ fn apply(
     Ok(())
 }
 
+/// Write `dest` from an already-open, pinned source handle.
+///
+/// Rewinds first so the same handle can be reused, and truncates the
+/// destination so a shorter new file cannot leave a tail of the old one.
+fn copy_from_handle(src: &mut std::fs::File, dest: &Path) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom};
+    src.seek(SeekFrom::Start(0))?;
+    let mut out = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(dest)?;
+    std::io::copy(src, &mut out)?;
+    out.sync_all()
+}
+
 /// Check the downloaded zip against the SHA-256 the release workflow published
 /// beside it, before a single byte of it is unpacked or executed.
 ///
@@ -366,7 +414,7 @@ fn apply(
 /// checksum comes from the same release, so it does not defend against the
 /// release itself being malicious — code signing would. It does close every
 /// failure between GitHub and this disk.
-fn verify_checksum(zip: &Path, sha_file: &Path) -> Result<(), String> {
+fn verify_checksum(zip: &mut impl std::io::Read, sha_file: &Path) -> Result<(), String> {
     use sha2::Digest;
 
     let published = std::fs::read_to_string(sha_file)
@@ -381,12 +429,10 @@ fn verify_checksum(zip: &Path, sha_file: &Path) -> Result<(), String> {
         return Err("the published checksum is not a SHA-256 — refusing to install".to_string());
     }
 
-    let mut file = std::fs::File::open(zip)
-        .map_err(|e| format!("could not reopen the download to verify it: {e}"))?;
     let mut hash = sha2::Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
-        match std::io::Read::read(&mut file, &mut buffer) {
+        match zip.read(&mut buffer) {
             Ok(0) => break,
             Ok(read) => hash.update(&buffer[..read]),
             Err(e) => return Err(format!("could not read the download to verify it: {e}")),
@@ -417,7 +463,10 @@ fn create_private_dir() -> Result<PathBuf, String> {
             .unwrap_or(attempt);
         let dir = base.join(format!("bdo-optimizer-update-{pid}-{nanos}-{attempt}"));
         match std::fs::create_dir(&dir) {
-            Ok(()) => return Ok(dir),
+            Ok(()) => {
+                protect_staging_dir(&dir);
+                return Ok(dir);
+            }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(format!("could not create {}: {e}", dir.display())),
         }
@@ -425,13 +474,135 @@ fn create_private_dir() -> Result<PathBuf, String> {
     Err("could not create a private staging directory".to_string())
 }
 
-/// Every regular file in the extracted release folder, checked to be readable
-/// **before** anything in the install directory is touched.
+/// Raise the staging directory to a high mandatory integrity level so lower
+/// integrity processes cannot write into it.
 ///
-/// Reading each one up front is what makes the swap below worth attempting: a
-/// truncated download or a file the antivirus has locked fails here, while the
-/// installed copy is still entirely intact.
-fn staged_files(inner: &Path) -> Result<Vec<(std::ffi::OsString, PathBuf)>, String> {
+/// Winning `create_dir` only proves nobody got there *first*. The temp directory
+/// belongs to the user, so a medium-integrity process running as that same user
+/// can still replace the zip, the checksum, or an extracted file afterwards —
+/// and every one of those is later copied next to the elevated executable and
+/// run. A DACL cannot express this (same user, same SID); a mandatory label can,
+/// because integrity is checked before the DACL and medium cannot write up to
+/// high.
+///
+/// Only possible when this process is elevated — raising a label above your own
+/// integrity level needs `SeRelabelPrivilege`, so an unelevated attempt fails
+/// with `ERROR_PRIVILEGE_NOT_HELD`. That is also the only case that matters: an
+/// unelevated update installs with the same privileges an attacker at that
+/// integrity level already has, so there is nothing to escalate to.
+///
+/// Best-effort by design. It is a second layer, not the load-bearing one: the
+/// guarantee that the bytes installed are the bytes verified comes from the
+/// deny-write handles held across verification and copying (see
+/// [`staged_files`] and [`install_all`]), which need no privilege and are
+/// covered by tests. Turning a bonus layer into a hard requirement would let an
+/// unexpected `SetNamedSecurityInfoW` failure break updating entirely.
+fn protect_staging_dir(dir: &Path) {
+    if bdo_launch::is_elevated() {
+        let _ = set_high_integrity(dir);
+    }
+}
+
+/// Apply a `High` mandatory label with no-write-up to `dir`.
+fn set_high_integrity(dir: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{ERROR_SUCCESS, LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
+        SE_FILE_OBJECT, SDDL_REVISION_1,
+    };
+    use windows::Win32::Security::{
+        GetSecurityDescriptorSacl, ACL, LABEL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+    };
+
+    // SDDL for a system-access-control-list holding one mandatory label:
+    // no-write-up (NW) at the High integrity level (HI).
+    let sddl: Vec<u16> = "S:(ML;;NW;;;HI)"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+
+    // SAFETY: `sddl` is a NUL-terminated wide string alive across the call, and
+    // `descriptor` is a valid out-parameter that the callee allocates.
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            None,
+        )
+        .map_err(|e| format!("could not build the integrity label: {e}"))?;
+    }
+
+    let mut sacl: *mut ACL = std::ptr::null_mut();
+    let mut present = false.into();
+    let mut defaulted = false.into();
+    // SAFETY: `descriptor` came from the call above and is still owned here.
+    let read = unsafe {
+        GetSecurityDescriptorSacl(descriptor, &mut present, &mut sacl, &mut defaulted)
+    };
+    let result = match read {
+        Ok(()) => {
+            let path: Vec<u16> = dir
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            // SAFETY: NUL-terminated path and a SACL borrowed from the
+            // descriptor, both alive for the duration of the call.
+            let status = unsafe {
+                SetNamedSecurityInfoW(
+                    PCWSTR(path.as_ptr()),
+                    SE_FILE_OBJECT,
+                    LABEL_SECURITY_INFORMATION,
+                    None,
+                    None,
+                    None,
+                    Some(sacl),
+                )
+            };
+            if status == ERROR_SUCCESS {
+                Ok(())
+            } else {
+                Err(format!("could not label the folder: {status:?}"))
+            }
+        }
+        Err(e) => Err(format!("could not read the built label: {e}")),
+    };
+
+    // SAFETY: the descriptor was allocated by the conversion above and is not
+    // used after this point.
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+    }
+    result
+}
+
+/// One staged file, held open so nothing can change it before it is installed.
+pub struct StagedFile {
+    /// Name it will take in the install directory.
+    name: std::ffi::OsString,
+    /// Handle opened denying write, rename and delete. Installation copies from
+    /// *this*, never by re-opening the path.
+    handle: std::fs::File,
+}
+
+/// Open every regular file in the extracted release folder, denying other
+/// processes write/rename/delete access, and hold those handles.
+///
+/// This is what makes "the bytes we verified are the bytes we install" true.
+/// The staging directory lives in the user's temp folder, so a same-user
+/// process can write there; opening each file up front and copying from the
+/// retained handle removes the window in which one could be swapped between
+/// staging and installation. It also fails early — a truncated download or a
+/// file the antivirus has locked errors here, while the installed copy is
+/// still entirely intact.
+fn staged_files(inner: &Path) -> Result<Vec<StagedFile>, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+
     let mut files = Vec::new();
     for entry in std::fs::read_dir(inner)
         .map_err(|e| format!("could not read extracted folder: {e}"))?
@@ -441,9 +612,20 @@ fn staged_files(inner: &Path) -> Result<Vec<(std::ffi::OsString, PathBuf)>, Stri
         if !src.is_file() {
             continue;
         }
-        std::fs::File::open(&src)
-            .map_err(|e| format!("the downloaded {} could not be read: {e}", src.display()))?;
-        files.push((entry.file_name(), src));
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&src)
+            .map_err(|e| {
+                format!(
+                    "the downloaded {} could not be locked for installation: {e}",
+                    src.display()
+                )
+            })?;
+        files.push(StagedFile {
+            name: entry.file_name(),
+            handle,
+        });
     }
     if files.is_empty() {
         return Err("the downloaded release contains no files".to_string());
@@ -457,7 +639,26 @@ fn staged_files(inner: &Path) -> Result<Vec<(std::ffi::OsString, PathBuf)>, Stri
 /// Without the rollback, a copy that fails part-way (disk full, antivirus lock,
 /// permissions) leaves a mix of two versions behind — or, if the executable was
 /// the one already renamed aside, no runnable app at all and no way back.
-fn install_all(staged: &[(std::ffi::OsString, PathBuf)], app_dir: &Path) -> Result<(), String> {
+fn install_all(staged: &mut [StagedFile], app_dir: &Path) -> Result<(), String> {
+    // Write the ledger *before* touching anything, so a crash at any point from
+    // here on is recoverable by the next start. See [`cleanup_old_files`].
+    let ledger = app_dir.join(INSTALL_LEDGER);
+    let names: Vec<String> = staged
+        .iter()
+        .map(|f| f.name.to_string_lossy().into_owned())
+        .collect();
+    std::fs::write(&ledger, names.join("\n"))
+        .map_err(|e| format!("could not record the update for recovery: {e}"))?;
+
+    let result = install_recorded(staged, app_dir);
+    // Only clear the ledger once the swap is settled either way: on success
+    // nothing needs recovering, and on a returned error the rollback below has
+    // already put everything back.
+    let _ = std::fs::remove_file(&ledger);
+    result
+}
+
+fn install_recorded(staged: &mut [StagedFile], app_dir: &Path) -> Result<(), String> {
     // (renamed-aside original, its real name) for undo, plus files we created
     // where nothing existed before.
     let mut displaced: Vec<(PathBuf, PathBuf)> = Vec::new();
@@ -473,7 +674,8 @@ fn install_all(staged: &[(std::ffi::OsString, PathBuf)], app_dir: &Path) -> Resu
         }
     };
 
-    for (name, src) in staged {
+    for file in staged.iter_mut() {
+        let name = &file.name;
         let dest = app_dir.join(name);
         let existed = dest.exists();
         if existed {
@@ -489,8 +691,10 @@ fn install_all(staged: &[(std::ffi::OsString, PathBuf)], app_dir: &Path) -> Resu
             }
             displaced.push((old, dest.clone()));
         }
-        // Copy, not rename: the temp dir can be on a different drive.
-        if let Err(e) = std::fs::copy(src, &dest) {
+        // Copy from the *held handle*, not by re-opening the staged path: the
+        // handle is the only thing proving these are still the verified bytes.
+        // (A rename would also be wrong — the temp dir can be on another drive.)
+        if let Err(e) = copy_from_handle(&mut file.handle, &dest) {
             rollback(&displaced, &created);
             return Err(format!(
                 "could not install {}: {e} — the previous version was put back",
@@ -520,8 +724,20 @@ fn run(cmd: &mut Command) -> Result<(), String> {
     ))
 }
 
-/// Remove `*.old` files a previous update left next to the exe (best-effort:
-/// the old exe may still be held open briefly by the exiting instance).
+/// Name of the in-progress-install ledger written beside the executable.
+///
+/// It exists only between the first file being displaced and the last one
+/// landing, and lists exactly which names this updater renamed aside.
+const INSTALL_LEDGER: &str = "bdo-optimizer-update.pending";
+
+/// Finish whatever the last update started: roll a crashed install back, then
+/// remove the backups a completed one left behind.
+///
+/// The in-process rollback in [`install_all`] only runs when an operation
+/// *returns an error*. Closing the window, a crash, or the machine losing power
+/// mid-swap kills the thread with files already renamed aside — possibly
+/// including the executable itself, leaving nothing runnable. The ledger is what
+/// makes that recoverable from the next start.
 fn cleanup_old_files() {
     let Some(dir) = std::env::current_exe()
         .ok()
@@ -529,14 +745,60 @@ fn cleanup_old_files() {
     else {
         return;
     };
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+    recover_with_ledger(&dir);
+}
+
+/// The recovery itself, split out so it can be tested against a scratch folder
+/// instead of the real install directory.
+fn recover_with_ledger(dir: &Path) {
+    let ledger = dir.join(INSTALL_LEDGER);
+    let names = match std::fs::read_to_string(&ledger) {
+        // A ledger left on disk means the install never finished: put every
+        // recorded file back before anything else runs.
+        Ok(text) => {
+            let names: Vec<String> = text.lines().map(str::to_string).collect();
+            for name in &names {
+                let dest = dir.join(name);
+                let old = dir.join(format!("{name}.old"));
+                if old.is_file() {
+                    let _ = std::fs::remove_file(&dest);
+                    let _ = std::fs::rename(&old, &dest);
+                }
+            }
+            let _ = std::fs::remove_file(&ledger);
+            names
+        }
+        // No ledger: the last install completed, so the backups it left are
+        // safe to drop.
+        Err(_) => Vec::new(),
     };
-    for path in entries.flatten().map(|e| e.path()) {
-        if path.extension().is_some_and(|ext| ext == "old") {
-            let _ = std::fs::remove_file(path);
+
+    // Only ever delete backups this updater is known to own. Sweeping every
+    // `*.old` in the folder destroys unrelated files — users extract the app
+    // into shared folders, and someone's `settings.old` is not ours to remove.
+    let owned: Vec<String> = names
+        .into_iter()
+        .chain(packaged_names().map(str::to_string))
+        .collect();
+    for name in &owned {
+        let old = dir.join(format!("{name}.old"));
+        // Never drop a backup while the file it backs up is missing: that is
+        // the only copy left.
+        if old.is_file() && dir.join(name).is_file() {
+            let _ = std::fs::remove_file(&old);
         }
     }
+}
+
+/// The file names this app ships and therefore replaces on update. Used to
+/// bound backup cleanup to updater-owned paths.
+fn packaged_names() -> impl Iterator<Item = &'static str> {
+    [
+        "bdo-optimizer.exe",
+        crate::presentmon::PRESENTMON_EXE,
+        crate::video::INSPECTOR_EXE,
+    ]
+    .into_iter()
 }
 
 #[cfg(test)]
@@ -566,21 +828,22 @@ mod tests {
         std::fs::write(&zip, b"release bytes").unwrap();
 
         // Exactly what the release workflow writes: hash, two spaces, file name.
+        let reread = || std::fs::File::open(&zip).unwrap();
         let good = "e4c8b1f31e1a4f2e0d0a5c8a3b1d9e77a0f9c4b6d2e8a1c3f5079b2d4e6a8c10";
         let real = {
             use sha2::Digest;
             format!("{:x}", sha2::Sha256::digest(b"release bytes"))
         };
         std::fs::write(&sha, format!("{real}  bdo-optimizer-v9.9.9-windows-x64.zip\n")).unwrap();
-        assert!(verify_checksum(&zip, &sha).is_ok());
+        assert!(verify_checksum(&mut reread(), &sha).is_ok());
 
         // A zip swapped after the checksum was published must be refused.
         std::fs::write(&sha, format!("{good}  x.zip\n")).unwrap();
-        assert!(verify_checksum(&zip, &sha).is_err());
+        assert!(verify_checksum(&mut reread(), &sha).is_err());
 
         // Garbage where a hash should be must be refused, not ignored.
         std::fs::write(&sha, "not-a-hash  x.zip\n").unwrap();
-        assert!(verify_checksum(&zip, &sha).is_err());
+        assert!(verify_checksum(&mut reread(), &sha).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -599,33 +862,95 @@ mod tests {
         std::fs::write(app.join("PresentMon.exe"), b"old presentmon").unwrap();
 
         std::fs::write(stage.join("bdo-optimizer.exe"), b"new exe").unwrap();
-        // Second entry is a *directory* at the source path, so the copy fails
-        // after the first file has already been swapped.
-        std::fs::create_dir(stage.join("PresentMon.exe")).unwrap();
+        std::fs::write(stage.join("PresentMon.exe"), b"new presentmon").unwrap();
 
-        let staged = vec![
-            (
-                std::ffi::OsString::from("bdo-optimizer.exe"),
-                stage.join("bdo-optimizer.exe"),
-            ),
-            (
-                std::ffi::OsString::from("PresentMon.exe"),
-                stage.join("PresentMon.exe"),
-            ),
-        ];
-        assert!(install_all(&staged, &app).is_err());
+        let mut staged = staged_files(&stage).unwrap();
+        staged.sort_by(|a, b| a.name.cmp(&b.name));
+        // Hold the second destination open exclusively so its swap fails the
+        // way an antivirus lock would — after the first file has already been
+        // replaced.
+        let blocker = {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(app.join("PresentMon.exe"))
+                .unwrap()
+        };
+
+        assert!(install_all(&mut staged, &app).is_err());
+        drop(blocker);
 
         assert_eq!(
             std::fs::read(app.join("bdo-optimizer.exe")).unwrap(),
             b"old exe",
             "the already-swapped executable must be rolled back"
         );
-        assert_eq!(
-            std::fs::read(app.join("PresentMon.exe")).unwrap(),
-            b"old presentmon"
+        // The ledger must be gone: a returned error already rolled everything
+        // back, so the next start has nothing to recover.
+        assert!(!app.join(INSTALL_LEDGER).exists());
+
+        drop(staged);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A staged file is held open denying writes, so nothing can substitute it
+    /// between verification and installation — and installation copies from
+    /// that handle rather than re-opening the path.
+    #[test]
+    fn staged_files_are_pinned_against_substitution() {
+        let base = std::env::temp_dir().join(format!("bdo-update-pin-{}", std::process::id()));
+        let stage = base.join("stage");
+        let app = base.join("app");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(stage.join("bdo-optimizer.exe"), b"verified bytes").unwrap();
+
+        let mut staged = staged_files(&stage).unwrap();
+        assert!(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(stage.join("bdo-optimizer.exe"))
+                .is_err(),
+            "a staged file must not be writable while it is pinned"
         );
 
+        install_all(&mut staged, &app).unwrap();
+        assert_eq!(
+            std::fs::read(app.join("bdo-optimizer.exe")).unwrap(),
+            b"verified bytes"
+        );
+
+        drop(staged);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A crash mid-install leaves the ledger behind; the next start must put
+    /// the displaced files back rather than leaving nothing runnable.
+    #[test]
+    fn a_ledger_left_behind_describes_what_to_restore() {
+        let dir = std::env::temp_dir().join(format!("bdo-update-ledger-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Simulate a crash after the executable was renamed aside.
+        std::fs::write(dir.join("bdo-optimizer.exe.old"), b"old exe").unwrap();
+        std::fs::write(dir.join(INSTALL_LEDGER), "bdo-optimizer.exe").unwrap();
+        // An unrelated backup that is none of our business.
+        std::fs::write(dir.join("settings.old"), b"someone else's").unwrap();
+
+        recover_with_ledger(&dir);
+
+        assert_eq!(
+            std::fs::read(dir.join("bdo-optimizer.exe")).unwrap(),
+            b"old exe",
+            "the displaced executable must come back"
+        );
+        assert!(!dir.join(INSTALL_LEDGER).exists());
+        assert!(
+            dir.join("settings.old").exists(),
+            "an unrelated .old file must not be swept up"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

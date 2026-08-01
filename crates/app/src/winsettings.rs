@@ -296,14 +296,23 @@ mod imp {
         if super::dx_setting_is_on(&current, SWAP_EFFECT_UPGRADE) {
             return Ok(false);
         }
-        if let Some(path) = undo_record_path() {
-            if !path.exists() {
-                if let Some(parent) = path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                std::fs::write(&path, previous.encode())
-                    .map_err(|e| format!("could not save the undo record: {e}"))?;
+        // No record, no change. This setting is advertised as reversible, and
+        // the record is the only thing that makes it so — writing the registry
+        // first and discovering afterwards that the original state was never
+        // saved leaves the user with a change they cannot undo.
+        let Some(path) = undo_record_path() else {
+            return Err(
+                "the app data folder could not be located, so the original value could not be \
+                 saved for undo — leaving this setting alone"
+                    .to_string(),
+            );
+        };
+        if !path.exists() {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
             }
+            std::fs::write(&path, previous.encode())
+                .map_err(|e| format!("could not save the undo record: {e}"))?;
         }
         let merged = super::merge_dx_setting(&current, SWAP_EFFECT_UPGRADE, "1");
         write_dx_settings(&Previous::Was(merged))?;

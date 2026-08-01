@@ -114,9 +114,13 @@ pub fn parse_presentmon_csv(
             Ok(true) => {}
             Ok(false) => break,
             // A parse-level error consumed the bad record, so skipping it makes
-            // progress. An IO error does *not* advance the reader, so `continue`
-            // would spin forever — stop and keep whatever we already parsed.
-            Err(e) if matches!(e.kind(), csv::ErrorKind::Io(_)) => break,
+            // progress. An IO error does *not* advance the reader, so
+            // `continue` would spin forever — and returning what was read so
+            // far would hand back a silently truncated capture that then gets
+            // saved and compared as if it were complete. Fail instead.
+            Err(e) if matches!(e.kind(), csv::ErrorKind::Io(_)) => {
+                return Err(BenchError::Csv(e.to_string()))
+            }
             Err(_) => continue,
         }
 
@@ -164,10 +168,16 @@ mod tests {
     }
 
     #[test]
-    fn io_error_terminates_instead_of_looping_forever() {
-        // Before the fix this never returned. Reaching the assert at all is the test.
-        let frames = parse_presentmon_csv(HeaderThenIoError { sent: false }, None).unwrap();
-        assert_eq!(frames, vec![16.6]);
+    fn io_error_terminates_and_is_reported_not_swallowed() {
+        // Two things at once: reaching the assert at all proves it terminates
+        // (an IO error does not advance the reader, so `continue` spun forever),
+        // and the error must surface rather than the partial series being
+        // handed back as a complete capture and saved for comparison.
+        let result = parse_presentmon_csv(HeaderThenIoError { sent: false }, None);
+        assert!(
+            matches!(result, Err(BenchError::Csv(_))),
+            "a truncated read must fail, got {result:?}"
+        );
     }
 
     #[test]

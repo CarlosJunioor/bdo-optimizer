@@ -25,8 +25,8 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows::Win32::System::Threading::{
     CreateProcessW, GetCurrentProcess, GetProcessAffinityMask, OpenProcess, OpenProcessToken,
-    ResumeThread, SetProcessAffinityMask, CREATE_SUSPENDED, PROCESS_INFORMATION,
-    PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
+    ResumeThread, SetProcessAffinityMask, TerminateProcess, WaitForSingleObject, CREATE_SUSPENDED,
+    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
 };
 use windows::Win32::UI::Shell::{
     IShellLinkDataList, IShellLinkW, ShellExecuteExW, ShellLink, SEE_MASK_NOCLOSEPROCESS,
@@ -161,13 +161,18 @@ fn launch_direct(
         // Apply affinity to the launcher; the game will inherit it.
         let set_res = SetProcessAffinityMask(pi.hProcess, mask as usize);
         if let Err(e) = set_res {
-            // Best-effort cleanup: resume so we don't leave a suspended zombie,
-            // then close handles.
-            ResumeThread(pi.hThread);
+            // Kill it rather than resume it. Resuming would start Black Desert
+            // with *no* affinity applied while the UI reports the launch as
+            // failed — the user then plays a whole session unoptimized,
+            // believing nothing started. The process is still suspended and has
+            // executed no instruction, so terminating is clean.
+            let _ = TerminateProcess(pi.hProcess, 1);
+            let _ = WaitForSingleObject(pi.hProcess, 5_000);
             let _ = CloseHandle(pi.hThread);
             let _ = CloseHandle(pi.hProcess);
             return Err(LaunchError::Os(format!(
-                "SetProcessAffinityMask failed: {e}"
+                "SetProcessAffinityMask failed: {e} — the launcher was stopped rather than \
+                 started without the mask"
             )));
         }
 
@@ -309,6 +314,23 @@ pub fn is_elevated() -> bool {
 /// `system32` and fail to find a relative launcher name. The `WorkingDirectory`
 /// is still set below (harmless, and correct for any non-elevated context), but
 /// the command no longer depends on it.
+///
+/// # What the elevation does and does not add
+///
+/// The link runs `cmd.exe` elevated and `start`s the launcher, which therefore
+/// inherits elevation without a second prompt — so an attacker who can replace
+/// `BlackDesertLauncher.exe` in a user-writable install folder gets their
+/// replacement run as administrator when the user clicks this shortcut.
+///
+/// That is worth stating plainly, but it is not privilege this shortcut
+/// introduces: `BlackDesertLauncher.exe` ships a `requireAdministrator`
+/// manifest, so Windows elevates it whichever way the user starts it. Someone
+/// who can write to that folder already gets the same outcome from the user
+/// launching the game normally, and pinning the launcher here would not change
+/// it — the mask has to reach the launcher, and the launcher has to be elevated.
+/// Closing this properly means a signed helper that verifies the publisher, or
+/// an install location the user cannot write to; neither is something this
+/// shortcut can decide.
 ///
 /// Returns the path of the written `.lnk`. Defaults to
 /// `<Desktop>/Black Desert Online (Optimized).lnk` when
@@ -783,11 +805,11 @@ mod tests {
     fn elevated_shell_params_matches_cmd_arguments() {
         assert_eq!(
             elevated_shell_params(0x555, false, r"C:\Games\BDO", "BlackDesertLauncher.exe").unwrap(),
-            "/d /c cd /d \"C:\\Games\\BDO\" && start \"\" /affinity 555 \"BlackDesertLauncher.exe\""
+            "/d /v:off /c cd /d \"C:\\Games\\BDO\" && start \"\" /affinity 555 \"BlackDesertLauncher.exe\""
         );
         assert_eq!(
             elevated_shell_params(0x554, true, r"C:\Games\BDO", "BlackDesertLauncher.exe").unwrap(),
-            "/d /c cd /d \"C:\\Games\\BDO\" && start \"\" /affinity 554 \"BlackDesertLauncher.exe\" -steam"
+            "/d /v:off /c cd /d \"C:\\Games\\BDO\" && start \"\" /affinity 554 \"BlackDesertLauncher.exe\" -steam"
         );
     }
 
@@ -801,7 +823,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            params.starts_with("/d /c cd /d \"C:\\BDO EUW\\BlackDesert\" && "),
+            params.starts_with("/d /v:off /c cd /d \"C:\\BDO EUW\\BlackDesert\" && "),
             "elevated command must cd into the launcher dir first, got: {params}"
         );
     }

@@ -138,28 +138,68 @@ fn map_device_type(t: wgpu::DeviceType) -> GpuDeviceType {
 /// and sort so discrete GPUs come first. Pure function, exercised by unit tests.
 ///
 /// Keyed on `(vendor, device_id)` when the backend reports a device id, since the
-/// same card is named differently by different backends and two identical cards
-/// share one name. Falls back to the name when no device id is available.
+/// same card is named differently by different backends. Falls back to the name
+/// when no device id is available.
+///
+/// # Why the count comes from one backend, not from collapsing duplicates
+///
+/// `AdapterInfo::device` is the PCI *product* id, so two identical cards report
+/// the same vendor and device id — collapsing every match would merge them into
+/// one and under-report the machine. What distinguishes "one card seen through
+/// three backends" from "three cards" is that each backend enumerates each
+/// physical adapter exactly once: the real count for a model is the largest
+/// number of times any single backend listed it.
 fn dedupe_and_sort(adapters: Vec<GpuInfo>) -> Vec<GpuInfo> {
-    fn same_adapter(a: &GpuInfo, b: &GpuInfo) -> bool {
-        if a.device_id != 0 && b.device_id != 0 {
-            a.vendor == b.vendor && a.device_id == b.device_id
+    fn key(g: &GpuInfo) -> (GpuVendor, u32, String) {
+        if g.device_id != 0 {
+            (g.vendor, g.device_id, String::new())
         } else {
-            a.name == b.name
+            (g.vendor, 0, g.name.clone())
+        }
+    }
+
+    // For each model: how many did the busiest backend report, and the best
+    // representative entry seen (preferring a discrete classification).
+    let mut order: Vec<(GpuVendor, u32, String)> = Vec::new();
+    let mut per_backend: Vec<((GpuVendor, u32, String), String, usize)> = Vec::new();
+    let mut best: Vec<((GpuVendor, u32, String), GpuInfo)> = Vec::new();
+
+    for gpu in adapters {
+        let k = key(&gpu);
+        if !order.contains(&k) {
+            order.push(k.clone());
+        }
+        match per_backend
+            .iter_mut()
+            .find(|(pk, backend, _)| *pk == k && *backend == gpu.backend)
+        {
+            Some((_, _, count)) => *count += 1,
+            None => per_backend.push((k.clone(), gpu.backend.clone(), 1)),
+        }
+        match best.iter_mut().find(|(bk, _)| *bk == k) {
+            Some((_, existing)) => {
+                if gpu.device_type == GpuDeviceType::Discrete
+                    && existing.device_type != GpuDeviceType::Discrete
+                {
+                    *existing = gpu;
+                }
+            }
+            None => best.push((k, gpu)),
         }
     }
 
     let mut deduped: Vec<GpuInfo> = Vec::new();
-    for gpu in adapters {
-        if let Some(existing) = deduped.iter_mut().find(|g| same_adapter(g, &gpu)) {
-            // Prefer the discrete classification if any backend reports it.
-            if gpu.device_type == GpuDeviceType::Discrete
-                && existing.device_type != GpuDeviceType::Discrete
-            {
-                *existing = gpu;
+    for k in order {
+        let count = per_backend
+            .iter()
+            .filter(|(pk, _, _)| *pk == k)
+            .map(|(_, _, c)| *c)
+            .max()
+            .unwrap_or(1);
+        if let Some((_, gpu)) = best.iter().find(|(bk, _)| *bk == k) {
+            for _ in 0..count {
+                deduped.push(gpu.clone());
             }
-        } else {
-            deduped.push(gpu);
         }
     }
     // Stable sort: discrete first, keeping original order within a class.
@@ -190,15 +230,21 @@ mod tests {
     }
 
     fn gpu(name: &str, vendor: GpuVendor, dt: GpuDeviceType) -> GpuInfo {
-        gpu_with_id(name, vendor, dt, 0)
+        gpu_full(name, vendor, dt, 0, "Vulkan")
     }
 
-    fn gpu_with_id(name: &str, vendor: GpuVendor, dt: GpuDeviceType, device_id: u32) -> GpuInfo {
+    fn gpu_full(
+        name: &str,
+        vendor: GpuVendor,
+        dt: GpuDeviceType,
+        device_id: u32,
+        backend: &str,
+    ) -> GpuInfo {
         GpuInfo {
             name: name.to_string(),
             vendor,
             device_type: dt,
-            backend: "Test".to_string(),
+            backend: backend.to_string(),
             driver: "Test driver".to_string(),
             device_id,
         }
@@ -208,17 +254,19 @@ mod tests {
     fn dedupe_matches_one_card_across_differently_named_backends() {
         // The GL backend decorates the name; same vendor + device id = same card.
         let input = vec![
-            gpu_with_id(
+            gpu_full(
                 "RTX 4090",
                 GpuVendor::Nvidia,
                 GpuDeviceType::Discrete,
                 0x2684,
+                "Dx12",
             ),
-            gpu_with_id(
+            gpu_full(
                 "NVIDIA GeForce RTX 4090/PCIe/SSE2",
                 GpuVendor::Nvidia,
                 GpuDeviceType::Other,
                 0x2684,
+                "Gl",
             ),
         ];
         let out = dedupe_and_sort(input);
@@ -226,32 +274,48 @@ mod tests {
         assert_eq!(out[0].device_type, GpuDeviceType::Discrete);
     }
 
+    /// Two identical cards report the *same* PCI device id — it is a product id,
+    /// not a slot id — so they are told apart by one backend enumerating the
+    /// model twice, not by differing ids. Keying on the id alone merged a
+    /// two-card machine into one entry.
     #[test]
     fn dedupe_keeps_two_identical_cards_apart() {
-        // Two physical 4090s share a name but not a device id slot.
-        let input = vec![
-            gpu_with_id(
+        let card = |backend| {
+            gpu_full(
                 "RTX 4090",
                 GpuVendor::Nvidia,
                 GpuDeviceType::Discrete,
                 0x2684,
-            ),
-            gpu_with_id(
-                "RTX 4090",
-                GpuVendor::Nvidia,
-                GpuDeviceType::Discrete,
-                0x2685,
-            ),
-        ];
+                backend,
+            )
+        };
+        // Two physical 4090s, each enumerated by both backends.
+        let input = vec![card("Vulkan"), card("Vulkan"), card("Dx12"), card("Dx12")];
         assert_eq!(dedupe_and_sort(input).len(), 2);
+
+        // …and one card seen by three backends is still one card.
+        let input = vec![card("Vulkan"), card("Dx12"), card("Gl")];
+        assert_eq!(dedupe_and_sort(input).len(), 1);
     }
 
     #[test]
     fn dedupe_same_gpu_across_backends() {
         // Same discrete GPU reported under Vulkan and DX12.
         let input = vec![
-            gpu("RTX 4090", GpuVendor::Nvidia, GpuDeviceType::Discrete),
-            gpu("RTX 4090", GpuVendor::Nvidia, GpuDeviceType::Discrete),
+            gpu_full(
+                "RTX 4090",
+                GpuVendor::Nvidia,
+                GpuDeviceType::Discrete,
+                0,
+                "Vulkan",
+            ),
+            gpu_full(
+                "RTX 4090",
+                GpuVendor::Nvidia,
+                GpuDeviceType::Discrete,
+                0,
+                "Dx12",
+            ),
         ];
         let out = dedupe_and_sort(input);
         assert_eq!(out.len(), 1);
@@ -261,8 +325,14 @@ mod tests {
     #[test]
     fn dedupe_prefers_discrete_classification() {
         let input = vec![
-            gpu("Weird GPU", GpuVendor::Amd, GpuDeviceType::Other),
-            gpu("Weird GPU", GpuVendor::Amd, GpuDeviceType::Discrete),
+            gpu_full("Weird GPU", GpuVendor::Amd, GpuDeviceType::Other, 0, "Gl"),
+            gpu_full(
+                "Weird GPU",
+                GpuVendor::Amd,
+                GpuDeviceType::Discrete,
+                0,
+                "Vulkan",
+            ),
         ];
         let out = dedupe_and_sort(input);
         assert_eq!(out.len(), 1);

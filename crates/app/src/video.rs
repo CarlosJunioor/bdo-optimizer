@@ -77,6 +77,64 @@ pub fn default_settings() -> Vec<(u32, u32)> {
     ]
 }
 
+/// The defaults for exactly the settings a previous apply actually wrote.
+///
+/// Restoring every setting in [`default_settings`] undoes work this app never
+/// did: with Ultra Low Latency left unticked — the default — apply never touches
+/// the three ULL entries, so a blanket restore wipes a Low Latency setup the
+/// user configured themselves in the NVIDIA control panel. `applied` is the id
+/// list recorded when the profile was written; an empty list means no record
+/// survived, in which case only the three settings apply *always* writes are
+/// reset.
+pub fn restore_settings(applied: &[u32]) -> Vec<(u32, u32)> {
+    let defaults = default_settings();
+    let touched: Vec<u32> = if applied.is_empty() {
+        guide_settings(8, false).iter().map(|(id, _)| *id).collect()
+    } else {
+        applied.to_vec()
+    };
+    defaults
+        .into_iter()
+        .filter(|(id, _)| touched.contains(id))
+        .collect()
+}
+
+/// Where the list of applied setting ids is kept, beside the other undo record.
+fn applied_record_path() -> Option<PathBuf> {
+    bdo_bench::SessionStore::default_store()
+        .ok()
+        .map(|s| s.dir().join("nvidia-applied-settings.txt"))
+}
+
+/// Record which setting ids an apply wrote, so undo can reverse exactly those.
+pub fn record_applied(settings: &[(u32, u32)]) {
+    let Some(path) = applied_record_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let ids: Vec<String> = settings.iter().map(|(id, _)| id.to_string()).collect();
+    let _ = std::fs::write(path, ids.join("\n"));
+}
+
+/// Read back the ids recorded by [`record_applied`]; empty when none survived.
+pub fn recorded_applied() -> Vec<u32> {
+    let Some(path) = applied_record_path() else {
+        return Vec::new();
+    };
+    std::fs::read_to_string(path)
+        .map(|text| text.lines().filter_map(|l| l.trim().parse().ok()).collect())
+        .unwrap_or_default()
+}
+
+/// Forget the applied-settings record once the profile has been restored.
+pub fn clear_applied_record() {
+    if let Some(path) = applied_record_path() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// Render the `.nip` XML for the Black Desert profile with the given settings.
 ///
 /// Mirrors the element order Profile Inspector's own exporter produces, since
@@ -339,18 +397,40 @@ pub mod worker {
         // was produced by this run, and the guard puts the originals back on
         // every exit path, so nobody else's file is consumed or deleted.
         let stash = stash_exports(&exe_dir)?;
-        run_inspector(exe, &["-exportCustomized"])?;
+        // Anything this run produced must be cleared before the stash is put
+        // back, on *every* path out. Leaving one behind means the next run's
+        // timestamped export can collide with a stashed original's name, and
+        // then neither the guard nor `recover_orphaned_stashes` can restore
+        // that file — the user's export stays hidden under the stash marker.
+        let export_result = run_inspector(exe, &["-exportCustomized"]);
         let created = export_files(&exe_dir);
+        let claim = |keep: Option<&Path>| {
+            for path in &created {
+                if Some(path.as_path()) != keep {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        };
+        if let Err(e) = export_result {
+            claim(None);
+            drop(stash);
+            return Err(e);
+        }
         let export = match created.as_slice() {
             [only] => only,
-            [] => return Err("verification export produced no file".to_string()),
+            [] => {
+                drop(stash);
+                return Err("verification export produced no file".to_string());
+            }
             many => {
+                let count = many.len();
+                claim(None);
+                drop(stash);
                 return Err(format!(
-                    "Profile Inspector produced {} exports at once, so this run's own export \
-                     could not be identified. Close any other Profile Inspector window and \
-                     try again.",
-                    many.len()
-                ))
+                    "Profile Inspector produced {count} exports at once, so this run's own \
+                     export could not be identified. Close any other Profile Inspector window \
+                     and try again."
+                ));
             }
         };
         let bytes = std::fs::read(export)
@@ -783,6 +863,30 @@ mod tests {
         assert!(with_ull.contains(&(ULL_CPL_STATE, 2)));
         assert!(with_ull.contains(&(MAX_PRERENDERED_FRAMES, 1)));
         assert_eq!(with_ull.len(), 6);
+    }
+
+    /// Undo must not reset settings the app never wrote. With ULL left off —
+    /// the default — a blanket restore wiped a Low Latency configuration the
+    /// user had set up themselves.
+    #[test]
+    fn restore_covers_only_what_was_applied() {
+        let applied: Vec<u32> = guide_settings(8, false).iter().map(|(id, _)| *id).collect();
+        let restore = restore_settings(&applied);
+        assert_eq!(restore.len(), 3, "{restore:?}");
+        for id in [ULL_ENABLED, ULL_CPL_STATE, MAX_PRERENDERED_FRAMES] {
+            assert!(
+                !restore.iter().any(|(r, _)| *r == id),
+                "an untouched ULL setting must not be reset: {id}"
+            );
+        }
+
+        // With ULL on, all six were written, so all six come back.
+        let with_ull: Vec<u32> = guide_settings(8, true).iter().map(|(id, _)| *id).collect();
+        assert_eq!(restore_settings(&with_ull).len(), 6);
+
+        // No record survived: fall back to the settings apply always writes,
+        // never to the full set.
+        assert_eq!(restore_settings(&[]).len(), 3);
     }
 
     #[test]

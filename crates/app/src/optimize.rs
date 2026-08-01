@@ -905,6 +905,14 @@ impl App {
             ));
             return;
         }
+        // Record before the job runs, not after: a crash mid-import must not
+        // leave settings written with no record of which ones, or undo would
+        // reset the wrong set.
+        if label == "apply" {
+            crate::video::record_applied(&settings);
+        } else {
+            crate::video::clear_applied_record();
+        }
         self.video.last = None;
         self.video.worker = Some(crate::video::worker::start(exe, settings, label));
         self.oneclick.driver_step = Some(STEP.to_string());
@@ -960,7 +968,10 @@ impl App {
                 Err(e) => self.oneclick.steps.push((step, Err(e))),
             }
 
-            self.one_click_driver_profile(crate::video::default_settings(), "restore");
+            // Reset only what an apply actually wrote — see
+            // [`crate::video::restore_settings`].
+            let applied = crate::video::recorded_applied();
+            self.one_click_driver_profile(crate::video::restore_settings(&applied), "restore");
         }
     }
 
@@ -1278,11 +1289,21 @@ impl App {
             let launcher = self.optimize.launcher_path();
             let mask_hex = self.optimize.mask_input.clone();
             let steam = self.optimize.steam;
+            // A mask the CPU cannot satisfy must gate these too, not just the
+            // launcher path: otherwise the shortcut is written with an affinity
+            // `start` will refuse, and Launch Now walks into the failing Windows
+            // call. The section above already says the mask is out of range —
+            // the buttons should not disagree with it.
+            let logical = self.detection.as_ref().map(|d| d.cpu.logical_cores);
+            let mask_ok = bdo_launch::parse_mask_hex(&mask_hex)
+                .and_then(|mask| bdo_launch::validate_mask(mask, logical))
+                .is_ok();
             let has_launcher = launcher.as_ref().map(|p| p.exists()).unwrap_or(false);
+            let ready = has_launcher && mask_ok;
 
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(has_launcher, egui::Button::new("Create Optimized Shortcut"))
+                    .add_enabled(ready, egui::Button::new("Create Optimized Shortcut"))
                     .clicked()
                 {
                     self.optimize.shortcut_result = Some(win_actions::create_shortcut(
@@ -1292,7 +1313,7 @@ impl App {
                     ));
                 }
                 if ui
-                    .add_enabled(has_launcher, egui::Button::new("Launch Now with Affinity"))
+                    .add_enabled(ready, egui::Button::new("Launch Now with Affinity"))
                     .clicked()
                 {
                     self.optimize.launch_result =
@@ -1306,6 +1327,15 @@ impl App {
                     RichText::new("Select a valid launcher path above to enable these actions.")
                         .size(12.0)
                         .weak(),
+                );
+            } else if !mask_ok {
+                ui.label(
+                    RichText::new(
+                        "Fix the affinity mask above to enable these actions — this one does \
+                         not fit this CPU.",
+                    )
+                    .size(12.0)
+                    .color(WARN),
                 );
             }
 
@@ -1510,21 +1540,27 @@ impl App {
                             .add_enabled(!busy, egui::Button::new("Apply guide profile"))
                             .clicked()
                         {
+                            let settings =
+                                crate::video::guide_settings(physical_cores, self.video.ull);
+                            crate::video::record_applied(&settings);
                             self.video.last = None;
-                            self.video.worker = Some(crate::video::worker::start(
-                                exe.clone(),
-                                crate::video::guide_settings(physical_cores, self.video.ull),
-                                "apply",
-                            ));
+                            self.video.worker =
+                                Some(crate::video::worker::start(exe.clone(), settings, "apply"));
                         }
                         if ui
                             .add_enabled(!busy, egui::Button::new("Restore driver defaults"))
+                            .on_hover_text(
+                                "Resets only the settings this app applied, so a Low Latency \
+                                 setup you configured yourself is left alone.",
+                            )
                             .clicked()
                         {
+                            let applied = crate::video::recorded_applied();
+                            crate::video::clear_applied_record();
                             self.video.last = None;
                             self.video.worker = Some(crate::video::worker::start(
                                 exe,
-                                crate::video::default_settings(),
+                                crate::video::restore_settings(&applied),
                                 "restore",
                             ));
                         }

@@ -68,12 +68,24 @@ fn relaunch_path_as_admin(exe: &Path) -> RelaunchOutcome {
     // still letting the elevation service load the image (proved by
     // `bdo_bench::capture::tests::a_locked_executable_still_runs_but_cannot_be_written`).
     //
-    // Best-effort on purpose: if the handle cannot be taken we still elevate.
-    // Turning a hardening measure into a new way for "Restart as administrator"
-    // to fail would cost users more than it protects them, and this closes the
-    // race, not the underlying problem — code signing plus an install location
-    // under `Program Files` is the real fix. See [`validated_relaunch_target`].
-    let _pinned = pin_image(&exe);
+    // Fatal if it cannot be taken. Continuing without the pin would let an
+    // attacker *cause* the failure — hold a conflicting handle, watch us elevate
+    // anyway, then swap the image — which is the exact race this closes. Nothing
+    // legitimate holds a write handle to a running executable, so refusing here
+    // costs an honest user nothing. It closes the race, not the underlying
+    // problem: code signing plus an install location under `Program Files` is
+    // the real fix. See [`validated_relaunch_target`].
+    let _pinned = match pin_image(&exe) {
+        Some(handle) => handle,
+        None => {
+            return RelaunchOutcome::Failed(
+                "this executable could not be locked against modification, so it was not \
+                 restarted as administrator — another program is holding it open. Close any \
+                 antivirus scan or file-sync tool touching the app folder and try again."
+                    .to_string(),
+            )
+        }
+    };
     let verb_w = to_wide("runas");
     // Encode the path exactly rather than round-tripping through lossy UTF-8,
     // which would rewrite an unpaired surrogate to U+FFFD and hand ShellExecuteW
