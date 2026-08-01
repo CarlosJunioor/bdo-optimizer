@@ -9,6 +9,10 @@ description = "Desktop GUI: detect hardware, apply the optimal BDO CPU-affinity,
 name = "bdo-optimizer"
 path = "src/main.rs"
 
+# Embeds assets/icon.ico into the .exe as its file icon (Windows builds only).
+[build-dependencies]
+winresource = "0.1"
+
 [dependencies]
 bdo-hw = { path = "../hw" }
 bdo-launch = { path = "../launch" }
@@ -43,6 +47,9 @@ directories = "6.0.0"
 # Parsing the GitHub Releases API response for the in-app updater (already in
 # the tree via bdo-bench's session files).
 serde_json = "1.0.151"
+
+# Decoding the embedded window/taskbar icon (the crate is already in the tree).
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 
 # Windows-only: relaunch the app elevated (ShellExecuteW verb "runas") from the
 # Benchmark tab's "Restart as administrator" button.

@@ -33,7 +33,8 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1100.0, 760.0])
             .with_min_inner_size([820.0, 560.0])
-            .with_title(format!("BDO Optimizer v{}", env!("CARGO_PKG_VERSION"))),
+            .with_title(format!("BDO Optimizer v{}", env!("CARGO_PKG_VERSION")))
+            .with_icon(app_icon()),
         ..Default::default()
     };
 
@@ -42,4 +43,18 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
     )
+}
+
+/// Window/taskbar icon decoded from the bundled logo. The exe's *file* icon is
+/// embedded separately by build.rs; both come from the same source PNG.
+fn app_icon() -> egui::IconData {
+    let img = image::load_from_memory(include_bytes!("../../../assets/icon.png"))
+        .expect("bundled icon.png is valid")
+        .into_rgba8();
+    let (width, height) = img.dimensions();
+    egui::IconData {
+        rgba: img.into_raw(),
+        width,
+        height,
+    }
 }

@@ -6,6 +6,8 @@ Inspect your PC, safely apply BDO CPU affinity, and prove the gain locally.
 ![Platform](https://img.shields.io/badge/BDO_workflow-Windows-0078D4)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
+<img src="assets/screenshot.png" alt="BDO Optimizer — Inspect tab showing detected hardware and the recommended affinity mask" width="720">
+
 BDO Optimizer is an open-source desktop app for Black Desert Online players who
 want a hardware-aware CPU-affinity recommendation and a repeatable way to check
 whether it improves frame rate and frame pacing on their own PC.
