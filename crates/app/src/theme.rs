@@ -116,6 +116,9 @@ pub fn apply(ctx: &egui::Context) {
     v.hyperlink_color = ACCENT;
     v.warn_fg_color = WARN;
     v.error_fg_color = ERR;
+    // Hand cursor on every hoverable widget (buttons, nav rows, links) —
+    // without this egui leaves the arrow cursor and buttons feel dead.
+    v.interact_cursor = Some(egui::CursorIcon::PointingHand);
     v.widgets.noninteractive.corner_radius = CornerRadius::same(9);
     v.widgets.inactive.corner_radius = CornerRadius::same(9);
     v.widgets.hovered.corner_radius = CornerRadius::same(9);
@@ -240,6 +243,13 @@ pub fn core_map(ui: &mut egui::Ui, cpu: &bdo_hw::CpuInfo, lit: &[usize]) {
         vec![(String::new(), false, cores.iter().collect())]
     };
 
+    // Keep repainting while any core is lit so the activity pulse animates.
+    // core_map only runs while it is on screen, so this costs nothing elsewhere.
+    if !lit.is_empty() {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(50));
+    }
+
     ui.horizontal_wrapped(|ui| {
         for (label, vcache, members) in &groups {
             egui::Frame::new()
@@ -269,17 +279,59 @@ pub fn core_map(ui: &mut egui::Ui, cpu: &bdo_hw::CpuInfo, lit: &[usize]) {
                 });
         }
     });
+
+    if !lit.is_empty() {
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 14.0), egui::Sense::hover());
+            let pulse = pulse_at(ui, 0);
+            ui.painter().circle_filled(
+                dot.center(),
+                2.5 + 1.0 * pulse,
+                lerp_color(ACCENT_DIM, ACCENT, pulse),
+            );
+            ui.label(
+                RichText::new("The game runs on the glowing cores — dim ones stay free for Windows.")
+                    .small()
+                    .color(INK_3),
+            );
+        });
+    }
+}
+
+/// 0..1 activity pulse, phase-shifted per core so the glow sweeps across the map.
+fn pulse_at(ui: &egui::Ui, index: usize) -> f32 {
+    let t = ui.input(|i| i.time);
+    (((t * 2.2 - index as f64 * 0.45).sin() * 0.5 + 0.5) as f32).powi(2)
+}
+
+fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let l = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t) as u8;
+    Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
 }
 
 fn chip(ui: &mut egui::Ui, index: usize, threads: &[usize], lit: &[usize]) {
     let on = threads.iter().any(|t| lit.contains(t));
     let (rect, _) = ui.allocate_exact_size(egui::vec2(30.0, 34.0), egui::Sense::hover());
+    let pulse = pulse_at(ui, index);
     let painter = ui.painter();
     let (fill, border, ink) = if on {
-        (Color32::from_rgb(0x2A, 0x26, 0x1C), ACCENT_DIM, ACCENT)
+        (
+            Color32::from_rgb(0x2A, 0x26, 0x1C),
+            lerp_color(ACCENT_DIM, ACCENT, pulse),
+            ACCENT,
+        )
     } else {
         (CARD, STROKE, INK_3)
     };
+    if on {
+        // Soft glow halo behind the chip, breathing with the pulse.
+        painter.rect_filled(
+            rect.expand(2.0),
+            CornerRadius::same(8),
+            Color32::from_rgba_unmultiplied(ACCENT.r(), ACCENT.g(), ACCENT.b(), (26.0 * pulse) as u8),
+        );
+    }
     painter.rect(
         rect,
         CornerRadius::same(6),
@@ -294,7 +346,7 @@ fn chip(ui: &mut egui::Ui, index: usize, threads: &[usize], lit: &[usize]) {
         FontId::new(10.0, FontFamily::Monospace),
         ink,
     );
-    // One dot per hardware thread, lit individually.
+    // One dot per hardware thread, lit individually; lit dots carry the pulse.
     let n = threads.len().max(1) as f32;
     let dot = 5.0;
     let gap = 3.0;
@@ -306,7 +358,11 @@ fn chip(ui: &mut egui::Ui, index: usize, threads: &[usize], lit: &[usize]) {
         painter.rect_filled(
             dot_rect,
             CornerRadius::same(2),
-            if lit.contains(t) { ACCENT } else { STROKE },
+            if lit.contains(t) {
+                lerp_color(ACCENT_DIM, ACCENT, 0.4 + 0.6 * pulse)
+            } else {
+                STROKE
+            },
         );
         x += dot + gap;
     }

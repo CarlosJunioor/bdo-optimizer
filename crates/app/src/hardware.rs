@@ -205,7 +205,7 @@ impl App {
         };
         let recommendation = &det.recommendation;
         let mut continue_to_apply = false;
-        section_card(ui, icons::CROSSHAIR, "Recommendation", |ui| {
+        section_card(ui, icons::PULSE, "Recommendation", |ui| {
             ui.label(RichText::new(&recommendation.explanation).color(theme::INK_2));
             match recommendation.topology_confirmed {
                 Some(true) => {
