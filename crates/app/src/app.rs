@@ -305,17 +305,7 @@ impl App {
             return false;
         }
         let ctx = ui.ctx().clone();
-        let texture = self.splash_texture.get_or_insert_with(|| {
-            let img = image::load_from_memory(include_bytes!("../../../assets/icon.png"))
-                .expect("bundled icon.png is valid")
-                .into_rgba8();
-            let size = [img.width() as usize, img.height() as usize];
-            ctx.load_texture(
-                "splash-logo",
-                egui::ColorImage::from_rgba_unmultiplied(size, &img),
-                Default::default(),
-            )
-        });
+        let texture = self.logo_texture(&ctx);
 
         let rect = ctx.content_rect();
         let painter = ui.painter();
@@ -339,6 +329,24 @@ impl App {
         );
         ctx.request_repaint();
         true
+    }
+
+    /// The bundled logo as an egui texture, uploaded once and shared by the
+    /// splash screen and the enhance-style apply screen.
+    pub(crate) fn logo_texture(&mut self, ctx: &egui::Context) -> egui::TextureHandle {
+        self.splash_texture
+            .get_or_insert_with(|| {
+                let img = image::load_from_memory(include_bytes!("../../../assets/icon.png"))
+                    .expect("bundled icon.png is valid")
+                    .into_rgba8();
+                let size = [img.width() as usize, img.height() as usize];
+                ctx.load_texture(
+                    "splash-logo",
+                    egui::ColorImage::from_rgba_unmultiplied(size, &img),
+                    Default::default(),
+                )
+            })
+            .clone()
     }
 
     /// Poll the detection channel; when the result lands, seed dependent state.

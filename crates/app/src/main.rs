@@ -14,6 +14,7 @@ mod app;
 mod benchmark;
 mod capture;
 mod detect;
+mod enhance;
 mod format;
 mod gameconfig;
 mod hardware;
