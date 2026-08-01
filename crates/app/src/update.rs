@@ -405,7 +405,7 @@ fn apply(
     // The zip contains a single versioned folder with all the files in it.
     // Requiring *exactly* one is the point: picking "the first directory" would
     // let anything else that appeared here be installed instead.
-    let dirs: Vec<PathBuf> = std::fs::read_dir(&tmp)
+    let dirs: Vec<PathBuf> = std::fs::read_dir(tmp)
         .map_err(|e| format!("could not read temp dir: {e}"))?
         .flatten()
         .map(|e| e.path())
