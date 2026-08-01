@@ -92,6 +92,13 @@ pub struct VideoState {
     /// apply added to them, so a failure that never reached the driver can be
     /// rewound. See `video::restore_applied_record`.
     pub applied_before: Vec<u32>,
+    /// The machine-wide driver lock, held from *before* the applied-settings
+    /// record is read until the job's bookkeeping is done. Dropping it after
+    /// spawning the worker left the record's read-modify-write and the
+    /// completion bookkeeping unguarded, so a second instance could interleave
+    /// and one could rewind or clear the other's ids.
+    #[cfg(windows)]
+    pub driver_lock: Option<crate::video::DriverLock>,
 }
 
 /// State for the game-config-files section of the Optimize tab.

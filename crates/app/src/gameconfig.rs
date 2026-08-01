@@ -698,10 +698,18 @@ fn restore_one(root: &Path, path: &Path) -> Result<FileChange, String> {
     let backup_bytes = std::fs::read(&backup).map_err(|e| format!("backup unreadable: {e}"))?;
 
     // The live file was deleted (by the game, or by hand): there is nothing to
-    // merge into, so the snapshot *is* the best available restore.
-    let Ok(live_bytes) = std::fs::read(path) else {
-        write_atomic_bytes(path, &backup_bytes).map_err(|e| format!("restore failed: {e}"))?;
-        return Ok(FileChange::Restored);
+    // merge into, so the snapshot *is* the best available restore. Only a
+    // genuine `NotFound` counts — a permission error, a sharing violation or an
+    // unhydrated cloud file would otherwise be read as "deleted" and answered
+    // by overwriting a file that is still there, discarding everything changed
+    // since the backup.
+    let live_bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            write_atomic_bytes(path, &backup_bytes).map_err(|e| format!("restore failed: {e}"))?;
+            return Ok(FileChange::Restored);
+        }
+        Err(e) => return Err(format!("could not read the current file: {e}")),
     };
 
     let is_xml = path

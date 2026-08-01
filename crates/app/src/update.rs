@@ -197,6 +197,15 @@ fn hidden(program: &str) -> Command {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let mut cmd = Command::new(system32(program));
     cmd.creation_flags(CREATE_NO_WINDOW);
+    // curl reads `.curlrc` / `_curlrc` from the user's own directories unless
+    // `-q` is the *first* argument. Those files can set a proxy, add a CA, or
+    // disable verification — enough for a same-user process to serve its own
+    // release, archive and matching checksum to an elevated updater, which
+    // would then install and run it. The sidecar checksum is no defence: it
+    // travels the same redirected channel.
+    if program.eq_ignore_ascii_case("curl.exe") {
+        cmd.arg("-q");
+    }
     cmd
 }
 
@@ -381,6 +390,12 @@ fn apply(
     };
 
     progress("Installing…");
+    // One installer at a time, machine-wide, held across the swap *and* the
+    // verification and rollback that follow. Releasing it when `install_all`
+    // returned let a second instance reuse the shared ledger and `.old` names
+    // while this one was still verifying — after which a rollback here would
+    // act on the other transaction's files. See [`UpdateLock`].
+    let _lock = UpdateLock::acquire()?;
     let mut staged = staged_files(&inner)?;
     install_all(&mut staged, &app_dir)?;
     // The install folder is the portable app folder, which is user-writable in
@@ -601,8 +616,6 @@ fn staged_files(inner: &Path) -> Result<Vec<StagedFile>, String> {
 /// permissions) leaves a mix of two versions behind — or, if the executable was
 /// the one already renamed aside, no runnable app at all and no way back.
 fn install_all(staged: &mut [StagedFile], app_dir: &Path) -> Result<(), String> {
-    // One installer at a time, machine-wide. See [`UpdateLock`].
-    let _lock = UpdateLock::acquire()?;
     // Pin the install directory for the whole swap. Every path below is built
     // from `app_dir`, which was resolved before any of this started: without
     // the pin a same-user process could rename that directory away and drop a
@@ -697,8 +710,12 @@ fn roll_back_completed_install(app_dir: &Path) -> Result<(), String> {
     let text = read_ledger(&ledger).map_err(|e| e.to_string())?;
     let names: Vec<String> = text.lines().skip(1).map(str::to_string).collect();
     // Re-arm the ledger first: if this process dies mid-rollback, the next
-    // start finishes the job instead of finding a half-reverted folder.
-    let _ = write_ledger(&ledger, LEDGER_PENDING, &names);
+    // start finishes the job instead of finding a half-reverted folder. If that
+    // write fails there is no safety net, and starting anyway would leave a
+    // `done` ledger over a half-reverted install — whose surviving `.old` files
+    // the next start would delete rather than restore.
+    write_ledger(&ledger, LEDGER_PENDING, &names)
+        .map_err(|e| format!("could not re-arm the update ledger to roll back: {e}"))?;
     let mut ok = true;
     for name in &names {
         if !restore_one(app_dir, name) {
@@ -1017,9 +1034,13 @@ fn recover_with_ledger(dir: &Path) {
             }
             (names, all_restored)
         }
-        // No ledger: the last install completed, so the backups it left are
-        // safe to drop.
-        Err(_) => (Vec::new(), true),
+        // No ledger at all: the last install completed and the backups it left
+        // are safe to drop. Any *other* read failure is not that — a sharing or
+        // permission error during an interrupted update would send us into the
+        // cleanup path and delete the only rollback copies. Leave everything be
+        // and let the next start try again.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Vec::new(), true),
+        Err(_) => return,
     };
 
     if !recovered {

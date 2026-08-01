@@ -300,8 +300,9 @@ impl App {
             // Read the mask and note which process it came from together. A
             // capture is saved carrying this mask and a trusted role, so it has
             // to be able to prove the frames came from *this* instance.
-            self.optimize.verify = Some(win_actions::verify(&self.optimize.mask_input));
-            self.optimize.verified_pid = win_actions::verified_pid();
+            let (outcome, pid) = win_actions::verify(&self.optimize.mask_input);
+            self.optimize.verify = Some(outcome);
+            self.optimize.verified_pid = pid;
             self.optimize.last_verify_at = Some(std::time::Instant::now());
         }
     }
@@ -466,10 +467,25 @@ impl App {
                     ui.label(RichText::new(format!("🔒 {blocker}")).color(WARN).size(13.0));
                 }
             });
-            #[cfg(windows)]
-            if needs_admin {
-                ui.vertical_centered(|ui| self.relaunch_admin_button(ui));
-            }
+        }
+
+        // Elevation is not required to apply — it only unlocks the NVIDIA step
+        // — so this is an offer beside a working button, not a gate in front of
+        // a disabled one.
+        #[cfg(windows)]
+        if needs_admin {
+            ui.add_space(10.0);
+            ui.vertical_centered(|ui| {
+                ui.label(
+                    RichText::new(
+                        "Running as administrator would also let this apply the NVIDIA driver \
+                         profile. Without it, the other steps still run.",
+                    )
+                    .size(12.0)
+                    .weak(),
+                );
+                self.relaunch_admin_button(ui);
+            });
         }
         let _ = needs_admin;
 
@@ -741,20 +757,14 @@ impl App {
                 "The affinity mask is invalid — fix it in the Affinity section below.".to_string(),
             );
         }
-        if self.show_nvidia_section() {
-            if !self.benchmark.elevated {
-                blockers.push(
-                    "You need to run the app as administrator so the NVIDIA driver profile can \
-                     be written:"
-                        .to_string(),
-                );
-            } else if self.video.inspector.is_none() {
-                blockers.push(format!(
-                    "{} was not found next to the app — the NVIDIA profile step cannot run.",
-                    crate::video::INSPECTOR_EXE
-                ));
-            }
-        }
+        // The NVIDIA profile is deliberately *not* a blocker. It is one step of
+        // four, and the other three — the affinity shortcut, the config files
+        // and the per-user Windows setting — all work as a standard user.
+        // Blocking the whole button on it meant a non-elevated user on an
+        // NVIDIA machine could not run any of them, which is neither what the
+        // README promises nor what the button is for. The driver step reports
+        // itself as unavailable in the results instead; see
+        // [`Self::one_click_driver_profile`].
         blockers
     }
 
@@ -835,6 +845,9 @@ impl App {
             }
             self.video.last = Some(outcome.result);
             self.video.worker = None;
+            // Bookkeeping is done; release the machine-wide lock so another
+            // instance can take its turn.
+            self.video.driver_lock = None;
         }
     }
 
@@ -896,6 +909,9 @@ impl App {
             .as_ref()
             .is_some_and(|d| d.gpus.iter().any(|g| g.vendor == bdo_hw::GpuVendor::Nvidia));
         if !has_nvidia {
+            // A restore path may already hold the lock; nothing will start, so
+            // release it here rather than leaving it held for the session.
+            self.video.driver_lock = None;
             return;
         }
         if !self.benchmark.elevated {
@@ -907,6 +923,7 @@ impl App {
                         .into(),
                 ),
             ));
+            self.video.driver_lock = None;
             return;
         }
         if !self.video.inspector_resolved {
@@ -921,6 +938,7 @@ impl App {
                     crate::video::INSPECTOR_EXE
                 )),
             ));
+            self.video.driver_lock = None;
             return;
         };
         if self.video.worker.is_some() {
@@ -940,9 +958,15 @@ impl App {
         // reports a verified success (see `poll_driver_worker`): clearing it up
         // front would leave a failed restore with nothing to retry from.
         if label == "apply" {
-            // Read-then-write on a file another instance may also be editing:
-            // hold the same machine-wide lock the job itself takes.
-            let _machine_wide = crate::video::DriverLock::acquire();
+            // Take the machine-wide lock before reading the record and keep it
+            // until `poll_driver_worker` finishes the bookkeeping.
+            match crate::video::DriverLock::acquire() {
+                Ok(lock) => self.video.driver_lock = Some(lock),
+                Err(e) => {
+                    self.oneclick.steps.push((STEP.into(), Err(e)));
+                    return;
+                }
+            }
             self.video.applied_before = crate::video::recorded_applied();
             if let Err(e) = crate::video::record_applied(&settings) {
                 self.oneclick.steps.push((
@@ -1014,6 +1038,13 @@ impl App {
             // [`crate::video::restore_settings`]. With no record there is
             // nothing this app can claim to have changed, so the profile is
             // left alone rather than reset on a guess.
+            match crate::video::DriverLock::acquire() {
+                Ok(lock) => self.video.driver_lock = Some(lock),
+                Err(e) => {
+                    self.oneclick.steps.push(("NVIDIA driver profile".into(), Err(e)));
+                    return;
+                }
+            }
             let applied = crate::video::recorded_applied();
             let settings = crate::video::restore_settings(&applied);
             if settings.is_empty() {
@@ -1021,6 +1052,7 @@ impl App {
                     "NVIDIA driver profile".into(),
                     Ok("left alone — this app has no record of changing it".into()),
                 ));
+                self.video.driver_lock = None;
             } else {
                 self.one_click_driver_profile(settings, "restore");
             }
@@ -1502,6 +1534,9 @@ impl App {
             None => return,
         };
         if !has_nvidia {
+            // A restore path may already hold the lock; nothing will start, so
+            // release it here rather than leaving it held for the session.
+            self.video.driver_lock = None;
             return;
         }
 
@@ -1596,7 +1631,13 @@ impl App {
                                 crate::video::guide_settings(physical_cores, self.video.ull);
                             // Same contract as the one-click path: no record,
                             // no change — the button promises a reversible edit.
-                            let _machine_wide = crate::video::DriverLock::acquire();
+                            match crate::video::DriverLock::acquire() {
+                                Ok(lock) => self.video.driver_lock = Some(lock),
+                                Err(e) => {
+                                    self.video.last = Some(Err(e));
+                                    return;
+                                }
+                            }
                             self.video.applied_before = crate::video::recorded_applied();
                             match crate::video::record_applied(&settings) {
                                 Ok(()) => {
@@ -1960,27 +2001,28 @@ mod win_actions {
         bdo_launch::launch_with_affinity(&launcher, mask, steam)
     }
 
-    /// The PID whose affinity the last [`verify`] read, so a capture can bind
-    /// to that exact instance instead of "whatever is running now".
-    pub fn verified_pid() -> Option<u32> {
-        bdo_bench::is_process_running(GAME_EXE).map(|pid| pid.as_u32())
-    }
-
-    pub fn verify(expected_hex: &str) -> VerifyOutcome {
+    /// Verify the running game's mask and report which process it came from.
+    ///
+    /// Both come out of one lookup: scanning for the mask and then scanning
+    /// again for the pid leaves a gap in which the game can exit and restart,
+    /// after which a capture would bind to the new instance while carrying the
+    /// old one's mask as trusted provenance.
+    pub fn verify(expected_hex: &str) -> (VerifyOutcome, Option<u32>) {
         let expected = match parse_mask_hex(expected_hex) {
             Ok(m) => m,
-            Err(e) => return VerifyOutcome::BadExpected(e.to_string()),
+            Err(e) => return (VerifyOutcome::BadExpected(e.to_string()), None),
         };
-        match bdo_launch::read_process_affinity(GAME_EXE) {
-            Ok(None) => VerifyOutcome::NotRunning,
-            Ok(Some(actual)) => {
-                if actual == expected {
+        match bdo_launch::read_process_affinity_with_pid(GAME_EXE) {
+            Ok(None) => (VerifyOutcome::NotRunning, None),
+            Ok(Some((pid, actual))) => {
+                let outcome = if actual == expected {
                     VerifyOutcome::Match { mask: actual }
                 } else {
                     VerifyOutcome::Mismatch { actual, expected }
-                }
+                };
+                (outcome, Some(pid))
             }
-            Err(e) => VerifyOutcome::Error(e.to_string()),
+            Err(e) => (VerifyOutcome::Error(e.to_string()), None),
         }
     }
 }

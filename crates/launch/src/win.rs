@@ -477,6 +477,19 @@ fn default_desktop_path() -> Result<PathBuf, LaunchError> {
 /// anti-cheat is not tripped), and calls `GetProcessAffinityMask`. Returns
 /// `Ok(None)` when the process is not running.
 pub fn read_process_affinity(process_name: &str) -> Result<Option<u64>, LaunchError> {
+    Ok(read_process_affinity_with_pid(process_name)?.map(|(_, mask)| mask))
+}
+
+/// [`read_process_affinity`], also reporting *which* process the mask came from.
+///
+/// The two have to come from one lookup. Scanning for the mask and then
+/// scanning again for the pid leaves a gap in which the game can exit and
+/// restart: the benchmark would then be bound to a new, unverified instance
+/// while carrying the old one's mask as trusted provenance, and an unoptimized
+/// run would be saved as an optimized one.
+pub fn read_process_affinity_with_pid(
+    process_name: &str,
+) -> Result<Option<(u32, u64)>, LaunchError> {
     use sysinfo::{ProcessesToUpdate, System};
 
     let mut sys = System::new();
@@ -501,7 +514,7 @@ pub fn read_process_affinity(process_name: &str) -> Result<Option<u64>, LaunchEr
         let _ = CloseHandle(handle);
         res.map_err(|e| LaunchError::Os(format!("GetProcessAffinityMask failed: {e}")))?;
 
-        Ok(Some(process_mask as u64))
+        Ok(Some((pid, process_mask as u64)))
     }
 }
 

@@ -519,10 +519,12 @@ pub mod worker {
         cancel: &std::sync::atomic::AtomicBool,
         imported: &mut bool,
     ) -> Result<String, String> {
+        // In-process serialisation only. The *machine-wide* `DriverLock` is
+        // held by the caller for the whole transaction — from before the
+        // applied-settings record is read until the completion bookkeeping is
+        // done — so taking it again here would block against our own UI thread
+        // (a Windows mutex is owned by a thread, not a process).
         let _serialized = job_lock();
-        // …and across processes, so a second copy of the app cannot interleave
-        // its own import and record rewrite with this one.
-        let _machine_wide = super::DriverLock::acquire()?;
         if cancelled(cancel) {
             return Err("cancelled".to_string());
         }

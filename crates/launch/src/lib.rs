@@ -59,14 +59,14 @@ pub use error::LaunchError;
 mod win;
 #[cfg(windows)]
 pub use win::{
-    create_shortcut, find_bdo_install, is_elevated, launch_with_affinity, read_process_affinity,
+    create_shortcut, find_bdo_install, is_elevated, launch_with_affinity, read_process_affinity, read_process_affinity_with_pid,
 };
 
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::{
-    create_shortcut, find_bdo_install, launch_with_affinity, read_process_affinity,
+    create_shortcut, find_bdo_install, launch_with_affinity, read_process_affinity, read_process_affinity_with_pid,
     write_desktop_file,
 };
 
