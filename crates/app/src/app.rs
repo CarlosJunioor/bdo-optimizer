@@ -97,13 +97,27 @@ pub struct GameConfigState {
     pub blocked: Option<String>,
 }
 
-/// State for the one-click "Apply everything safe" action.
+/// Which screen the Apply tab shows: the round button, the progress ring, or
+/// the results summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ApplyPhase {
+    #[default]
+    Idle,
+    Running,
+    Done,
+}
+
+/// State for the one-click "Apply Performance Optimizer" action.
 #[derive(Default)]
 pub struct OneClickState {
+    /// Which apply screen is showing.
+    pub phase: ApplyPhase,
+    /// True when the current/last run was an undo rather than an apply.
+    pub undoing: bool,
     /// Per-step outcome of the last run, in the order the steps ran.
     pub steps: Vec<(String, Result<String, String>)>,
-    /// True once a run has happened, so the empty list is not shown as success.
-    pub ran: bool,
+    /// When the last run started; drives the staggered step-reveal animation.
+    pub started: Option<Instant>,
     /// Set while the driver-profile job this run started is still in flight, so
     /// its result can be folded back into `steps` when it finishes.
     pub driver_step: Option<String>,
@@ -253,6 +267,10 @@ pub struct App {
     pub benchmark: BenchmarkState,
     #[cfg(windows)]
     pub update: crate::update::UpdateState,
+    /// When the app opened; drives the startup splash screen.
+    splash_started: Instant,
+    /// Lazily-uploaded splash logo texture.
+    splash_texture: Option<egui::TextureHandle>,
 }
 
 impl App {
@@ -271,7 +289,56 @@ impl App {
             benchmark: BenchmarkState::new(),
             #[cfg(windows)]
             update: crate::update::UpdateState::new(cc.egui_ctx.clone()),
+            splash_started: Instant::now(),
+            splash_texture: None,
         }
+    }
+
+    /// Startup splash: the app logo centered, version bottom-right, fading out
+    /// into the app. Returns true while it is showing (the app UI waits).
+    fn splash_ui(&mut self, ui: &mut egui::Ui) -> bool {
+        const TOTAL: Duration = Duration::from_millis(1800);
+        const FADE_SECS: f32 = 0.45;
+
+        let elapsed = self.splash_started.elapsed();
+        if elapsed >= TOTAL {
+            return false;
+        }
+        let ctx = ui.ctx().clone();
+        let texture = self.splash_texture.get_or_insert_with(|| {
+            let img = image::load_from_memory(include_bytes!("../../../assets/icon.png"))
+                .expect("bundled icon.png is valid")
+                .into_rgba8();
+            let size = [img.width() as usize, img.height() as usize];
+            ctx.load_texture(
+                "splash-logo",
+                egui::ColorImage::from_rgba_unmultiplied(size, &img),
+                Default::default(),
+            )
+        });
+
+        let rect = ctx.content_rect();
+        let painter = ui.painter();
+        painter.rect_filled(rect, 0.0, crate::theme::BG);
+        // Fade the logo and version out over the last FADE_SECS of the splash.
+        let remaining = (TOTAL - elapsed).as_secs_f32();
+        let opacity = (remaining / FADE_SECS).clamp(0.0, 1.0);
+        let side = 230.0;
+        painter.image(
+            texture.id(),
+            egui::Rect::from_center_size(rect.center(), egui::vec2(side, side)),
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE.gamma_multiply(opacity),
+        );
+        painter.text(
+            rect.right_bottom() - egui::vec2(14.0, 10.0),
+            egui::Align2::RIGHT_BOTTOM,
+            format!("v{}", env!("CARGO_PKG_VERSION")),
+            egui::FontId::monospace(12.0),
+            crate::theme::INK_3.gamma_multiply(opacity),
+        );
+        ctx.request_repaint();
+        true
     }
 
     /// Poll the detection channel; when the result lands, seed dependent state.
@@ -427,8 +494,13 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if self.splash_ui(ui) {
+            return;
+        }
         self.poll_detection();
         self.poll_capture();
+        #[cfg(windows)]
+        self.poll_driver_worker();
         #[cfg(windows)]
         self.poll_update();
         self.drive_overlay(&ui.ctx().clone());

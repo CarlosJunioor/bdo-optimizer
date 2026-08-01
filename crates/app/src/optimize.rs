@@ -1,9 +1,10 @@
-//! Optimize tab: game path, affinity mask entry + validation, shortcut / launch
-//! actions, and read-only affinity verification.
+//! Optimize tab: a one-button apply flow (round button → progress ring →
+//! results screen), with the individual sections kept under an Advanced
+//! collapsible for fixing blockers and fine-tuning.
 
 use egui::{Color32, RichText};
 
-use crate::app::{App, Tab, VerifyOutcome};
+use crate::app::{App, ApplyPhase, Tab, VerifyOutcome};
 use crate::format;
 
 const OK_GREEN: Color32 = crate::theme::OK;
@@ -143,6 +144,125 @@ fn ease_out_cubic(t: f32) -> f32 {
     1.0 - (1.0 - t).powi(3)
 }
 
+/// How many one-click steps are shown `elapsed` seconds after the click: one
+/// immediately, then one more every `STEP_STAGGER` seconds, capped at `total`.
+const STEP_STAGGER: f32 = 0.6;
+
+fn revealed_steps(elapsed: f32, total: usize) -> usize {
+    ((elapsed / STEP_STAGGER) as usize + 1).min(total)
+}
+
+/// Animation clock ids for the apply flow.
+fn progress_id() -> egui::Id {
+    egui::Id::new("apply-progress")
+}
+fn fade_id() -> egui::Id {
+    egui::Id::new("apply-fadeout")
+}
+fn done_fade_id() -> egui::Id {
+    egui::Id::new("apply-donefade")
+}
+
+/// The big round Apply button. Returns true when clicked (only while enabled).
+fn round_apply_button(ui: &mut egui::Ui, enabled: bool) -> bool {
+    let size = 170.0;
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(size, size),
+        if enabled {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        },
+    );
+    let response = if enabled {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    };
+
+    let accent = crate::theme::ACCENT;
+    let hovered = enabled && response.hovered();
+    let (fill, ring, ink, sub) = if enabled {
+        (
+            accent.gamma_multiply(if hovered { 0.30 } else { 0.20 }),
+            accent,
+            crate::theme::INK,
+            crate::theme::INK_2,
+        )
+    } else {
+        (
+            crate::theme::PANEL,
+            crate::theme::STROKE_SOFT,
+            crate::theme::INK_3,
+            crate::theme::INK_3,
+        )
+    };
+
+    let painter = ui.painter();
+    let center = rect.center();
+    let radius = size / 2.0 - 8.0;
+    painter.circle_filled(center, radius, fill);
+    painter.circle_stroke(center, radius, egui::Stroke::new(2.0, ring));
+    if enabled {
+        // Soft outer glow ring, slightly stronger on hover.
+        painter.circle_stroke(
+            center,
+            radius + 6.0,
+            egui::Stroke::new(1.2, accent.gamma_multiply(if hovered { 0.55 } else { 0.3 })),
+        );
+    }
+    painter.text(
+        center - egui::vec2(0.0, 8.0),
+        egui::Align2::CENTER_CENTER,
+        "APPLY",
+        egui::FontId::new(26.0, crate::theme::display()),
+        ink,
+    );
+    painter.text(
+        center + egui::vec2(0.0, 16.0),
+        egui::Align2::CENTER_CENTER,
+        "PERFORMANCE OPTIMIZER",
+        egui::FontId::new(9.0, crate::theme::display()),
+        sub,
+    );
+    enabled && response.clicked()
+}
+
+/// Circular progress ring with the percentage in the middle.
+fn progress_ring(ui: &mut egui::Ui, progress: f32) {
+    let size = 170.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    let painter = ui.painter();
+    let center = rect.center();
+    let radius = size / 2.0 - 10.0;
+
+    painter.circle_stroke(center, radius, egui::Stroke::new(5.0, crate::theme::PANEL));
+    let progress = progress.clamp(0.0, 1.0);
+    if progress > 0.0 {
+        // egui has no arc primitive; sample the arc as a polyline.
+        let start = -std::f32::consts::FRAC_PI_2;
+        let sweep = std::f32::consts::TAU * progress;
+        let n = 72;
+        let points: Vec<egui::Pos2> = (0..=n)
+            .map(|i| {
+                let a = start + sweep * i as f32 / n as f32;
+                center + egui::vec2(a.cos(), a.sin()) * radius
+            })
+            .collect();
+        painter.add(egui::Shape::line(
+            points,
+            egui::Stroke::new(5.0, crate::theme::ACCENT),
+        ));
+    }
+    painter.text(
+        center,
+        egui::Align2::CENTER_CENTER,
+        format!("{:.0}%", progress * 100.0),
+        egui::FontId::new(30.0, crate::theme::display()),
+        crate::theme::INK,
+    );
+}
+
 #[cfg(windows)]
 fn verification_due(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
     last.map(|last| now.saturating_duration_since(last) >= std::time::Duration::from_secs(1))
@@ -177,8 +297,8 @@ impl App {
         crate::theme::screen_heading(
             ui,
             "Apply",
-            "Use the detected recommendation, verify it in-game, and return to normal \
-             launch at any time.",
+            "One click applies the whole optimization — CPU-affinity shortcut, config \
+             tweaks, and driver profile. Everything can be undone.",
         );
 
         if self.detection.is_none() {
@@ -190,41 +310,54 @@ impl App {
             return;
         }
 
-        self.optimization_status(ui);
-        ui.add_space(10.0);
-        crate::theme::section_card(ui, icons::LIGHTNING, "One click", |ui| {
-            self.one_click_section(ui)
-        });
-        crate::theme::section_card(ui, icons::FOLDER_OPEN, "Game path", |ui| {
-            self.game_path_section(ui)
-        });
-        crate::theme::section_card(ui, icons::CIRCUITRY, "Affinity", |ui| self.mask_section(ui));
-        crate::theme::section_card(ui, icons::ROCKET_LAUNCH, "Apply for this launch", |ui| {
-            self.actions_section(ui)
-        });
-        crate::theme::section_card(ui, icons::SEAL_CHECK, "Automatic verification", |ui| {
-            self.verify_section(ui)
-        });
-        if self.show_nvidia_section() {
-            crate::theme::section_card(ui, icons::SHIELD_CHECK, "NVIDIA driver profile", |ui| {
-                self.nvidia_section(ui)
+        // Keep verification ticking regardless of which screen is up, so the
+        // sidebar check and the "verified" footer stay live.
+        self.poll_verification(ui.ctx());
+
+        match self.oneclick.phase {
+            ApplyPhase::Idle => self.apply_idle_ui(ui),
+            ApplyPhase::Running => self.apply_running_ui(ui),
+            ApplyPhase::Done => self.apply_done_ui(ui),
+        }
+
+        if self.oneclick.phase == ApplyPhase::Running {
+            return;
+        }
+        ui.add_space(20.0);
+        egui::CollapsingHeader::new("Advanced: individual settings")
+            .id_salt("apply_advanced")
+            .show(ui, |ui| {
+                crate::theme::section_card(ui, icons::FOLDER_OPEN, "Game path", |ui| {
+                    self.game_path_section(ui)
+                });
+                crate::theme::section_card(ui, icons::CIRCUITRY, "Affinity", |ui| {
+                    self.mask_section(ui)
+                });
+                crate::theme::section_card(ui, icons::ROCKET_LAUNCH, "Apply for this launch", |ui| {
+                    self.actions_section(ui)
+                });
+                crate::theme::section_card(ui, icons::SEAL_CHECK, "Automatic verification", |ui| {
+                    self.verify_section(ui)
+                });
+                if self.show_nvidia_section() {
+                    crate::theme::section_card(
+                        ui,
+                        icons::SHIELD_CHECK,
+                        "NVIDIA driver profile",
+                        |ui| self.nvidia_section(ui),
+                    );
+                }
+                if self.show_amd_section() {
+                    crate::theme::section_card(ui, icons::SLIDERS, "AMD Radeon settings", |ui| {
+                        self.amd_section(ui)
+                    });
+                }
+                if cfg!(windows) {
+                    crate::theme::section_card(ui, icons::FILE_TEXT, "Game config files", |ui| {
+                        self.gameconfig_section(ui)
+                    });
+                }
             });
-        }
-        if self.show_amd_section() {
-            crate::theme::section_card(ui, icons::SLIDERS, "AMD Radeon settings", |ui| {
-                self.amd_section(ui)
-            });
-        }
-        if cfg!(windows) {
-            crate::theme::section_card(ui, icons::FILE_TEXT, "Game config files", |ui| {
-                self.gameconfig_section(ui)
-            });
-        }
-        if matches!(&self.optimize.verify, Some(VerifyOutcome::Match { .. }))
-            && ui.button("Continue to Measure").clicked()
-        {
-            self.tab = Tab::Benchmark;
-        }
     }
 
     fn show_nvidia_section(&self) -> bool {
@@ -243,129 +376,401 @@ impl App {
             })
     }
 
-    fn optimization_status(&self, ui: &mut egui::Ui) {
-        let (title, detail, color) = match &self.optimize.verify {
-            Some(VerifyOutcome::Match { .. }) => (
-                "VERIFIED",
-                "The running game matches the selected affinity mask.",
-                OK_GREEN,
-            ),
-            Some(VerifyOutcome::Mismatch { .. })
-            | Some(VerifyOutcome::BadExpected(_))
-            | Some(VerifyOutcome::Error(_)) => (
-                "NEEDS ATTENTION",
-                "The selected change is not verified. Review the details below before measuring.",
-                WARN,
-            ),
-            _ => (
-                "PENDING",
-                "Launch with the optimized shortcut or Launch Now; verification starts when BDO opens.",
-                crate::theme::ACCENT,
-            ),
-        };
+    /// Small footer shown on the idle and done screens once the running game
+    /// verifiably carries the selected mask.
+    fn verified_footer(&mut self, ui: &mut egui::Ui) {
+        if !matches!(&self.optimize.verify, Some(VerifyOutcome::Match { .. })) {
+            return;
+        }
+        ui.add_space(10.0);
+        ui.vertical_centered(|ui| {
+            ui.label(
+                RichText::new("Verified: the running game matches the selected affinity mask.")
+                    .color(OK_GREEN)
+                    .strong(),
+            );
+            if ui.button("Continue to Measure").clicked() {
+                self.tab = Tab::Benchmark;
+            }
+        });
+    }
 
-        egui::Frame::new()
-            .fill(crate::theme::PANEL)
-            .stroke(egui::Stroke::new(1.0, color))
-            .corner_radius(8)
-            .inner_margin(egui::Margin::same(14))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(title).monospace().strong().color(color));
-                    ui.label(detail);
-                });
+    // --------------------------------------------------------- One-button apply
+    /// Idle screen: the round Apply button, its preflight blockers, and the
+    /// undo link.
+    fn apply_idle_ui(&mut self, ui: &mut egui::Ui) {
+        if cfg!(windows) && !self.video.inspector_resolved {
+            self.video.inspector_resolved = true;
+            self.video.inspector = crate::video::resolve();
+        }
+        let blockers = self.one_click_blockers();
+        let ready = blockers.is_empty();
+        let needs_admin =
+            cfg!(windows) && self.show_nvidia_section() && !self.benchmark.elevated;
+
+        ui.add_space(28.0);
+        let clicked = ui
+            .vertical_centered(|ui| {
+                let clicked = round_apply_button(ui, ready);
+                ui.add_space(12.0);
                 ui.label(
                     RichText::new(
-                        "Rollback: close the game and launch BDO normally, or delete the optimized shortcut. No global driver or system settings are changed.",
+                        "Creates the optimized desktop shortcut and applies the config-file \
+                         tweaks, windowed-game optimizations, and the GPU driver profile when \
+                         one is available. Everything is reversible.",
                     )
                     .size(12.0)
                     .weak(),
                 );
+                clicked
+            })
+            .inner;
+        if clicked {
+            self.start_apply(ui.ctx(), false);
+        }
+
+        // Preflight: every reason the button is disabled, spelled out so the
+        // user knows exactly what to fix before they can click.
+        if !ready {
+            ui.add_space(10.0);
+            ui.vertical_centered(|ui| {
+                for blocker in &blockers {
+                    ui.label(RichText::new(format!("🔒 {blocker}")).color(WARN).size(13.0));
+                }
             });
+            #[cfg(windows)]
+            if needs_admin {
+                ui.vertical_centered(|ui| self.relaunch_admin_button(ui));
+            }
+        }
+        let _ = needs_admin;
+
+        if cfg!(windows) {
+            ui.add_space(14.0);
+            let undo = ui
+                .vertical_centered(|ui| {
+                    ui.small_button("Undo a previous optimization")
+                        .on_hover_text(
+                            "Restores the config files from their backups, puts the Windows \
+                             setting back exactly as it was, and resets the driver profile.",
+                        )
+                        .clicked()
+                })
+                .inner;
+            if undo {
+                self.start_apply(ui.ctx(), true);
+            }
+        }
+
+        self.verified_footer(ui);
     }
 
-    // --------------------------------------------------------------- One click
-    /// One button for every guide setting that is safe to apply unattended.
-    ///
-    /// Deliberately excludes anything needing a reboot, anything system-wide
-    /// rather than BDO-scoped, and anything the guide only recommends
-    /// conditionally. Those stay as their own buttons further down, so a user
-    /// who wants them chooses them knowingly.
-    fn one_click_section(&mut self, ui: &mut egui::Ui) {
-        ui.label(
-            RichText::new(
-                "Applies the guide settings that are reversible, need no reboot, and only affect \
-                 Black Desert: the config-file tweaks, Windows' windowed-game optimizations, and \
-                 — when the app runs as administrator on an NVIDIA GPU — the \"Black Desert\" \
-                 driver profile. Memory compression and HAGS stay on their own buttons because \
-                 they need a reboot or affect every application.",
-            )
-            .size(12.0)
-            .weak(),
-        );
-
-        if !cfg!(windows) {
-            ui.label(RichText::new("Windows only.").color(WARN));
-            return;
+    /// Kick off an apply or undo run and switch to the progress screen.
+    fn start_apply(&mut self, ctx: &egui::Context, undo: bool) {
+        if undo {
+            self.undo_one_click();
+        } else {
+            self.run_one_click();
         }
+        self.oneclick.undoing = undo;
+        self.oneclick.started = Some(std::time::Instant::now());
+        self.oneclick.phase = ApplyPhase::Running;
+        seed_checks(ctx, self.oneclick.steps.len());
+        // Zero the progress/fade clocks so the run always animates from scratch.
+        ctx.animate_value_with_time(progress_id(), 0.0, 0.0);
+        ctx.animate_bool_with_time(fade_id(), false, 0.0);
+        ctx.animate_bool_with_time(done_fade_id(), false, 0.0);
+    }
 
-        ui.horizontal(|ui| {
-            if ui
-                .button(RichText::new("⚡ Apply everything safe").strong())
-                .on_hover_text("Close Black Desert first — it rewrites its config files on exit.")
-                .clicked()
-            {
-                self.run_one_click();
-                seed_checks(ui.ctx(), self.oneclick.steps.len());
-            }
-            if ui
-                .button("Undo all of it")
-                .on_hover_text(
-                    "Restores the config files from their backups and puts the Windows setting \
-                     back exactly as it was.",
-                )
-                .clicked()
-            {
-                self.undo_one_click();
-                seed_checks(ui.ctx(), self.oneclick.steps.len());
-            }
-        });
-
-        if !self.oneclick.ran {
-            return;
-        }
+    /// Progress screen: ring with percentage, the stage currently applying,
+    /// and the steps already done. Fades out once everything has landed.
+    fn apply_running_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.collect_driver_step(&ctx);
-        for (index, (step, outcome)) in self.oneclick.steps.iter().enumerate() {
-            match outcome {
-                Ok(detail) => {
-                    ui.horizontal(|ui| {
-                        animated_check(ui, check_id(index), OK_GREEN);
+
+        let steps = &self.oneclick.steps;
+        let driver_pending = self.oneclick.driver_step.is_some();
+        let total = steps.len() + usize::from(driver_pending);
+        let visible = match self.oneclick.started {
+            Some(started) => revealed_steps(started.elapsed().as_secs_f32(), steps.len()),
+            None => steps.len(),
+        };
+        let target = if total == 0 {
+            1.0
+        } else {
+            visible as f32 / total as f32
+        };
+        let progress = ctx.animate_value_with_time(progress_id(), target, 0.45);
+        let complete = !driver_pending && visible == steps.len() && progress > 0.995;
+        let fade = ctx.animate_bool_with_time(fade_id(), complete, 0.6);
+        if complete && fade >= 1.0 {
+            self.oneclick.phase = ApplyPhase::Done;
+            ctx.animate_bool_with_time(done_fade_id(), false, 0.0);
+            ctx.request_repaint();
+            return;
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(33));
+
+        let stage = if visible < steps.len() {
+            format!("Applying: {}", steps[visible].0)
+        } else if driver_pending {
+            "Applying: NVIDIA driver profile".to_string()
+        } else {
+            "Finishing up".to_string()
+        };
+
+        ui.add_space(28.0);
+        ui.scope(|ui| {
+            ui.set_opacity(1.0 - fade);
+            ui.vertical_centered(|ui| {
+                progress_ring(ui, progress);
+                ui.add_space(14.0);
+                ui.label(RichText::new(stage).size(14.0));
+                ui.add_space(16.0);
+            });
+            for (index, (step, outcome)) in self.oneclick.steps.iter().take(visible).enumerate()
+            {
+                ui.horizontal(|ui| {
+                    ui.add_space(ui.available_width() * 0.5 - 170.0);
+                    match outcome {
+                        Ok(_) => {
+                            animated_check(ui, check_id(index), OK_GREEN);
+                            ui.label(RichText::new(step).color(OK_GREEN).size(12.0));
+                        }
+                        Err(_) => {
+                            ui.label(
+                                RichText::new(format!("✘ {step}")).color(ERR).size(12.0),
+                            );
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    /// Results screen: what was applied, what failed and how to fix it.
+    fn apply_done_ui(&mut self, ui: &mut egui::Ui) {
+        use egui_phosphor::regular as icons;
+
+        let ctx = ui.ctx().clone();
+        let t = ctx.animate_bool_with_time(done_fade_id(), true, 0.45);
+        if t < 1.0 {
+            ctx.request_repaint();
+        }
+        let failures = self
+            .oneclick
+            .steps
+            .iter()
+            .filter(|(_, r)| r.is_err())
+            .count();
+
+        ui.add_space(24.0);
+        ui.scope(|ui| {
+            ui.set_opacity(t);
+            ui.vertical_centered(|ui| {
+                if failures == 0 {
+                    ui.label(
+                        RichText::new(icons::CHECK_CIRCLE)
+                            .size(52.0)
+                            .color(OK_GREEN),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(if self.oneclick.undoing {
+                            "Everything restored"
+                        } else {
+                            "Everything applied!"
+                        })
+                        .font(egui::FontId::new(22.0, crate::theme::display()))
+                        .color(crate::theme::INK),
+                    );
+                    if !self.oneclick.undoing {
                         ui.label(
-                            RichText::new(format!("{step}: {detail}"))
-                                .color(OK_GREEN)
+                            RichText::new(
+                                "Start Black Desert with the new desktop shortcut and enjoy \
+                                 the optimized settings.",
+                            )
+                            .size(13.0)
+                            .weak(),
+                        );
+                    }
+                } else {
+                    ui.label(RichText::new(icons::WARNING).size(52.0).color(WARN));
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "{failures} step{} need{} attention",
+                            if failures == 1 { "" } else { "s" },
+                            if failures == 1 { "s" } else { "" },
+                        ))
+                        .font(egui::FontId::new(22.0, crate::theme::display()))
+                        .color(crate::theme::INK),
+                    );
+                    ui.label(
+                        RichText::new("Fix the items below, then apply again.")
+                            .size(13.0)
+                            .weak(),
+                    );
+                }
+            });
+
+            ui.add_space(16.0);
+            for (index, (step, outcome)) in self.oneclick.steps.iter().enumerate() {
+                match outcome {
+                    Ok(detail) => {
+                        ui.horizontal(|ui| {
+                            animated_check(ui, check_id(index), OK_GREEN);
+                            ui.label(
+                                RichText::new(format!("{step}: {detail}"))
+                                    .color(OK_GREEN)
+                                    .size(12.0),
+                            );
+                        });
+                    }
+                    Err(e) => {
+                        ui.label(
+                            RichText::new(format!("✘ {step}: {e}"))
+                                .color(ERR)
                                 .size(12.0),
                         );
-                    });
+                    }
                 }
-                Err(e) => {
-                    ui.label(
-                        RichText::new(format!("✘ {step}: {e}"))
-                            .color(ERR)
-                            .size(12.0),
-                    );
+            }
+            if failures == 0 && !self.oneclick.undoing {
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(
+                        "Rollback any time: launch BDO normally, delete the shortcut, or use \
+                         \"Undo a previous optimization\". No global system settings were \
+                         changed.",
+                    )
+                    .size(12.0)
+                    .weak(),
+                );
+            }
+
+            ui.add_space(14.0);
+            ui.vertical_centered(|ui| {
+                if ui
+                    .button(if failures == 0 { "Back" } else { "Fix and retry" })
+                    .clicked()
+                {
+                    self.oneclick.phase = ApplyPhase::Idle;
+                }
+            });
+            self.verified_footer(ui);
+        });
+    }
+
+    /// Everything that would make a one-click run fail, checked before the
+    /// button is enabled. Uses only state that is already polled each frame —
+    /// no extra process or disk scans.
+    fn one_click_blockers(&self) -> Vec<String> {
+        let mut blockers = Vec::new();
+        if !cfg!(windows) {
+            blockers.push(
+                "Windows only — Black Desert and these optimizations require Windows."
+                    .to_string(),
+            );
+            return blockers;
+        }
+        if matches!(
+            self.optimize.verify,
+            Some(VerifyOutcome::Match { .. }) | Some(VerifyOutcome::Mismatch { .. })
+        ) {
+            blockers.push(
+                "Black Desert is running — close it first; the game rewrites its config files \
+                 on exit."
+                    .to_string(),
+            );
+        }
+        if !self
+            .optimize
+            .launcher_path()
+            .map(|p| p.exists())
+            .unwrap_or(false)
+        {
+            blockers.push(
+                "No game launcher found — pick BlackDesertLauncher.exe in the Game path \
+                 section below."
+                    .to_string(),
+            );
+        }
+        let logical = self.detection.as_ref().map(|d| d.cpu.logical_cores);
+        if bdo_launch::parse_mask_hex(&self.optimize.mask_input)
+            .and_then(|mask| bdo_launch::validate_mask(mask, logical))
+            .is_err()
+        {
+            blockers.push(
+                "The affinity mask is invalid — fix it in the Affinity section below.".to_string(),
+            );
+        }
+        if self.show_nvidia_section() {
+            if !self.benchmark.elevated {
+                blockers.push(
+                    "You need to run the app as administrator so the NVIDIA driver profile can \
+                     be written:"
+                        .to_string(),
+                );
+            } else if self.video.inspector.is_none() {
+                blockers.push(format!(
+                    "{} was not found next to the app — the NVIDIA profile step cannot run.",
+                    crate::video::INSPECTOR_EXE
+                ));
+            }
+        }
+        blockers
+    }
+
+    /// The "Restart as administrator" button plus its error line, shared by
+    /// the one-click preflight and the NVIDIA section.
+    #[cfg(windows)]
+    fn relaunch_admin_button(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .button(RichText::new("🛡 Restart as administrator").strong())
+            .on_hover_text("Relaunches this app with a UAC prompt, then closes this window.")
+            .clicked()
+        {
+            self.benchmark.relaunch_error = None;
+            match crate::relaunch::relaunch_as_admin() {
+                crate::relaunch::RelaunchOutcome::Launched => {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                crate::relaunch::RelaunchOutcome::Cancelled => {}
+                crate::relaunch::RelaunchOutcome::Failed(e) => {
+                    self.benchmark.relaunch_error = Some(e);
                 }
             }
         }
-        if self.oneclick.driver_step.is_some() {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(RichText::new("NVIDIA driver profile: applying…").size(12.0));
-            });
+        if let Some(err) = &self.benchmark.relaunch_error {
+            ui.label(
+                RichText::new(format!("Could not relaunch: {err}"))
+                    .color(ERR)
+                    .size(12.0),
+            );
         }
     }
 
     /// Fold a finished driver-profile job started by the one-click button back
+    /// Drain the driver-profile worker's result into `video.last`.
+    ///
+    /// Called from the app update loop every frame, not from a section UI: the
+    /// one-click progress screen hides the NVIDIA section entirely, so draining
+    /// there would deadlock the run at "Applying: NVIDIA driver profile" — the
+    /// worker done, its result forever unread.
+    #[cfg(windows)]
+    pub fn poll_driver_worker(&mut self) {
+        let finished = self
+            .video
+            .worker
+            .as_ref()
+            .and_then(|worker| worker.rx.try_recv().ok());
+        if let Some(result) = finished {
+            self.video.last = Some(result);
+            self.video.worker = None;
+        }
+    }
+
     /// into its step list. The driver pipeline is the only asynchronous step, so
     /// its result arrives a frame or two after the rest.
     #[cfg(windows)]
@@ -394,10 +799,10 @@ impl App {
     fn run_one_click(&mut self) {
         self.oneclick.steps.clear();
         self.oneclick.driver_step = None;
-        self.oneclick.ran = true;
 
         #[cfg(windows)]
         {
+            self.one_click_affinity_shortcut();
             self.one_click_config_files();
             self.one_click_windowed_optimizations();
             self.one_click_driver_profile(
@@ -466,7 +871,6 @@ impl App {
     fn undo_one_click(&mut self) {
         self.oneclick.steps.clear();
         self.oneclick.driver_step = None;
-        self.oneclick.ran = true;
 
         #[cfg(windows)]
         {
@@ -522,6 +926,23 @@ impl App {
 
             self.one_click_driver_profile(crate::video::default_settings(), "restore");
         }
+    }
+
+    /// Create the optimized run-with-affinity desktop shortcut, mirroring the
+    /// result into the manual "Apply for this launch" section below.
+    #[cfg(windows)]
+    fn one_click_affinity_shortcut(&mut self) {
+        const STEP: &str = "CPU affinity";
+        let result = win_actions::create_shortcut(
+            self.optimize.launcher_path(),
+            &self.optimize.mask_input,
+            self.optimize.steam,
+        );
+        self.optimize.shortcut_result = Some(result.clone());
+        self.oneclick.steps.push((
+            STEP.into(),
+            result.map(|path| format!("optimized shortcut created at {}", path.display())),
+        ));
     }
 
     #[cfg(windows)]
@@ -1035,43 +1456,12 @@ impl App {
                     .color(WARN)
                     .size(12.0),
                 );
-                if ui
-                    .button(RichText::new("🛡 Restart as administrator").strong())
-                    .on_hover_text(
-                        "Relaunches this app with a UAC prompt, then closes this window.",
-                    )
-                    .clicked()
-                {
-                    self.benchmark.relaunch_error = None;
-                    match crate::relaunch::relaunch_as_admin() {
-                        crate::relaunch::RelaunchOutcome::Launched => {
-                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                        crate::relaunch::RelaunchOutcome::Cancelled => {}
-                        crate::relaunch::RelaunchOutcome::Failed(e) => {
-                            self.benchmark.relaunch_error = Some(e);
-                        }
-                    }
-                }
-                if let Some(err) = &self.benchmark.relaunch_error {
-                    ui.label(
-                        RichText::new(format!("Could not relaunch: {err}"))
-                            .color(ERR)
-                            .size(12.0),
-                    );
-                }
+                self.relaunch_admin_button(ui);
                 return;
             }
 
-            let finished = self
-                .video
-                .worker
-                .as_ref()
-                .and_then(|worker| worker.rx.try_recv().ok());
-            if let Some(result) = finished {
-                self.video.last = Some(result);
-                self.video.worker = None;
-            }
+            // The worker is drained centrally by `poll_driver_worker`; this
+            // section only displays the in-flight state.
             if let Some(worker) = &self.video.worker {
                 ui.horizontal(|ui| {
                     ui.spinner();
@@ -1437,6 +1827,15 @@ mod tests {
         assert!(rows.iter().any(|row| row.0 == "554"));
         assert!(!rows.iter().any(|row| row.0 == "AAA0"));
         assert_eq!(rows.iter().filter(|row| row.0 == "555").count(), 1);
+    }
+
+    #[test]
+    fn steps_reveal_one_at_a_time() {
+        assert_eq!(revealed_steps(0.0, 4), 1);
+        assert_eq!(revealed_steps(0.59, 4), 1);
+        assert_eq!(revealed_steps(0.61, 4), 2);
+        assert_eq!(revealed_steps(10.0, 4), 4);
+        assert_eq!(revealed_steps(0.0, 0), 0);
     }
 
     #[cfg(windows)]
