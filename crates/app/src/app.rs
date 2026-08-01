@@ -516,6 +516,14 @@ impl eframe::App for App {
         if let Some(worker) = self.benchmark.worker.as_mut() {
             worker.stop_and_join();
         }
+        // The driver job spawns Profile Inspector and can be parked waiting on
+        // it for up to 90 seconds. Exiting underneath it leaves that child
+        // running elevated, still writing the driver profile, with nothing left
+        // to verify the result or delete the staging directory.
+        #[cfg(windows)]
+        if let Some(worker) = self.video.worker.as_mut() {
+            worker.stop();
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {

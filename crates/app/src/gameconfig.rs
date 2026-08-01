@@ -282,15 +282,33 @@ pub const TWEAKS: &[Tweak] = &[
 /// endings and unrelated lines, is preserved. A key absent from this file is
 /// simply not applicable — it is not an error and is not counted.
 pub fn patch_game_option(text: &str) -> (String, PatchStats) {
+    patch_game_option_to(text, &|t, _| t.txt_value.to_string())
+}
+
+/// [`patch_game_option`] with the target value chosen per setting.
+///
+/// Restore uses this to write back the values a file *originally* had rather
+/// than the guide's, which is what lets it undo six settings without touching
+/// anything else in the file.
+pub fn patch_game_option_to(
+    text: &str,
+    value_for: &dyn Fn(&Tweak, usize) -> String,
+) -> (String, PatchStats) {
     let mut stats = PatchStats::default();
+    let mut seen: Vec<(&str, usize)> = Vec::new();
     let mut out = String::with_capacity(text.len());
     for line in lines_inclusive(text) {
-        out.push_str(&patch_option_line(line, &mut stats));
+        out.push_str(&patch_option_line(line, value_for, &mut seen, &mut stats));
     }
     (out, stats)
 }
 
-fn patch_option_line(line: &str, stats: &mut PatchStats) -> String {
+fn patch_option_line(
+    line: &str,
+    value_for: &dyn Fn(&Tweak, usize) -> String,
+    seen: &mut Vec<(&'static str, usize)>,
+    stats: &mut PatchStats,
+) -> String {
     let Some(eq) = line.find('=') else {
         return line.to_string();
     };
@@ -301,12 +319,23 @@ fn patch_option_line(line: &str, stats: &mut PatchStats) -> String {
     let value_part = &line[eq + 1..];
     let trimmed = value_part.trim_end_matches(['\r', '\n']);
     let (value, ending) = value_part.split_at(trimmed.len());
+    let nth = match seen.iter_mut().find(|(key, _)| *key == tweak.txt_key) {
+        Some((_, count)) => {
+            *count += 1;
+            *count
+        }
+        None => {
+            seen.push((tweak.txt_key, 0));
+            0
+        }
+    };
+    let target = value_for(tweak, nth);
     stats.found += 1;
-    if value.trim() == tweak.txt_value {
+    if value.trim() == target {
         return line.to_string();
     }
     stats.changed += 1;
-    format!("{}= {}{}", &line[..eq], tweak.txt_value, ending)
+    format!("{}= {}{}", &line[..eq], target, ending)
 }
 
 /// Patch `gamevariable.xml` text: every [`TWEAKS`] key gets its `xml_value`.
@@ -321,14 +350,94 @@ fn patch_option_line(line: &str, stats: &mut PatchStats) -> String {
 /// Each shape occurs multiple times per file (the live values plus one copy per
 /// in-game settings preset); the guide says to set them all.
 pub fn patch_game_variable(text: &str) -> (String, PatchStats) {
+    patch_game_variable_to(text, &|t, _| t.xml_value.to_string())
+}
+
+/// [`patch_game_variable`] with the target value chosen per setting.
+pub fn patch_game_variable_to(
+    text: &str,
+    value_for: &dyn Fn(&Tweak, usize) -> String,
+) -> (String, PatchStats) {
     let mut stats = PatchStats::default();
     let mut text = text.to_string();
     for tweak in TWEAKS {
         let element = format!("<{} Value=\"", tweak.xml_key);
-        text = set_attr_values(&text, &element, tweak.xml_value, &mut stats);
-        text = set_game_option_values(&text, tweak.xml_key, tweak.xml_value, &mut stats);
+        // One counter per key across both shapes, matching the order
+        // `managed_values` reads them in — these files carry one copy per
+        // in-game settings preset, each with its own value.
+        let mut nth = 0;
+        text = set_attr_values(&text, &element, &mut nth, &|i| value_for(tweak, i), &mut stats);
+        text = set_game_option_values(
+            &text,
+            tweak.xml_key,
+            &mut nth,
+            &|i| value_for(tweak, i),
+            &mut stats,
+        );
     }
     (text, stats)
+}
+
+/// The value each managed setting currently holds in `text`, if the parser can
+/// see it. Used to read a file's original values out of its backup.
+fn managed_values(text: &str, is_xml: bool) -> Vec<(&'static str, Vec<String>)> {
+    let mut found = Vec::new();
+    for tweak in TWEAKS {
+        let mut values = Vec::new();
+        if is_xml {
+            // Both shapes, in the order `patch_game_variable_to` rewrites them,
+            // so the nth value read here is the nth value written back.
+            collect_attr_values(text, &format!("<{} Value=\"", tweak.xml_key), &mut values);
+            collect_game_option_values(text, tweak.xml_key, &mut values);
+        } else {
+            for line in lines_inclusive(text) {
+                let Some(eq) = line.find('=') else { continue };
+                if line[..eq].trim().eq_ignore_ascii_case(tweak.txt_key) {
+                    values.push(line[eq + 1..].trim().to_string());
+                }
+            }
+        }
+        if !values.is_empty() {
+            found.push((tweak.txt_key, values));
+        }
+    }
+    found
+}
+
+/// Every `<Key Value="…"/>` value in document order.
+fn collect_attr_values(text: &str, tag_prefix: &str, out: &mut Vec<String>) {
+    let mut rest = text;
+    while let Some(found) = rest.find(tag_prefix) {
+        rest = &rest[found + tag_prefix.len()..];
+        match rest.find(['"', '<', '>']) {
+            Some(end) if rest.as_bytes()[end] == b'"' => {
+                out.push(rest[..end].to_string());
+                rest = &rest[end..];
+            }
+            // Unterminated attribute: `set_attr_values` skips it too, so the
+            // counts stay aligned.
+            _ => continue,
+        }
+    }
+}
+
+/// Every `DataValue` inside a `<GameOption Type="key" …>` tag, in order.
+fn collect_game_option_values(text: &str, key: &str, out: &mut Vec<String>) {
+    let opener = format!("<GameOption Type=\"{key}\"");
+    let mut rest = text;
+    while let Some(found) = rest.find(&opener) {
+        rest = &rest[found + opener.len()..];
+        let tag_end = rest.find('>').unwrap_or(rest.len());
+        let (tag, after) = rest.split_at(tag_end);
+        const ATTR: &str = "DataValue=\"";
+        if let Some(attr_at) = tag.find(ATTR) {
+            let value_start = attr_at + ATTR.len();
+            if let Some(close) = tag[value_start..].find('"') {
+                out.push(tag[value_start..value_start + close].to_string());
+            }
+        }
+        rest = after;
+    }
 }
 
 /// Rewrite `DataValue` inside every `<GameOption Type="key" … />` tag.
@@ -340,7 +449,8 @@ pub fn patch_game_variable(text: &str) -> (String, PatchStats) {
 fn set_game_option_values(
     text: &str,
     key: &str,
-    new_value: &str,
+    nth: &mut usize,
+    value_for: &dyn Fn(usize) -> String,
     stats: &mut PatchStats,
 ) -> String {
     let opener = format!("<GameOption Type=\"{key}\"");
@@ -369,12 +479,14 @@ fn set_game_option_values(
             continue;
         };
         let current = &tag[value_start..value_start + close];
+        let new_value = value_for(*nth);
+        *nth += 1;
         if current != new_value {
             stats.changed += 1;
         }
         stats.found += 1;
         out.push_str(&tag[..value_start]);
-        out.push_str(new_value);
+        out.push_str(&new_value);
         out.push_str(&tag[value_start + close..]);
         rest = after;
     }
@@ -385,7 +497,8 @@ fn set_game_option_values(
 fn set_attr_values(
     text: &str,
     tag_prefix: &str,
-    new_value: &str,
+    nth: &mut usize,
+    value_for: &dyn Fn(usize) -> String,
     stats: &mut PatchStats,
 ) -> String {
     let mut out = String::with_capacity(text.len());
@@ -401,11 +514,13 @@ fn set_attr_values(
         let terminator = rest.find(['"', '<', '>']);
         match terminator {
             Some(end) if rest.as_bytes()[end] == b'"' => {
-                if &rest[..end] != new_value {
+                let new_value = value_for(*nth);
+                *nth += 1;
+                if rest[..end] != new_value {
                     stats.changed += 1;
                 }
                 stats.found += 1;
-                out.push_str(new_value);
+                out.push_str(&new_value);
                 rest = &rest[end..];
             }
             // Unterminated attribute (truncated / malformed file): copy verbatim
@@ -540,6 +655,21 @@ pub fn restore_files(root: &Path, paths: &[PathBuf], safe: &dyn Fn() -> bool) ->
     run_over(root, paths, safe, restore_one)
 }
 
+/// Undo this app's edits to one file.
+///
+/// # Why the whole backup is not simply copied back
+///
+/// The backup is a snapshot of the file the first time it was ever changed, and
+/// these files hold far more than the six settings this app touches — graphics,
+/// controls, UI layout, keybinds. Copying it over the live file would silently
+/// throw away everything the user changed in the game since, which is not an
+/// undo of *this app's* work but of theirs. Apply-play-undo is an ordinary
+/// sequence, not an edge case.
+///
+/// So the backup is read for what the six managed settings *were*, and only
+/// those values are written into the file as it stands today. Same principle as
+/// the registry undo. The whole-file copy survives for the one case where it is
+/// the right answer: the live file is gone and there is nothing to merge into.
 fn restore_one(root: &Path, path: &Path) -> Result<FileChange, String> {
     let (_pinned, path) = pin_and_verify(root, path)?;
     let path = path.as_path();
@@ -548,8 +678,58 @@ fn restore_one(root: &Path, path: &Path) -> Result<FileChange, String> {
     if !usable {
         return Ok(FileChange::NoBackup);
     }
-    let bytes = std::fs::read(&backup).map_err(|e| format!("backup unreadable: {e}"))?;
-    write_atomic_bytes(path, &bytes).map_err(|e| format!("restore failed: {e}"))?;
+    let backup_bytes = std::fs::read(&backup).map_err(|e| format!("backup unreadable: {e}"))?;
+
+    // The live file was deleted (by the game, or by hand): there is nothing to
+    // merge into, so the snapshot *is* the best available restore.
+    let Ok(live_bytes) = std::fs::read(path) else {
+        write_atomic_bytes(path, &backup_bytes).map_err(|e| format!("restore failed: {e}"))?;
+        return Ok(FileChange::Restored);
+    };
+
+    let is_xml = path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("xml"));
+    let original = decode_latin1(&backup_bytes);
+    let originals = managed_values(&original, is_xml);
+    // A setting the backup does not mention was not in the file before either,
+    // so leaving the current value alone is the faithful undo.
+    // Restore the nth occurrence to the nth original. These files hold one copy
+    // of each setting per in-game settings preset, and those copies can differ,
+    // so collapsing them to "the" value per key would flatten every preset onto
+    // whichever one happened to come first.
+    //
+    // If the file has grown an occurrence the backup never had — a preset added
+    // since — there is no original for it, and the value it currently holds is
+    // left alone rather than guessed at from a different preset.
+    let value_for = |tweak: &Tweak, nth: usize| {
+        originals
+            .iter()
+            .find(|(key, _)| *key == tweak.txt_key)
+            .and_then(|(_, values)| values.get(nth).cloned())
+            .unwrap_or_else(|| {
+                if is_xml {
+                    tweak.xml_value.to_string()
+                } else {
+                    tweak.txt_value.to_string()
+                }
+            })
+    };
+
+    let live = decode_latin1(&live_bytes);
+    let (restored, stats) = if is_xml {
+        patch_game_variable_to(&live, &value_for)
+    } else {
+        patch_game_option_to(&live, &value_for)
+    };
+    if stats.found == 0 {
+        return Ok(FileChange::NothingRecognized);
+    }
+    if stats.changed == 0 {
+        return Ok(FileChange::Restored);
+    }
+    write_atomic_bytes(path, &encode_latin1(&restored))
+        .map_err(|e| format!("restore failed: {e}"))?;
     Ok(FileChange::Restored)
 }
 
@@ -1323,6 +1503,46 @@ mod tests {
         let fresh = dir.join("fresh.bak");
         write_new_only(&fresh, b"written").unwrap();
         assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "written");
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Undo must reverse *this app's* six settings, not everything the user
+    /// did since. The backup is a whole-file snapshot from the first apply, so
+    /// copying it back wholesale would silently discard graphics, keybind and
+    /// UI changes made after — apply, play, undo is an ordinary sequence.
+    #[test]
+    fn restore_puts_back_our_settings_and_keeps_later_edits() {
+        let dir = temp_dir("merge-restore");
+        let file = dir.join("GameOption.txt");
+        std::fs::write(
+            &file,
+            "Resolution = 1920x1080\npostFilter = 1\nTessellation = 1\nMasterVolume = 50\n",
+        )
+        .unwrap();
+
+        let out = apply_files(&dir, std::slice::from_ref(&file), always_safe());
+        assert!(out[0].result.is_ok(), "{:?}", out[0].result);
+
+        // The user then changes unrelated settings in-game.
+        let patched = std::fs::read_to_string(&file).unwrap();
+        let edited = patched
+            .replace("Resolution = 1920x1080", "Resolution = 2560x1440")
+            .replace("MasterVolume = 50", "MasterVolume = 80");
+        std::fs::write(&file, &edited).unwrap();
+
+        restore_files(&dir, std::slice::from_ref(&file), always_safe());
+        let restored = std::fs::read_to_string(&file).unwrap();
+
+        assert!(
+            restored.contains("postFilter = 1") && restored.contains("Tessellation = 1"),
+            "our settings must be reverted to their originals: {restored}"
+        );
+        assert!(
+            restored.contains("Resolution = 2560x1440")
+                && restored.contains("MasterVolume = 80"),
+            "changes made after the apply must survive the undo: {restored}"
+        );
 
         std::fs::remove_dir_all(dir).unwrap();
     }

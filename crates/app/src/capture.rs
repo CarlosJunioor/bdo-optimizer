@@ -114,6 +114,16 @@ pub struct CaptureParams {
     pub cpu: String,
     pub gpu: String,
     pub store_dir: PathBuf,
+    /// The game process whose affinity was verified before this capture was
+    /// allowed to start, when one was running.
+    ///
+    /// The session is saved carrying that verified mask and a trusted role, so
+    /// the numbers have to come from *that* process. Watching only for "some
+    /// `BlackDesert64.exe` exists" would let the verified instance exit and a
+    /// fresh, unverified one be measured under the old provenance — a run that
+    /// then passes the comparison gates while describing a launch that never
+    /// happened.
+    pub verified_pid: Option<u32>,
 }
 
 /// Best-effort cleanup for the transient raw CSV on every worker exit path.
@@ -221,13 +231,31 @@ fn run(p: CaptureParams, stop: Arc<AtomicBool>, tx: Sender<CaptureMsg>, ctx: egu
 
     let mut start = None;
     let mut game_seen = false;
+    let mut replaced = false;
     let mut last_full_stats: Option<Instant> = None;
     let mut last_snapshot: Option<LiveSnapshot> = None;
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
         }
-        let running = is_process_running(GAME_EXE).is_some();
+        // Bind to the verified process when there is one; fall back to "any
+        // instance" only when the capture was armed before the game started.
+        let current = is_process_running(GAME_EXE).map(|pid| pid.as_u32());
+        let running = match (p.verified_pid, current) {
+            (Some(verified), Some(seen)) => seen == verified,
+            (Some(_), None) => false,
+            (None, seen) => seen.is_some(),
+        };
+        if let (Some(verified), Some(seen)) = (p.verified_pid, current) {
+            if seen != verified && game_seen {
+                // The verified instance is gone and a different one is up. The
+                // provenance this session would be saved with no longer
+                // describes what is on screen, so stop rather than attribute
+                // one run's frames to another's launch.
+                replaced = true;
+                break;
+            }
+        }
         let elapsed = capture_elapsed(&mut start, running, Instant::now());
         if running {
             game_seen = true;
@@ -295,6 +323,16 @@ fn run(p: CaptureParams, stop: Arc<AtomicBool>, tx: Sender<CaptureMsg>, ctx: egu
     // ended. If it exited on its own with a failure — most importantly the
     // unelevated "access denied" case — surface that instead of blaming a missing
     // CSV. A deliberate stop (PresentMon still running) or a clean exit returns Ok.
+    if replaced {
+        let _ = handle.finish();
+        let _ = tx.send(CaptureMsg::Error(
+            "Black Desert restarted during the capture, so this run mixes two launches and              was discarded. Start the capture again once the game is up."
+                .to_string(),
+        ));
+        ctx.request_repaint();
+        return;
+    }
+
     if let Err(e) = handle.finish() {
         let _ = tx.send(match e {
             BenchError::NeedsElevation => CaptureMsg::NeedsElevation,

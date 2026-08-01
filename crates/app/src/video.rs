@@ -386,22 +386,90 @@ pub mod worker {
 
     /// A one-shot background driver-profile job. Poll `rx` from the UI loop.
     pub struct DriverWorker {
-        pub rx: Receiver<Result<String, String>>,
+        pub rx: Receiver<DriverOutcome>,
         /// "apply" or "restore" — for the in-progress label.
         pub label: &'static str,
+        /// Set to ask an in-flight job to stop at its next check, and to kill
+        /// the inspector if one is already running. See [`DriverWorker::stop`].
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    /// What a finished driver job reports.
+    pub struct DriverOutcome {
+        pub result: Result<String, String>,
+        /// Whether the merge-import actually ran.
+        ///
+        /// A failure is *not* proof the profile is untouched: the import
+        /// completes before the verification export, so an export timeout or a
+        /// mismatch fails a job whose settings did land. Callers use this to
+        /// decide whether the applied-settings record may be rewound — doing
+        /// that after a real write would leave changed values with no undo.
+        pub imported: bool,
+    }
+
+    impl DriverWorker {
+        /// Stop an in-flight job and wait briefly for it to unwind.
+        ///
+        /// Called when the app is closing. The job can be parked for up to
+        /// `INSPECTOR_TIMEOUT` waiting on a child process; letting the process
+        /// exit underneath it would leave Profile Inspector running elevated,
+        /// still writing the driver profile, with nothing left to verify the
+        /// result or clean the staging directory.
+        pub fn stop(&mut self) {
+            self.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+            let Some(thread) = self.thread.take() else {
+                return;
+            };
+            let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = done.clone();
+            std::thread::spawn(move || {
+                let _ = thread.join();
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !done.load(std::sync::atomic::Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
     }
 
     /// Start applying (or restoring) `settings` via the inspector at `exe`.
     pub fn start(exe: PathBuf, settings: Vec<(u32, u32)>, label: &'static str) -> DriverWorker {
         let (tx, rx) = channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(run(&exe, &settings));
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = cancel.clone();
+        let thread = std::thread::spawn(move || {
+            let _ = tx.send(run(&exe, &settings, &flag));
         });
-        DriverWorker { rx, label }
+        DriverWorker {
+            rx,
+            label,
+            cancel,
+            thread: Some(thread),
+        }
     }
 
-    fn run(exe: &Path, settings: &[(u32, u32)]) -> Result<String, String> {
+    fn run(
+        exe: &Path,
+        settings: &[(u32, u32)],
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> DriverOutcome {
+        let mut imported = false;
+        let result = run_job(exe, settings, cancel, &mut imported);
+        DriverOutcome { result, imported }
+    }
+
+    fn run_job(
+        exe: &Path,
+        settings: &[(u32, u32)],
+        cancel: &std::sync::atomic::AtomicBool,
+        imported: &mut bool,
+    ) -> Result<String, String> {
         let _serialized = job_lock();
+        if cancelled(cancel) {
+            return Err("cancelled".to_string());
+        }
 
         // Hold this handle for the whole job. It denies other processes write /
         // rename / delete access to the executable, so the binary we hashed is
@@ -439,7 +507,7 @@ pub mod worker {
                 return Err(e);
             }
         };
-        let outcome = run_in(&exe, &run_dir, settings);
+        let outcome = run_in(&exe, &run_dir, settings, cancel, imported);
         let _ = std::fs::remove_dir_all(&run_dir);
         outcome
     }
@@ -494,7 +562,13 @@ pub mod worker {
     }
 
     /// The import-and-verify sequence, with `exe` already staged in `exe_dir`.
-    fn run_in(exe: &Path, exe_dir: &Path, settings: &[(u32, u32)]) -> Result<String, String> {
+    fn run_in(
+        exe: &Path,
+        exe_dir: &Path,
+        settings: &[(u32, u32)],
+        cancel: &std::sync::atomic::AtomicBool,
+        imported: &mut bool,
+    ) -> Result<String, String> {
         // 1. Write the .nip into a private directory and merge-import it.
         //    `create_dir` fails if the name already exists, so winning that call
         //    proves exclusive ownership: no other process can have pre-created
@@ -508,12 +582,22 @@ pub mod worker {
             // process could swap the file the elevated child re-opens by path;
             // this handle lets the child read it and nobody rewrite it.
             let nip_arg = nip.to_string_lossy().into_owned();
-            let result = run_inspector(exe, &["-mergeImport", "-silentImport", &nip_arg]);
+            let result = run_inspector_cancellable(
+                exe,
+                &["-mergeImport", "-silentImport", &nip_arg],
+                cancel,
+            );
             drop(payload);
             result
         });
         let _ = std::fs::remove_dir_all(&job_dir);
         import?;
+        // Past this point the driver profile has been written. A later failure
+        // is a *verification* failure, not proof that nothing changed.
+        *imported = true;
+        if cancelled(cancel) {
+            return Err("cancelled after the profile was written".to_string());
+        }
 
         // 2. The silent import reports nothing, so verify through an export.
         //
@@ -524,7 +608,7 @@ pub mod worker {
         // private directory removes the problem instead of managing it: this
         // folder was created empty moments ago and nothing else can see it, so
         // whatever is here now came from the call above.
-        run_inspector(exe, &["-exportCustomized"])?;
+        run_inspector_cancellable(exe, &["-exportCustomized"], cancel)?;
         let created = export_files(exe_dir);
         let export = match created.as_slice() {
             [only] => only,
@@ -631,8 +715,17 @@ pub mod worker {
             .collect()
     }
 
-    /// Spawn the inspector without a console window and wait for it to exit.
-    fn run_inspector(exe: &Path, args: &[&str]) -> Result<(), String> {
+    fn cancelled(flag: &std::sync::atomic::AtomicBool) -> bool {
+        flag.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Spawn the inspector without a console window and wait for it to exit,
+    /// killing it if `cancel` is raised.
+    fn run_inspector_cancellable(
+        exe: &Path,
+        args: &[&str],
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), String> {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -664,6 +757,15 @@ pub mod worker {
                         "Profile Inspector did not finish within {}s",
                         INSPECTOR_TIMEOUT.as_secs()
                     ));
+                }
+                Ok(None) if cancelled(cancel) => {
+                    // The app is closing. Killing the child here is the whole
+                    // point: leaving it running would let an elevated Profile
+                    // Inspector keep writing the driver profile after the UI
+                    // is gone, with nothing left to verify or clean up.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("cancelled while Profile Inspector was running".to_string());
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(100)),
                 Err(e) => {
@@ -858,7 +960,7 @@ mod tests {
                 .rx
                 .recv_timeout(std::time::Duration::from_secs(240))
                 .expect("worker did not finish");
-            assert!(result.is_ok(), "{label}: {result:?}");
+            assert!(result.result.is_ok(), "{label}: {:?}", result.result);
         }
     }
 

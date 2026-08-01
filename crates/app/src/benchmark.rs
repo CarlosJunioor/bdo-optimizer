@@ -492,6 +492,11 @@ impl App {
             cpu: self.cpu_label(),
             gpu: self.gpu_label(),
             store_dir: self.benchmark.store_dir.clone(),
+            // `refresh_verification` above read the affinity of whichever
+            // instance is running right now; the capture must stay bound to
+            // that one, because its mask is what the session records.
+            verified_pid: bdo_bench::is_process_running(bdo_launch::GAME_EXE)
+                .map(|pid| pid.as_u32()),
         };
 
         // Fresh run: clear any stale live stats and reset the overlay snapshot.

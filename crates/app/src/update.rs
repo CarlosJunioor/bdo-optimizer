@@ -579,6 +579,14 @@ fn staged_files(inner: &Path) -> Result<Vec<StagedFile>, String> {
 fn install_all(staged: &mut [StagedFile], app_dir: &Path) -> Result<(), String> {
     // One installer at a time, machine-wide. See [`UpdateLock`].
     let _lock = UpdateLock::acquire()?;
+    // Pin the install directory for the whole swap. Every path below is built
+    // from `app_dir`, which was resolved before any of this started: without
+    // the pin a same-user process could rename that directory away and drop a
+    // junction in its place, turning the elevated writes and renames that
+    // follow into a write primitive aimed wherever it likes. Denying rename and
+    // delete sharing, and refusing to open through a reparse point, removes
+    // that. Same technique the config-file writer uses on the BDO folder.
+    let _pinned_dir = pin_directory(app_dir)?;
     // Write the ledger *before* touching anything, so a crash at any point from
     // here on is recoverable by the next start. See [`cleanup_old_files`].
     let ledger = app_dir.join(INSTALL_LEDGER);
@@ -597,8 +605,17 @@ fn install_all(staged: &mut [StagedFile], app_dir: &Path) -> Result<(), String> 
             // (README, licenses, the inspector `.config`) — so the next start
             // needs it to clean up after itself instead of leaving a stale
             // backup beside every file forever.
-            let _ = write_ledger(&ledger, LEDGER_DONE, &names);
-            Ok(())
+            // Part of the transaction, not bookkeeping after it. A `pending`
+            // ledger left on disk tells the next start to roll a *successful*
+            // update back, so failing to mark it done has to surface here —
+            // where the user sees it and the previous version is still intact —
+            // rather than as a silent downgrade on the next launch.
+            write_ledger(&ledger, LEDGER_DONE, &names).map_err(|e| {
+                format!(
+                    "the update was installed but could not be recorded as finished ({e}), so \
+                     it was not started — the next launch will restore the previous version"
+                )
+            })
         }
         Err(e) => {
             // Only drop the ledger when the rollback is known to have put
@@ -612,6 +629,32 @@ fn install_all(staged: &mut [StagedFile], app_dir: &Path) -> Result<(), String> 
             Err(e)
         }
     }
+}
+
+/// Open `dir` so it cannot be renamed, deleted or relinked while the returned
+/// handle lives, refusing it outright if it is already a link.
+fn pin_directory(dir: &Path) -> Result<std::fs::File, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    // `FILE_FLAG_OPEN_REPARSE_POINT` means this open never follows a link, so
+    // a junction swapped in beforehand is caught rather than traversed.
+    let handle = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(dir)
+        .map_err(|e| format!("could not lock {} for the update: {e}", dir.display()))?;
+    if std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(format!(
+            "{} is a link — refusing to install through it",
+            dir.display()
+        ));
+    }
+    Ok(handle)
 }
 
 /// First line of the ledger: whether the install it describes finished.

@@ -801,30 +801,35 @@ impl App {
             // Treating that as "still running" leaves the one-click screen
             // waiting forever on a result that can never arrive, with the
             // Advanced section hidden and no way out but restarting the app.
-            Some(Err(TryRecvError::Disconnected)) => Some(Err(
-                "the driver-profile job stopped unexpectedly — try again, and run the app as \
-                 administrator if it keeps failing"
-                    .to_string(),
-            )),
+            Some(Err(TryRecvError::Disconnected)) => Some(crate::video::worker::DriverOutcome {
+                result: Err("the driver-profile job stopped unexpectedly — try again, and run \
+                             the app as administrator if it keeps failing"
+                    .to_string()),
+                // A panicked job may have got as far as the import, so this
+                // must not be treated as "nothing was written".
+                imported: true,
+            }),
             Some(Err(TryRecvError::Empty)) | None => None,
         };
-        if let Some(result) = finished {
-            match (label, result.is_ok()) {
+        if let Some(outcome) = finished {
+            match (label, outcome.result.is_ok()) {
                 // Only a *verified* restore may forget which settings were
                 // applied. Clearing it when the job merely started would leave
                 // a failed restore with nothing to retry from, and the settings
                 // it did not reach would stay applied with no record of it.
                 (Some("restore"), true) => crate::video::clear_applied_record(),
-                // An apply that failed did not necessarily change anything —
-                // the inspector may never have started. Rewind the ids this run
-                // added so a later Restore cannot reset values the app never
-                // wrote. See [`crate::video::restore_applied_record`].
-                (Some("apply"), false) => {
+                // An apply that failed *before the import ran* changed nothing,
+                // so the ids it optimistically recorded are rewound — otherwise
+                // a later Restore would reset values this app never wrote. A
+                // failure after the import is a verification failure: the
+                // settings did land, and dropping their record would leave real
+                // changes with no way back. `imported` tells the two apart.
+                (Some("apply"), false) if !outcome.imported => {
                     crate::video::restore_applied_record(&self.video.applied_before)
                 }
                 _ => {}
             }
-            self.video.last = Some(result);
+            self.video.last = Some(outcome.result);
             self.video.worker = None;
         }
     }
