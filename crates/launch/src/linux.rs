@@ -26,15 +26,26 @@ pub fn launch_with_affinity(
         return Err(LaunchError::PathNotFound(launcher_path.to_path_buf()));
     }
     let cores = mask_to_cores(mask);
-    let cmd_str = generate_taskset_command(&cores, &launcher_path.to_string_lossy());
-    let mut parts = cmd_str.split_whitespace();
-    let program = parts
-        .next()
-        .ok_or_else(|| LaunchError::Os("empty command".to_string()))?;
-    let child = Command::new(program)
-        .args(parts)
-        .spawn()
-        .map_err(|e| LaunchError::Os(format!("failed to spawn: {e}")))?;
+    // Pass the path as one argument rather than formatting a command string and
+    // splitting it on whitespace: `/home/me/My Games/run.sh` would otherwise
+    // become three arguments and `taskset` would try to execute `/home/me/My`.
+    // `generate_taskset_command` still exists for the `.desktop` `Exec=` line,
+    // which genuinely is text.
+    let child = if cores.is_empty() {
+        Command::new(launcher_path).spawn()
+    } else {
+        let list = cores
+            .iter()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        Command::new("taskset")
+            .arg("-c")
+            .arg(list)
+            .arg(launcher_path)
+            .spawn()
+    }
+    .map_err(|e| LaunchError::Os(format!("failed to spawn: {e}")))?;
     Ok(LaunchMethod::Direct { pid: child.id() })
 }
 

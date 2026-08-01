@@ -316,15 +316,12 @@ fn apply(
     ]))?;
 
     progress("Verifying…");
-    let sha = tmp.join("update.zip.sha256");
-    run(hidden("curl.exe").args([
-        "-fSL",
-        "--max-time",
-        "60",
-        "-o",
-        sha.to_str().ok_or("temp path is not valid UTF-8")?,
-        sha_url,
-    ]))?;
+    // Take the expected hash straight from the HTTPS response into memory. A
+    // checksum written to disk and read back by pathname is one more object an
+    // attacker could swap in the window before it is opened — and swapping the
+    // pair (archive + checksum) together would defeat the check entirely.
+    // Nothing on disk is trusted for this comparison.
+    let sha_body = capture(hidden("curl.exe").args(["-fsSL", "--max-time", "60", sha_url]))?;
     // Pin the archive before hashing it and keep the pin through extraction, so
     // the bytes tar unpacks are provably the bytes that matched the checksum.
     // Verifying a path and then handing that path to another program is the
@@ -339,7 +336,7 @@ fn apply(
             .open(&zip)
             .map_err(|e| format!("could not lock the download for verification: {e}"))?
     };
-    verify_checksum(&mut &pinned_zip, &sha)?;
+    verify_checksum(&mut &pinned_zip, &sha_body)?;
 
     progress("Extracting…");
     // Windows' tar.exe is bsdtar, which reads zip archives natively.
@@ -381,10 +378,24 @@ fn apply(
     let _ = std::fs::remove_dir_all(&tmp);
 
     progress("Restarting…");
+    // Pin the executable we just wrote and hold it across process creation.
+    // Verifying the download and then launching whatever now sits at that path
+    // is the same check-then-use gap closed everywhere else in this file — and
+    // here the child inherits our administrator token.
+    let pinned_exe = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&exe)
+            .map_err(|e| format!("update installed, but the new executable could not be locked for restart: {e}"))?
+    };
     Command::new(&exe)
         .current_dir(&app_dir)
         .spawn()
         .map_err(|e| format!("update installed, but restart failed: {e}"))?;
+    drop(pinned_exe);
     let _ = tx.send(UpdateMsg::Restarting);
     ctx.request_repaint();
     Ok(())
@@ -414,12 +425,10 @@ fn copy_from_handle(src: &mut std::fs::File, dest: &Path) -> std::io::Result<()>
 /// checksum comes from the same release, so it does not defend against the
 /// release itself being malicious — code signing would. It does close every
 /// failure between GitHub and this disk.
-fn verify_checksum(zip: &mut impl std::io::Read, sha_file: &Path) -> Result<(), String> {
+fn verify_checksum(zip: &mut impl std::io::Read, published: &str) -> Result<(), String> {
     use sha2::Digest;
 
-    let published = std::fs::read_to_string(sha_file)
-        .map_err(|e| format!("could not read the published checksum: {e}"))?;
-    // The file is `<hex>  <name>`; take the first field and normalise case.
+    // The published line is `<hex>  <name>`; take the first field, normalise case.
     let expected = published
         .split_whitespace()
         .next()
@@ -464,7 +473,7 @@ fn create_private_dir() -> Result<PathBuf, String> {
         let dir = base.join(format!("bdo-optimizer-update-{pid}-{nanos}-{attempt}"));
         match std::fs::create_dir(&dir) {
             Ok(()) => {
-                protect_staging_dir(&dir);
+                protect_staging_dir(&dir)?;
                 return Ok(dir);
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -491,16 +500,30 @@ fn create_private_dir() -> Result<PathBuf, String> {
 /// unelevated update installs with the same privileges an attacker at that
 /// integrity level already has, so there is nothing to escalate to.
 ///
-/// Best-effort by design. It is a second layer, not the load-bearing one: the
-/// guarantee that the bytes installed are the bytes verified comes from the
-/// deny-write handles held across verification and copying (see
-/// [`staged_files`] and [`install_all`]), which need no privilege and are
-/// covered by tests. Turning a bonus layer into a hard requirement would let an
-/// unexpected `SetNamedSecurityInfoW` failure break updating entirely.
-fn protect_staging_dir(dir: &Path) {
-    if bdo_launch::is_elevated() {
-        let _ = set_high_integrity(dir);
+/// Mandatory when elevated. The pinned handles cover everything *after* a file
+/// is opened, but `curl` and `tar` write into this directory by pathname, and
+/// the extracted files exist unpinned between `tar` closing them and
+/// [`staged_files`] opening them. The label is what covers those gaps, so an
+/// elevated update that cannot get it does not proceed — the alternative is
+/// installing and running attacker-substitutable bytes as administrator.
+///
+/// Unelevated it is skipped, not failed: raising a label above your own
+/// integrity level needs `SeRelabelPrivilege` (an unelevated attempt returns
+/// `ERROR_PRIVILEGE_NOT_HELD`), and an unelevated update installs with exactly
+/// the privileges an attacker at that level already has, so there is nothing to
+/// escalate to.
+fn protect_staging_dir(dir: &Path) -> Result<(), String> {
+    if !bdo_launch::is_elevated() {
+        return Ok(());
     }
+    set_high_integrity(dir).map_err(|e| {
+        let _ = std::fs::remove_dir_all(dir);
+        format!(
+            "the update could not be staged in a folder protected from other programs on this \
+             machine ({e}), so it was not downloaded. Download the release manually from GitHub \
+             instead."
+        )
+    })
 }
 
 /// Apply a `High` mandatory label with no-write-up to `dir`.
@@ -640,6 +663,8 @@ fn staged_files(inner: &Path) -> Result<Vec<StagedFile>, String> {
 /// permissions) leaves a mix of two versions behind — or, if the executable was
 /// the one already renamed aside, no runnable app at all and no way back.
 fn install_all(staged: &mut [StagedFile], app_dir: &Path) -> Result<(), String> {
+    // One installer at a time, machine-wide. See [`UpdateLock`].
+    let _lock = UpdateLock::acquire()?;
     // Write the ledger *before* touching anything, so a crash at any point from
     // here on is recoverable by the next start. See [`cleanup_old_files`].
     let ledger = app_dir.join(INSTALL_LEDGER);
@@ -677,12 +702,36 @@ fn install_recorded(staged: &mut [StagedFile], app_dir: &Path) -> Result<(), Str
     for file in staged.iter_mut() {
         let name = &file.name;
         let dest = app_dir.join(name);
+
+        // Write the replacement into the install folder *first*, under a
+        // temporary name, and only then swap. The obvious order — rename the
+        // old file aside, then copy the new one in — leaves the destination
+        // absent for the whole duration of a copy, and for `bdo-optimizer.exe`
+        // that means a crash there leaves nothing to launch, so the ledger
+        // recovery below can never run. Writing first shrinks that window to a
+        // single rename.
+        //
+        // ponytail: a rename is not atomic against power loss, so the window is
+        // narrowed, not eliminated. Closing it entirely needs a separate
+        // bootstrap executable to do the swap — worth it only if this ever
+        // actually strands someone.
+        let incoming = app_dir.join(format!("{}.new", name.to_string_lossy()));
+        let _ = std::fs::remove_file(&incoming);
+        if let Err(e) = copy_from_handle(&mut file.handle, &incoming) {
+            rollback(&displaced, &created);
+            return Err(format!(
+                "could not stage {}: {e} — the previous version was left in place",
+                name.to_string_lossy()
+            ));
+        }
+
         let existed = dest.exists();
         if existed {
             // Renaming works even for the running exe; deleting would not.
             let old = app_dir.join(format!("{}.old", name.to_string_lossy()));
             let _ = std::fs::remove_file(&old);
             if let Err(e) = std::fs::rename(&dest, &old) {
+                let _ = std::fs::remove_file(&incoming);
                 rollback(&displaced, &created);
                 return Err(format!(
                     "could not replace {}: {e} — the previous version was left in place",
@@ -691,10 +740,8 @@ fn install_recorded(staged: &mut [StagedFile], app_dir: &Path) -> Result<(), Str
             }
             displaced.push((old, dest.clone()));
         }
-        // Copy from the *held handle*, not by re-opening the staged path: the
-        // handle is the only thing proving these are still the verified bytes.
-        // (A rename would also be wrong — the temp dir can be on another drive.)
-        if let Err(e) = copy_from_handle(&mut file.handle, &dest) {
+        if let Err(e) = std::fs::rename(&incoming, &dest) {
+            let _ = std::fs::remove_file(&incoming);
             rollback(&displaced, &created);
             return Err(format!(
                 "could not install {}: {e} — the previous version was put back",
@@ -706,6 +753,22 @@ fn install_recorded(staged: &mut [StagedFile], app_dir: &Path) -> Result<(), Str
         }
     }
     Ok(())
+}
+
+/// Run a tool and return its stdout, turning a non-zero exit into an error.
+fn capture(cmd: &mut Command) -> Result<String, String> {
+    let program = cmd.get_program().to_string_lossy().to_string();
+    let out = cmd
+        .output()
+        .map_err(|e| format!("could not run {program}: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!(
+            "{program} failed: {}",
+            stderr.lines().last().unwrap_or("unknown error").trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Wait for a spawned tool and turn a non-zero exit into an error message.
@@ -722,6 +785,58 @@ fn run(cmd: &mut Command) -> Result<(), String> {
         "{program} failed: {}",
         stderr.lines().last().unwrap_or("unknown error").trim()
     ))
+}
+
+/// A machine-wide lock held across recovery, installation and rollback.
+///
+/// Two copies of the app updating at once share the ledger and the `.old`
+/// names: one can overwrite the other's ledger, delete its backup, and adopt
+/// its half-written file as its own — after which a failure loses the genuine
+/// previous version for good. A named mutex is the cheapest thing that makes
+/// the whole sequence one-at-a-time across processes.
+struct UpdateLock(windows::Win32::Foundation::HANDLE);
+
+impl UpdateLock {
+    /// Take the lock, or report that another instance is mid-update.
+    fn acquire() -> Result<Self, String> {
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::WAIT_TIMEOUT;
+        use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+
+        let name: Vec<u16> = "Local\\bdo-optimizer-update"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: `name` is a NUL-terminated wide string alive across the call.
+        let handle = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) }
+            .map_err(|e| format!("could not create the update lock: {e}"))?;
+        // SAFETY: `handle` is a live mutex handle from the call above.
+        let waited = unsafe { WaitForSingleObject(handle, 0) };
+        if waited == WAIT_TIMEOUT {
+            // SAFETY: closing a handle we own and do not use again.
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(handle);
+            }
+            return Err(
+                "another copy of BDO Optimizer is already installing an update — wait for it \
+                 to finish"
+                    .to_string(),
+            );
+        }
+        Ok(Self(handle))
+    }
+}
+
+impl Drop for UpdateLock {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::ReleaseMutex;
+        // SAFETY: the handle is owned by this guard and released exactly once.
+        unsafe {
+            let _ = ReleaseMutex(self.0);
+            let _ = CloseHandle(self.0);
+        }
+    }
 }
 
 /// Name of the in-progress-install ledger written beside the executable.
@@ -751,6 +866,11 @@ fn cleanup_old_files() {
 /// The recovery itself, split out so it can be tested against a scratch folder
 /// instead of the real install directory.
 fn recover_with_ledger(dir: &Path) {
+    // Recovery rewrites the same files an install does, so it takes the same
+    // lock. If another instance holds it there is nothing stranded to recover.
+    let Ok(_lock) = UpdateLock::acquire() else {
+        return;
+    };
     let ledger = dir.join(INSTALL_LEDGER);
     let names = match std::fs::read_to_string(&ledger) {
         // A ledger left on disk means the install never finished: put every
@@ -805,6 +925,15 @@ fn packaged_names() -> impl Iterator<Item = &'static str> {
 mod tests {
     use super::*;
 
+    /// `install_all` takes a machine-wide named mutex, so two installing tests
+    /// running on different threads of the same binary would make one of them
+    /// fail with "another copy is already installing" — the lock doing exactly
+    /// its job. Serialise them here instead of weakening it.
+    fn installing() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     #[test]
     fn version_comparison() {
         assert!(is_newer("v0.5.0", "0.4.0"));
@@ -824,26 +953,24 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bdo-update-sha-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let zip = dir.join("update.zip");
-        let sha = dir.join("update.zip.sha256");
         std::fs::write(&zip, b"release bytes").unwrap();
-
-        // Exactly what the release workflow writes: hash, two spaces, file name.
         let reread = || std::fs::File::open(&zip).unwrap();
-        let good = "e4c8b1f31e1a4f2e0d0a5c8a3b1d9e77a0f9c4b6d2e8a1c3f5079b2d4e6a8c10";
+
         let real = {
             use sha2::Digest;
             format!("{:x}", sha2::Sha256::digest(b"release bytes"))
         };
-        std::fs::write(&sha, format!("{real}  bdo-optimizer-v9.9.9-windows-x64.zip\n")).unwrap();
-        assert!(verify_checksum(&mut reread(), &sha).is_ok());
+        // Exactly what the release workflow publishes: hash, two spaces, name.
+        let published = format!("{real}  bdo-optimizer-v9.9.9-windows-x64.zip\n");
+        assert!(verify_checksum(&mut reread(), &published).is_ok());
 
-        // A zip swapped after the checksum was published must be refused.
-        std::fs::write(&sha, format!("{good}  x.zip\n")).unwrap();
-        assert!(verify_checksum(&mut reread(), &sha).is_err());
+        // A zip that does not match the published hash must be refused.
+        let other = "e4c8b1f31e1a4f2e0d0a5c8a3b1d9e77a0f9c4b6d2e8a1c3f5079b2d4e6a8c10";
+        assert!(verify_checksum(&mut reread(), &format!("{other}  x.zip\n")).is_err());
 
         // Garbage where a hash should be must be refused, not ignored.
-        std::fs::write(&sha, "not-a-hash  x.zip\n").unwrap();
-        assert!(verify_checksum(&mut reread(), &sha).is_err());
+        assert!(verify_checksum(&mut reread(), "not-a-hash  x.zip\n").is_err());
+        assert!(verify_checksum(&mut reread(), "").is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -852,6 +979,7 @@ mod tests {
     /// half-swapped folder — or, worse, no executable at all.
     #[test]
     fn a_failed_install_restores_every_displaced_file() {
+        let _serialised = installing();
         let base = std::env::temp_dir().join(format!("bdo-update-rollback-{}", std::process::id()));
         let app = base.join("app");
         let stage = base.join("stage");
@@ -899,6 +1027,7 @@ mod tests {
     /// that handle rather than re-opening the path.
     #[test]
     fn staged_files_are_pinned_against_substitution() {
+        let _serialised = installing();
         let base = std::env::temp_dir().join(format!("bdo-update-pin-{}", std::process::id()));
         let stage = base.join("stage");
         let app = base.join("app");
@@ -929,6 +1058,7 @@ mod tests {
     /// the displaced files back rather than leaving nothing runnable.
     #[test]
     fn a_ledger_left_behind_describes_what_to_restore() {
+        let _serialised = installing();
         let dir = std::env::temp_dir().join(format!("bdo-update-ledger-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // Simulate a crash after the executable was renamed aside.

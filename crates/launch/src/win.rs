@@ -177,10 +177,17 @@ fn launch_direct(
         }
 
         // ResumeThread returns the previous suspend count, or u32::MAX on error.
+        // Same reasoning as the affinity failure above: closing the handles and
+        // returning would strand a launcher that is suspended forever, holding
+        // the game's single-instance state and blocking every later attempt.
         if ResumeThread(pi.hThread) == u32::MAX {
+            let _ = TerminateProcess(pi.hProcess, 1);
+            let _ = WaitForSingleObject(pi.hProcess, 5_000);
             let _ = CloseHandle(pi.hThread);
             let _ = CloseHandle(pi.hProcess);
-            return Err(LaunchError::Os("ResumeThread failed".to_string()));
+            return Err(LaunchError::Os(
+                "ResumeThread failed — the suspended launcher was stopped".to_string(),
+            ));
         }
 
         let _ = CloseHandle(pi.hThread);

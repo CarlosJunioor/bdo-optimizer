@@ -794,6 +794,7 @@ impl App {
     pub fn poll_driver_worker(&mut self) {
         use std::sync::mpsc::TryRecvError;
 
+        let restoring = self.video.worker.as_ref().is_some_and(|w| w.label == "restore");
         let finished = match self.video.worker.as_ref().map(|worker| worker.rx.try_recv()) {
             Some(Ok(result)) => Some(result),
             // The worker thread ended without sending — a panic inside the job.
@@ -808,6 +809,13 @@ impl App {
             Some(Err(TryRecvError::Empty)) | None => None,
         };
         if let Some(result) = finished {
+            // Only a *verified* restore may forget which settings were applied.
+            // Clearing it when the job merely started would leave a failed
+            // restore with nothing to retry from, and the settings it did not
+            // reach would stay applied with no record that they ever were.
+            if restoring && result.is_ok() {
+                crate::video::clear_applied_record();
+            }
             self.video.last = Some(result);
             self.video.worker = None;
         }
@@ -907,11 +915,24 @@ impl App {
         }
         // Record before the job runs, not after: a crash mid-import must not
         // leave settings written with no record of which ones, or undo would
-        // reset the wrong set.
+        // reset the wrong set. The record is a union, so a job that fails
+        // before touching anything only ever *over*-records — undo then resets
+        // a setting to its default that was already at its default.
+        //
+        // Restore does the opposite and keeps the record until the worker
+        // reports a verified success (see `poll_driver_worker`): clearing it up
+        // front would leave a failed restore with nothing to retry from.
         if label == "apply" {
-            crate::video::record_applied(&settings);
-        } else {
-            crate::video::clear_applied_record();
+            if let Err(e) = crate::video::record_applied(&settings) {
+                self.oneclick.steps.push((
+                    STEP.into(),
+                    Err(format!(
+                        "could not save which driver settings are being changed, so this could \
+                         not be made undoable ({e}) — the profile was left alone"
+                    )),
+                ));
+                return;
+            }
         }
         self.video.last = None;
         self.video.worker = Some(crate::video::worker::start(exe, settings, label));
@@ -1542,10 +1563,25 @@ impl App {
                         {
                             let settings =
                                 crate::video::guide_settings(physical_cores, self.video.ull);
-                            crate::video::record_applied(&settings);
-                            self.video.last = None;
-                            self.video.worker =
-                                Some(crate::video::worker::start(exe.clone(), settings, "apply"));
+                            // Same contract as the one-click path: no record,
+                            // no change — the button promises a reversible edit.
+                            match crate::video::record_applied(&settings) {
+                                Ok(()) => {
+                                    self.video.last = None;
+                                    self.video.worker = Some(crate::video::worker::start(
+                                        exe.clone(),
+                                        settings,
+                                        "apply",
+                                    ));
+                                }
+                                Err(e) => {
+                                    self.video.last = Some(Err(format!(
+                                        "could not save which settings are being changed, so \
+                                         this could not be made undoable ({e}) — the profile \
+                                         was left alone"
+                                    )));
+                                }
+                            }
                         }
                         if ui
                             .add_enabled(!busy, egui::Button::new("Restore driver defaults"))
@@ -1555,8 +1591,10 @@ impl App {
                             )
                             .clicked()
                         {
+                            // The record is cleared by `poll_driver_worker`, and
+                            // only once the restore verifies — a failed one
+                            // must stay retryable.
                             let applied = crate::video::recorded_applied();
-                            crate::video::clear_applied_record();
                             self.video.last = None;
                             self.video.worker = Some(crate::video::worker::start(
                                 exe,

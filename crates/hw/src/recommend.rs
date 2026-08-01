@@ -153,7 +153,7 @@ fn apply_x3d_topology(rec: &mut Recommendation, cpu: &CpuInfo) {
 /// Match an AMD Ryzen model string against the guide's table.
 /// Returns `Some((recommendation, is_dual_ccd_x3d))`, or `None` for models the
 /// guide does not name (those derive from topology instead).
-fn match_amd(m: &str, _cpu: &CpuInfo) -> Option<(Recommendation, bool)> {
+fn match_amd(m: &str, cpu: &CpuInfo) -> Option<(Recommendation, bool)> {
     // --- Dual-CCD X3D parts: must land on the V-Cache CCD (topology cross-check) ---
     // NOTE: the X3D arms must stay above their non-X3D counterparts — "9950X3D"
     // also contains "9950X", so reordering these silently mis-recommends.
@@ -254,7 +254,12 @@ fn match_amd(m: &str, _cpu: &CpuInfo) -> Option<(Recommendation, bool)> {
     }
 
     // --- Ryzen 5 3500/3500X: 6 cores / 6 threads, no SMT ---
-    if m.contains("3500") {
+    //
+    // Guarded by the live thread count, because "3500" also matches the Ryzen 5
+    // 3500U — a 4-core/8-thread mobile part *with* SMT. Claiming it has nothing
+    // to disable would deny those laptops the one recommendation that helps
+    // them; without the guard they get the exact opposite of the right advice.
+    if m.contains("3500") && cpu.logical_cores == cpu.physical_cores {
         return Some((
             Recommendation::no_change(
                 "Ryzen 5 3500/3500X has 6 cores / 6 threads — no SMT to disable, no change needed.",
@@ -727,6 +732,22 @@ mod tests {
         let rec = recommend(&cpu("AMD Ryzen 5 3500X 6-Core Processor", 6, 6));
         assert_eq!(rec.mask_hex, None);
         assert!(rec.explanation.contains("no SMT"));
+    }
+
+    /// "3500" also matches the Ryzen 5 3500U, a 4c/8t mobile part *with* SMT.
+    /// Telling it there is no SMT to disable is the opposite of the truth, so
+    /// it must fall through to the topology derivation instead.
+    #[test]
+    fn mobile_3500u_is_not_treated_as_the_desktop_3500() {
+        let mut c = cpu("AMD Ryzen 5 3500U with Radeon Vega Mobile Gfx", 4, 8);
+        c.cores = topo(&[(4, 0, true)]);
+        let rec = recommend(&c);
+        assert_eq!(
+            rec.mask_hex.as_deref(),
+            Some("55"),
+            "one thread per physical core: {}",
+            rec.explanation
+        );
     }
 
     #[test]

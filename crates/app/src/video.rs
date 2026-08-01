@@ -22,6 +22,22 @@ use std::path::{Path, PathBuf};
 /// The bundled NVIDIA Profile Inspector executable file name.
 pub const INSPECTOR_EXE: &str = "nvidiaProfileInspector.exe";
 
+/// The `.config` the inspector ships with, reproduced verbatim.
+///
+/// Emitted from here rather than copied out of the app folder when the tool is
+/// staged into its private run directory: it is a fixed five lines that only
+/// pin the .NET runtime version, and reading it from a user-writable location
+/// would hand a same-user process a way to add assembly-binding redirects to a
+/// process that runs elevated.
+pub const INSPECTOR_CONFIG: &str = concat!(
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n",
+    "<configuration>\r\n",
+    "  <startup>\r\n",
+    "    <supportedRuntime version=\"v4.0\" sku=\".NETFramework,Version=v4.8\" />\r\n",
+    "  </startup>\r\n",
+    "</configuration>",
+);
+
 /// Exact bundled Profile Inspector v3.0.2.1 binary identity.
 const INSPECTOR_SIZE: u64 = 1_043_456;
 const INSPECTOR_SHA256: [u8; 32] = [
@@ -107,15 +123,32 @@ fn applied_record_path() -> Option<PathBuf> {
 }
 
 /// Record which setting ids an apply wrote, so undo can reverse exactly those.
-pub fn record_applied(settings: &[(u32, u32)]) {
-    let Some(path) = applied_record_path() else {
-        return;
-    };
+///
+/// The record accumulates: it is the union of every id written since the last
+/// verified restore, not just the latest apply. Applying once with Ultra Low
+/// Latency on and again with it off would otherwise shrink the record to three
+/// ids — and because the import is a *merge*, the earlier ULL overrides are
+/// still sitting in the driver profile, so undo would walk away leaving
+/// settings this app wrote behind.
+///
+/// Returns an error the caller can report: silently failing to record makes a
+/// change the UI calls reversible into one that is not.
+pub fn record_applied(settings: &[(u32, u32)]) -> Result<(), String> {
+    let path = applied_record_path()
+        .ok_or_else(|| "the app data folder could not be located".to_string())?;
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
     }
-    let ids: Vec<String> = settings.iter().map(|(id, _)| id.to_string()).collect();
-    let _ = std::fs::write(path, ids.join("\n"));
+    let mut ids: Vec<u32> = recorded_applied();
+    for (id, _) in settings {
+        if !ids.contains(id) {
+            ids.push(*id);
+        }
+    }
+    let text: Vec<String> = ids.iter().map(u32::to_string).collect();
+    std::fs::write(&path, text.join("\n"))
+        .map_err(|e| format!("could not save {}: {e}", path.display()))
 }
 
 /// Read back the ids recorded by [`record_applied`]; empty when none survived.
@@ -361,11 +394,81 @@ pub mod worker {
                 exe.display()
             ));
         }
-        let exe_dir = exe
-            .parent()
-            .ok_or_else(|| "inspector path has no parent directory".to_string())?
-            .to_path_buf();
+        // Run the inspector from a directory that holds *only* files we
+        // wrote. Pinning the executable proves the EXE is ours, but Windows
+        // searches the executable's own folder before System32 for ordinary
+        // (non-KnownDLL) imports, and this one resolves `nvapi64.dll` by name.
+        // Left in the portable app folder, a same-user process could drop an
+        // `nvapi64.dll` beside the pinned EXE and have it loaded into a child
+        // that inherits our administrator token — no tampering with the EXE
+        // required. A fresh, exclusively-created directory has nothing to find.
+        //
+        // Exports land here too, which is why this file no longer needs to
+        // stash and restore the user's own `CustomProfiles_*.nip` files: the
+        // directory starts empty and belongs to this run alone.
+        let run_dir = create_private_dir()?;
+        let exe = match stage_inspector(&mut locked, &run_dir) {
+            Ok(path) => path,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&run_dir);
+                return Err(e);
+            }
+        };
+        let exe = exe.as_path();
+        let exe_dir = run_dir.clone();
+        let outcome = run_in(exe, &exe_dir, settings);
+        let _ = std::fs::remove_dir_all(&run_dir);
+        outcome
+    }
 
+    /// Copy the verified inspector out of `locked` into `dir`, alongside the
+    /// `.config` the .NET launcher needs, and hand back the new path.
+    ///
+    /// The copy is written from the *pinned handle*, so it is byte-for-byte the
+    /// build that was hashed. The `.config` is emitted from a constant rather
+    /// than copied out of the app folder: it is five fixed lines that only pin
+    /// the runtime version, and reading it from a user-writable location would
+    /// reintroduce exactly the tampering this staging removes.
+    fn stage_inspector(locked: &mut std::fs::File, dir: &Path) -> Result<PathBuf, String> {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dest = dir.join(super::INSPECTOR_EXE);
+        locked
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| format!("could not rewind the inspector: {e}"))?;
+        let mut bytes = Vec::new();
+        locked
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("could not read the inspector: {e}"))?;
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .share_mode(0)
+            .open(&dest)
+            .map_err(|e| format!("could not create {}: {e}", dest.display()))?;
+        out.write_all(&bytes)
+            .and_then(|()| out.sync_all())
+            .map_err(|e| format!("could not write {}: {e}", dest.display()))?;
+        drop(out);
+
+        let config = dir.join(format!("{}.config", super::INSPECTOR_EXE));
+        std::fs::write(&config, super::INSPECTOR_CONFIG)
+            .map_err(|e| format!("could not write {}: {e}", config.display()))?;
+
+        // The staged copy is what actually runs, so it is what must be pinned
+        // and re-verified — trusting the source handle alone would leave the
+        // copy itself unchecked.
+        let mut staged = super::open_locked(&dest)
+            .map_err(|e| format!("could not lock {}: {e}", dest.display()))?;
+        if !super::handle_is_trusted(&mut staged) {
+            return Err("the staged Profile Inspector copy did not verify".to_string());
+        }
+        Ok(dest)
+    }
+
+    /// The import-and-verify sequence, with `exe` already staged in `exe_dir`.
+    fn run_in(exe: &Path, exe_dir: &Path, settings: &[(u32, u32)]) -> Result<String, String> {
         // 1. Write the .nip into a private directory and merge-import it.
         //    `create_dir` fails if the name already exists, so winning that call
         //    proves exclusive ownership: no other process can have pre-created
@@ -389,54 +492,27 @@ pub mod worker {
         // 2. The silent import reports nothing, so verify through an export.
         //
         // The export lands beside the executable under a timestamped name we do
-        // not choose, and that name has only second resolution — so *inferring*
-        // which file is ours is unreliable in both directions: a quick retry
-        // overwrites the previous name (looks like nothing happened), while a
-        // stale export left by someone else looks like ours. Rather than guess,
-        // move any existing exports aside first. Whatever is present afterwards
-        // was produced by this run, and the guard puts the originals back on
-        // every exit path, so nobody else's file is consumed or deleted.
-        let stash = stash_exports(&exe_dir)?;
-        // Anything this run produced must be cleared before the stash is put
-        // back, on *every* path out. Leaving one behind means the next run's
-        // timestamped export can collide with a stashed original's name, and
-        // then neither the guard nor `recover_orphaned_stashes` can restore
-        // that file — the user's export stays hidden under the stash marker.
-        let export_result = run_inspector(exe, &["-exportCustomized"]);
-        let created = export_files(&exe_dir);
-        let claim = |keep: Option<&Path>| {
-            for path in &created {
-                if Some(path.as_path()) != keep {
-                    let _ = std::fs::remove_file(path);
-                }
-            }
-        };
-        if let Err(e) = export_result {
-            claim(None);
-            drop(stash);
-            return Err(e);
-        }
+        // not choose. That used to mean guessing which file was ours among the
+        // user's own exports in the app folder — and an elaborate stash-and-
+        // restore dance to avoid consuming one of theirs. Running from a
+        // private directory removes the problem instead of managing it: this
+        // folder was created empty moments ago and nothing else can see it, so
+        // whatever is here now came from the call above.
+        run_inspector(exe, &["-exportCustomized"])?;
+        let created = export_files(exe_dir);
         let export = match created.as_slice() {
             [only] => only,
-            [] => {
-                drop(stash);
-                return Err("verification export produced no file".to_string());
-            }
+            [] => return Err("verification export produced no file".to_string()),
             many => {
-                let count = many.len();
-                claim(None);
-                drop(stash);
                 return Err(format!(
-                    "Profile Inspector produced {count} exports at once, so this run's own \
-                     export could not be identified. Close any other Profile Inspector window \
-                     and try again."
-                ));
+                    "Profile Inspector wrote {} exports into its own private folder, so this \
+                     run's export could not be identified.",
+                    many.len()
+                ))
             }
         };
         let bytes = std::fs::read(export)
             .map_err(|e| format!("could not read {}: {e}", export.display()))?;
-        let _ = std::fs::remove_file(export);
-        drop(stash);
 
         if super::export_confirms(&super::decode_export(&bytes), settings) {
             Ok(format!(
@@ -533,104 +609,6 @@ pub mod worker {
             }
         }
         Err("could not create a private temp directory".to_string())
-    }
-
-    /// Pre-existing exports moved out of the way, restored when dropped.
-    ///
-    /// This is what makes export attribution exact instead of inferred: with
-    /// the directory cleared of other exports, anything present afterwards came
-    /// from this run. The originals are renamed, never copied or deleted, and
-    /// come back on every exit path including errors and panics.
-    struct StashedExports(Vec<(PathBuf, PathBuf)>);
-
-    /// Marker embedded in a stashed file's name, followed by the owning pid.
-    const STASH_MARKER: &str = ".bdo-optimizer-stash-";
-
-    impl Drop for StashedExports {
-        fn drop(&mut self) {
-            for (stashed, original) in self.0.drain(..) {
-                // A transient lock on the directory can make the rename fail,
-                // and a Drop cannot report that — so retry briefly rather than
-                // discarding the error outright. If it still fails the file
-                // keeps its self-describing stash name and the next run's
-                // `recover_orphaned_stashes` puts it back.
-                for attempt in 0..5 {
-                    if std::fs::rename(&stashed, &original).is_ok() {
-                        break;
-                    }
-                    if attempt < 4 {
-                        std::thread::sleep(Duration::from_millis(50));
-                    }
-                }
-            }
-        }
-    }
-
-    /// Put back any exports a previous run stashed and never restored.
-    ///
-    /// Without this, a crash (or a failed restore) between stashing and
-    /// restoring would hide the user's exports permanently: the stash name does
-    /// not end in `.nip`, so nothing would ever look at them again.
-    ///
-    /// Stashes are recovered regardless of which pid owns them. Skipping this
-    /// process's own pid looks safer but is strictly worse: it leaves a failed
-    /// restore hidden for the rest of the session, and Windows reuses pids, so
-    /// after a crash a new process can inherit the pid of the run that stranded
-    /// the file and skip it forever. Nothing live is at risk either way —
-    /// `job_lock` serializes jobs and this runs before the new stash is made,
-    /// so no guard of ours owns a stash at this moment.
-    ///
-    /// ponytail: a second copy of the app running concurrently could have its
-    /// stash restored mid-run; that yields a fail-closed "more than one export"
-    /// error for that run, never data loss.
-    fn recover_orphaned_stashes(dir: &Path) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for path in entries.flatten().map(|e| e.path()) {
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            let Some(marker_at) = name.rfind(STASH_MARKER) else {
-                continue;
-            };
-            let original_name = &name[..marker_at];
-            if !(original_name.starts_with("CustomProfiles_") && original_name.ends_with(".nip")) {
-                continue;
-            }
-            let original = path.with_file_name(original_name);
-            // Only restore into a free name: if the original is back, this stash
-            // is a duplicate and overwriting would destroy the live copy.
-            if !original.exists() {
-                let _ = std::fs::rename(&path, &original);
-            }
-        }
-    }
-
-    /// Move every existing export aside. The stash name deliberately does not
-    /// end in `.nip`, so [`export_files`] cannot see the stashed copies.
-    fn stash_exports(dir: &Path) -> Result<StashedExports, String> {
-        // Clean up after any earlier run that died mid-stash before deciding
-        // what is "already there".
-        recover_orphaned_stashes(dir);
-
-        let mut moved = StashedExports(Vec::new());
-        for original in export_files(dir) {
-            let mut name = original.file_name().unwrap_or_default().to_os_string();
-            name.push(format!("{STASH_MARKER}{}", std::process::id()));
-            let stashed = original.with_file_name(name);
-            // `moved` already owns the earlier renames, so an error here still
-            // unwinds them through its Drop — the directory never keeps a
-            // half-stashed state.
-            std::fs::rename(&original, &stashed).map_err(|e| {
-                format!(
-                    "could not move the existing export {} aside: {e}",
-                    original.display()
-                )
-            })?;
-            moved.0.push((stashed, original));
-        }
-        Ok(moved)
     }
 
     /// Every `CustomProfiles_*.nip` currently next to the inspector executable.
@@ -731,102 +709,6 @@ pub mod worker {
             assert!(writer.is_err(), "payload must not be writable while held");
 
             drop(held);
-            let _ = std::fs::remove_dir_all(dir);
-        }
-
-        /// Someone else's export must be invisible while ours is identified,
-        /// and must come back afterwards — never consumed or deleted.
-        #[test]
-        fn stashing_hides_then_restores_existing_exports() {
-            let dir = create_private_dir().expect("dir");
-            let theirs = dir.join("CustomProfiles_2020-01-01_00-00-00.nip");
-            std::fs::write(&theirs, "someone else's export").unwrap();
-
-            {
-                let _stash = stash_exports(&dir).expect("stash");
-                assert!(
-                    export_files(&dir).is_empty(),
-                    "a stashed export must not look like this run's output"
-                );
-                // Whatever appears now is unambiguously ours.
-                let ours = dir.join("CustomProfiles_2026-07-28_12-00-00.nip");
-                std::fs::write(&ours, "ours").unwrap();
-                assert_eq!(export_files(&dir), vec![ours.clone()]);
-                std::fs::remove_file(&ours).unwrap();
-            }
-
-            assert_eq!(
-                std::fs::read_to_string(&theirs).unwrap(),
-                "someone else's export",
-                "the pre-existing export must be restored untouched"
-            );
-            let _ = std::fs::remove_dir_all(dir);
-        }
-
-        /// A stash orphaned by a crashed run must be put back, not left hidden
-        /// forever under a name nothing looks at.
-        #[test]
-        fn an_orphaned_stash_is_recovered_by_the_next_run() {
-            let dir = create_private_dir().expect("dir");
-            let original_name = "CustomProfiles_2020-01-01_00-00-00.nip";
-            // Pid 1 stands in for a previous, now-dead run.
-            let orphan = dir.join(format!("{original_name}{STASH_MARKER}1"));
-            std::fs::write(&orphan, "stranded export").unwrap();
-            assert!(export_files(&dir).is_empty(), "precondition: hidden");
-
-            recover_orphaned_stashes(&dir);
-
-            let restored = dir.join(original_name);
-            assert_eq!(export_files(&dir), vec![restored.clone()]);
-            assert_eq!(
-                std::fs::read_to_string(&restored).unwrap(),
-                "stranded export"
-            );
-            assert!(!orphan.exists());
-
-            let _ = std::fs::remove_dir_all(dir);
-        }
-
-        /// A stash carrying *our own* pid must be recovered too: a failed
-        /// restore would otherwise stay hidden for the whole session, and
-        /// Windows reuses pids, so a crashed run's pid can come back.
-        #[test]
-        fn an_orphan_with_our_own_pid_is_recovered() {
-            let dir = create_private_dir().expect("dir");
-            let original_name = "CustomProfiles_2021-02-03_04-05-06.nip";
-            let orphan = dir.join(format!(
-                "{original_name}{STASH_MARKER}{}",
-                std::process::id()
-            ));
-            std::fs::write(&orphan, "ours, stranded").unwrap();
-
-            recover_orphaned_stashes(&dir);
-
-            let restored = dir.join(original_name);
-            assert_eq!(export_files(&dir), vec![restored.clone()]);
-            assert_eq!(
-                std::fs::read_to_string(&restored).unwrap(),
-                "ours, stranded"
-            );
-
-            let _ = std::fs::remove_dir_all(dir);
-        }
-
-        /// Recovery must never overwrite a live file with a stale stash.
-        #[test]
-        fn recovery_leaves_a_stash_alone_when_the_original_is_back() {
-            let dir = create_private_dir().expect("dir");
-            let original_name = "CustomProfiles_2020-01-01_00-00-00.nip";
-            let live = dir.join(original_name);
-            std::fs::write(&live, "the live copy").unwrap();
-            let orphan = dir.join(format!("{original_name}{STASH_MARKER}1"));
-            std::fs::write(&orphan, "the stale stash").unwrap();
-
-            recover_orphaned_stashes(&dir);
-
-            assert_eq!(std::fs::read_to_string(&live).unwrap(), "the live copy");
-            assert!(orphan.exists(), "the stash must be left, not destroyed");
-
             let _ = std::fs::remove_dir_all(dir);
         }
 
