@@ -282,7 +282,7 @@ pub const TWEAKS: &[Tweak] = &[
 /// endings and unrelated lines, is preserved. A key absent from this file is
 /// simply not applicable — it is not an error and is not counted.
 pub fn patch_game_option(text: &str) -> (String, PatchStats) {
-    patch_game_option_to(text, &|t, _| t.txt_value.to_string())
+    patch_game_option_to(text, &|t, _| Some(t.txt_value.to_string()))
 }
 
 /// [`patch_game_option`] with the target value chosen per setting.
@@ -292,7 +292,7 @@ pub fn patch_game_option(text: &str) -> (String, PatchStats) {
 /// anything else in the file.
 pub fn patch_game_option_to(
     text: &str,
-    value_for: &dyn Fn(&Tweak, usize) -> String,
+    value_for: &dyn Fn(&Tweak, usize) -> Option<String>,
 ) -> (String, PatchStats) {
     let mut stats = PatchStats::default();
     let mut seen: Vec<(&str, usize)> = Vec::new();
@@ -305,7 +305,7 @@ pub fn patch_game_option_to(
 
 fn patch_option_line(
     line: &str,
-    value_for: &dyn Fn(&Tweak, usize) -> String,
+    value_for: &dyn Fn(&Tweak, usize) -> Option<String>,
     seen: &mut Vec<(&'static str, usize)>,
     stats: &mut PatchStats,
 ) -> String {
@@ -329,7 +329,12 @@ fn patch_option_line(
             0
         }
     };
-    let target = value_for(tweak, nth);
+    // `None` means "leave this occurrence as it is" — restore uses it for an
+    // occurrence the backup never had.
+    let Some(target) = value_for(tweak, nth) else {
+        stats.found += 1;
+        return line.to_string();
+    };
     stats.found += 1;
     if value.trim() == target {
         return line.to_string();
@@ -350,13 +355,13 @@ fn patch_option_line(
 /// Each shape occurs multiple times per file (the live values plus one copy per
 /// in-game settings preset); the guide says to set them all.
 pub fn patch_game_variable(text: &str) -> (String, PatchStats) {
-    patch_game_variable_to(text, &|t, _| t.xml_value.to_string())
+    patch_game_variable_to(text, &|t, _| Some(t.xml_value.to_string()))
 }
 
 /// [`patch_game_variable`] with the target value chosen per setting.
 pub fn patch_game_variable_to(
     text: &str,
-    value_for: &dyn Fn(&Tweak, usize) -> String,
+    value_for: &dyn Fn(&Tweak, usize) -> Option<String>,
 ) -> (String, PatchStats) {
     let mut stats = PatchStats::default();
     let mut text = text.to_string();
@@ -450,7 +455,7 @@ fn set_game_option_values(
     text: &str,
     key: &str,
     nth: &mut usize,
-    value_for: &dyn Fn(usize) -> String,
+    value_for: &dyn Fn(usize) -> Option<String>,
     stats: &mut PatchStats,
 ) -> String {
     let opener = format!("<GameOption Type=\"{key}\"");
@@ -479,7 +484,13 @@ fn set_game_option_values(
             continue;
         };
         let current = &tag[value_start..value_start + close];
-        let new_value = value_for(*nth);
+        let Some(new_value) = value_for(*nth) else {
+            *nth += 1;
+            stats.found += 1;
+            out.push_str(tag);
+            rest = after;
+            continue;
+        };
         *nth += 1;
         if current != new_value {
             stats.changed += 1;
@@ -498,7 +509,7 @@ fn set_attr_values(
     text: &str,
     tag_prefix: &str,
     nth: &mut usize,
-    value_for: &dyn Fn(usize) -> String,
+    value_for: &dyn Fn(usize) -> Option<String>,
     stats: &mut PatchStats,
 ) -> String {
     let mut out = String::with_capacity(text.len());
@@ -514,7 +525,13 @@ fn set_attr_values(
         let terminator = rest.find(['"', '<', '>']);
         match terminator {
             Some(end) if rest.as_bytes()[end] == b'"' => {
-                let new_value = value_for(*nth);
+                let Some(new_value) = value_for(*nth) else {
+                    *nth += 1;
+                    stats.found += 1;
+                    out.push_str(&rest[..end]);
+                    rest = &rest[end..];
+                    continue;
+                };
                 *nth += 1;
                 if rest[..end] != new_value {
                     stats.changed += 1;
@@ -707,13 +724,6 @@ fn restore_one(root: &Path, path: &Path) -> Result<FileChange, String> {
             .iter()
             .find(|(key, _)| *key == tweak.txt_key)
             .and_then(|(_, values)| values.get(nth).cloned())
-            .unwrap_or_else(|| {
-                if is_xml {
-                    tweak.xml_value.to_string()
-                } else {
-                    tweak.txt_value.to_string()
-                }
-            })
     };
 
     let live = decode_latin1(&live_bytes);

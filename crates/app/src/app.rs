@@ -52,6 +52,10 @@ pub struct OptimizeState {
     pub last_verify_at: Option<Instant>,
     /// Whether `mask_input` has been seeded from the recommendation yet.
     pub seeded: bool,
+    /// The game process the last verification read, captured in the same step
+    /// so a benchmark can refuse to measure a different instance under that
+    /// instance's provenance.
+    pub verified_pid: Option<u32>,
 }
 
 impl OptimizeState {
@@ -478,6 +482,22 @@ impl App {
         );
     }
 
+    /// Stop every background job that owns a child process, and wait for it.
+    ///
+    /// Both workers spawn separate elevated processes that outlive a bare
+    /// `exit`: PresentMon holds an ETW trace session, and Profile Inspector can
+    /// still be mid-import. Called from `on_exit` and from the updater's
+    /// restart path, which does not go through `on_exit`.
+    pub(crate) fn shutdown_workers(&mut self) {
+        if let Some(worker) = self.benchmark.worker.as_mut() {
+            worker.stop_and_join();
+        }
+        #[cfg(windows)]
+        if let Some(worker) = self.video.worker.as_mut() {
+            worker.stop();
+        }
+    }
+
     /// CPU model for stamping into sessions (falls back to a placeholder).
     pub fn cpu_label(&self) -> String {
         self.detection
@@ -513,17 +533,7 @@ impl eframe::App for App {
     /// discard the session the user was recording. This gives the worker its
     /// ordinary stop path instead.
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        if let Some(worker) = self.benchmark.worker.as_mut() {
-            worker.stop_and_join();
-        }
-        // The driver job spawns Profile Inspector and can be parked waiting on
-        // it for up to 90 seconds. Exiting underneath it leaves that child
-        // running elevated, still writing the driver profile, with nothing left
-        // to verify the result or delete the staging directory.
-        #[cfg(windows)]
-        if let Some(worker) = self.video.worker.as_mut() {
-            worker.stop();
-        }
+        self.shutdown_workers();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {

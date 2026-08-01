@@ -86,7 +86,15 @@ impl App {
                 UpdateMsg::UpToDate => UpdateStatus::UpToDate,
                 UpdateMsg::Available(info) => UpdateStatus::Available(info),
                 UpdateMsg::Progress(step) => UpdateStatus::Working(step),
-                UpdateMsg::Restarting => std::process::exit(0),
+                UpdateMsg::Restarting => {
+                    // `process::exit` does not run `eframe::App::on_exit`, so
+                    // the workers have to be stopped here. A capture started
+                    // after the update began would otherwise be discarded with
+                    // its elevated PresentMon left running, and a driver job
+                    // would keep writing the profile with nobody to verify it.
+                    self.shutdown_workers();
+                    std::process::exit(0)
+                }
                 UpdateMsg::Error(e) => UpdateStatus::Error(e),
             };
         }
@@ -94,7 +102,9 @@ impl App {
 
     /// Sidebar row: update button / progress / result.
     pub fn update_row(&mut self, ui: &mut egui::Ui) {
-        let capturing = self.benchmark.worker.is_some();
+        // Both workers block an update: restarting mid-job would abandon an
+        // elevated child process either way.
+        let capturing = self.benchmark.worker.is_some() || self.video.worker.is_some();
         egui::Frame::new()
             .inner_margin(egui::Margin::symmetric(10, 6))
             .show(ui, |ui| match &self.update.status {
@@ -378,25 +388,24 @@ fn apply(
     // about what is sitting at the destination now. Read the executable back
     // through a pin that denies further writes and check it byte-for-byte
     // against the verified staged copy before anything runs it.
-    verify_installed(&mut staged, &exe)?;
+    let pinned_exe = match verify_installed(&mut staged, &exe) {
+        Ok(handle) => handle,
+        Err(e) => {
+            // The swap already happened and the ledger says `done`, so leaving
+            // now would strand the rejected executable at the canonical path
+            // with the good one only as `.old` — and the next start would clean
+            // that backup away. Put the previous version back instead.
+            let _ = roll_back_completed_install(&app_dir);
+            return Err(e);
+        }
+    };
     // Release the source pins before the staging directory is removed.
     drop(staged);
     let _ = std::fs::remove_dir_all(&tmp);
 
     progress("Restarting…");
-    // Pin the executable we just wrote and hold it across process creation.
-    // Verifying the download and then launching whatever now sits at that path
-    // is the same check-then-use gap closed everywhere else in this file — and
-    // here the child inherits our administrator token.
-    let pinned_exe = {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_SHARE_READ: u32 = 0x0000_0001;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .share_mode(FILE_SHARE_READ)
-            .open(&exe)
-            .map_err(|e| format!("update installed, but the new executable could not be locked for restart: {e}"))?
-    };
+    // `pinned_exe` has been held since the bytes were compared, so what starts
+    // here is provably what was verified.
     Command::new(&exe)
         .current_dir(&app_dir)
         .spawn()
@@ -415,7 +424,7 @@ fn apply(
 /// folder is writable by any process running as this user. Without this check
 /// a same-user process could overwrite the new executable in the gap before it
 /// is launched and have its bytes run with this app's administrator token.
-fn verify_installed(staged: &mut [StagedFile], exe: &Path) -> Result<(), String> {
+fn verify_installed(staged: &mut [StagedFile], exe: &Path) -> Result<std::fs::File, String> {
     use std::io::{Read, Seek, SeekFrom};
 
     let name = exe
@@ -458,7 +467,11 @@ fn verify_installed(staged: &mut [StagedFile], exe: &Path) -> Result<(), String>
                 .to_string(),
         );
     }
-    Ok(())
+    // Hand the pin back rather than dropping it. Re-opening the path later to
+    // launch it would reintroduce the gap this check just closed: the verified
+    // bytes could be swapped in between and the replacement started with the
+    // administrator token, unverified.
+    Ok(installed)
 }
 
 /// Write `dest` from an already-open, pinned source handle.
@@ -541,10 +554,11 @@ fn staged_files(inner: &Path) -> Result<Vec<StagedFile>, String> {
     const FILE_SHARE_READ: u32 = 0x0000_0001;
 
     let mut files = Vec::new();
-    for entry in std::fs::read_dir(inner)
-        .map_err(|e| format!("could not read extracted folder: {e}"))?
-        .flatten()
-    {
+    for entry in std::fs::read_dir(inner).map_err(|e| format!("could not read extracted folder: {e}"))? {
+        // Never `.flatten()` here: a dropped entry is a file that silently does
+        // not get installed, and the result is a new executable running beside
+        // a stale PresentMon or inspector whose hash no longer matches.
+        let entry = entry.map_err(|e| format!("could not read the extracted release: {e}"))?;
         let src = entry.path();
         if !src.is_file() {
             continue;
@@ -566,6 +580,16 @@ fn staged_files(inner: &Path) -> Result<Vec<StagedFile>, String> {
     }
     if files.is_empty() {
         return Err("the downloaded release contains no files".to_string());
+    }
+    // Everything this app needs at runtime has to be in the package. Installing
+    // a partial one commits the swap and only then discovers that capture or
+    // the driver profile no longer works.
+    for required in packaged_names() {
+        if !files.iter().any(|f| f.name == std::ffi::OsStr::new(required)) {
+            return Err(format!(
+                "the downloaded release is missing {required}, so it was not installed"
+            ));
+        }
     }
     Ok(files)
 }
@@ -648,7 +672,12 @@ fn pin_directory(dir: &Path) -> Result<std::fs::File, String> {
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(dir)
         .map_err(|e| format!("could not lock {} for the update: {e}", dir.display()))?;
-    if std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
+    // Classify from the handle, and by reparse *tag*: a junction is a mount
+    // point, not a symlink, so a `is_symlink()` check would wave it through
+    // while every later `app_dir.join(...)` followed it — turning the elevated
+    // writes below into a redirected write primitive. Same test the config
+    // writer uses on the BDO folder.
+    if is_name_surrogate(&handle).unwrap_or(true) {
         return Err(format!(
             "{} is a link — refusing to install through it",
             dir.display()
@@ -657,25 +686,119 @@ fn pin_directory(dir: &Path) -> Result<std::fs::File, String> {
     Ok(handle)
 }
 
+/// Undo a swap that already completed, used when the installed executable
+/// fails its post-install check.
+///
+/// At that point the ledger reads `done`, so nothing else will ever put the
+/// previous version back — the next start would instead delete it as a
+/// finished install's backup.
+fn roll_back_completed_install(app_dir: &Path) -> Result<(), String> {
+    let ledger = app_dir.join(INSTALL_LEDGER);
+    let text = read_ledger(&ledger).map_err(|e| e.to_string())?;
+    let names: Vec<String> = text.lines().skip(1).map(str::to_string).collect();
+    // Re-arm the ledger first: if this process dies mid-rollback, the next
+    // start finishes the job instead of finding a half-reverted folder.
+    let _ = write_ledger(&ledger, LEDGER_PENDING, &names);
+    let mut ok = true;
+    for name in &names {
+        if !restore_one(app_dir, name) {
+            ok = false;
+        }
+    }
+    if ok {
+        let _ = std::fs::remove_file(&ledger);
+    }
+    Ok(())
+}
+
+/// Whether an open handle refers to a *name-surrogate* reparse point — a
+/// symlink or junction, i.e. one that redirects a path.
+///
+/// Classifying from the handle rather than the path is what makes the check
+/// atomic with the open. The name-surrogate bit keeps OneDrive-style
+/// placeholders working: those are reparse points too, but not surrogates.
+fn is_name_surrogate(handle: &std::fs::File) -> std::io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        FileAttributeTagInfo, GetFileInformationByHandleEx, FILE_ATTRIBUTE_TAG_INFO,
+    };
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    const REPARSE_TAG_NAME_SURROGATE: u32 = 0x2000_0000;
+
+    let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
+    // SAFETY: `info` is a valid, correctly-sized FILE_ATTRIBUTE_TAG_INFO and
+    // the handle is live for the call.
+    unsafe {
+        GetFileInformationByHandleEx(
+            HANDLE(handle.as_raw_handle() as _),
+            FileAttributeTagInfo,
+            std::ptr::from_mut(&mut info).cast(),
+            std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    }
+    .map_err(std::io::Error::other)?;
+
+    Ok(info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        && info.ReparseTag & REPARSE_TAG_NAME_SURROGATE != 0)
+}
+
 /// First line of the ledger: whether the install it describes finished.
 const LEDGER_PENDING: &str = "pending";
 const LEDGER_DONE: &str = "done";
 
 fn write_ledger(path: &Path, state: &str, names: &[String]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
     let mut text = String::from(state);
     for name in names {
         text.push('\n');
         text.push_str(name);
     }
-    std::fs::write(path, text)
+    // The ledger has a predictable name in a user-writable folder, and this
+    // runs elevated. `std::fs::write` follows a reparse point, so a link
+    // planted at this path would have the administrator token truncate and
+    // overwrite whatever it points at. `FILE_FLAG_OPEN_REPARSE_POINT` never
+    // follows one — the open lands on the link itself and fails.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()
 }
 
-/// Whether every recorded file is back to a single, present copy — i.e. the
-/// rollback left nothing for startup recovery to do.
+/// Read the ledger without following a link planted at its path.
+fn read_ledger(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    Ok(text)
+}
+
+/// Whether the rollback left nothing for startup recovery to do.
+///
+/// A leftover `.old` is the only thing recovery acts on, so its absence is the
+/// condition. Note this is deliberately not "the file is present": a file the
+/// install *created* where nothing existed before is correctly rolled back by
+/// deleting it, and demanding it be present afterwards would keep a ledger
+/// describing an install that is already fully undone.
 fn rolled_back_cleanly(dir: &Path, names: &[String]) -> bool {
     names
         .iter()
-        .all(|name| dir.join(name).is_file() && !dir.join(format!("{name}.old")).exists())
+        .all(|name| !dir.join(format!("{name}.old")).exists())
 }
 
 fn install_recorded(staged: &mut [StagedFile], app_dir: &Path) -> Result<(), String> {
@@ -867,7 +990,7 @@ fn recover_with_ledger(dir: &Path) {
         return;
     };
     let ledger = dir.join(INSTALL_LEDGER);
-    let (names, recovered) = match std::fs::read_to_string(&ledger) {
+    let (names, recovered) = match read_ledger(&ledger) {
         Ok(text) => {
             let mut lines = text.lines();
             let state = lines.next().unwrap_or_default().trim().to_string();
@@ -1031,6 +1154,8 @@ mod tests {
 
         std::fs::write(stage.join("bdo-optimizer.exe"), b"new exe").unwrap();
         std::fs::write(stage.join("PresentMon.exe"), b"new presentmon").unwrap();
+        // The package must be complete or `staged_files` refuses it.
+        std::fs::write(stage.join(crate::video::INSPECTOR_EXE), b"new inspector").unwrap();
 
         let mut staged = staged_files(&stage).unwrap();
         staged.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1062,6 +1187,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// An incomplete package must be refused before anything is swapped: a new
+    /// executable beside a stale PresentMon fails every capture, after the
+    /// install has already committed.
+    #[test]
+    fn an_incomplete_package_is_refused() {
+        let dir = std::env::temp_dir().join(format!("bdo-update-partial-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("bdo-optimizer.exe"), b"new exe").unwrap();
+        let err = match staged_files(&dir) {
+            Err(e) => e,
+            Ok(_) => panic!("an incomplete package must be refused"),
+        };
+        assert!(err.contains("missing"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A staged file is held open denying writes, so nothing can substitute it
     /// between verification and installation — and installation copies from
     /// that handle rather than re-opening the path.
@@ -1074,6 +1215,8 @@ mod tests {
         std::fs::create_dir_all(&stage).unwrap();
         std::fs::create_dir_all(&app).unwrap();
         std::fs::write(stage.join("bdo-optimizer.exe"), b"verified bytes").unwrap();
+        std::fs::write(stage.join("PresentMon.exe"), b"pm").unwrap();
+        std::fs::write(stage.join(crate::video::INSPECTOR_EXE), b"npi").unwrap();
 
         let mut staged = staged_files(&stage).unwrap();
         assert!(

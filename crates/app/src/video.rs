@@ -114,6 +114,59 @@ pub fn restore_settings(applied: &[u32]) -> Vec<(u32, u32)> {
         .collect()
 }
 
+/// A machine-wide lock over the driver profile and its applied-settings record.
+///
+/// The record is a read-modify-write on a shared file, and the in-process job
+/// lock says nothing about a second copy of the app. Two elevated instances
+/// could each read the same prior ids and overwrite the other's union — after
+/// which the profile carries settings the surviving record does not list, and
+/// Undo cannot reverse them. Held across reading, importing and rewriting.
+#[cfg(windows)]
+pub struct DriverLock(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl DriverLock {
+    /// Take the lock, waiting briefly for another instance to finish.
+    pub fn acquire() -> Result<Self, String> {
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::WAIT_TIMEOUT;
+        use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+
+        let name: Vec<u16> = r"Local\bdo-optimizer-driver-profile"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: `name` is a NUL-terminated wide string alive across the call.
+        let handle = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) }
+            .map_err(|e| format!("could not create the driver lock: {e}"))?;
+        // SAFETY: a live mutex handle from the call above.
+        if unsafe { WaitForSingleObject(handle, 30_000) } == WAIT_TIMEOUT {
+            // SAFETY: closing a handle we own and do not use again.
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(handle);
+            }
+            return Err(
+                "another copy of BDO Optimizer is changing the driver profile — wait for it                  to finish"
+                    .to_string(),
+            );
+        }
+        Ok(Self(handle))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for DriverLock {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::ReleaseMutex;
+        // SAFETY: owned by this guard and released exactly once.
+        unsafe {
+            let _ = ReleaseMutex(self.0);
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
 /// Where the list of applied setting ids is kept, beside the other undo record.
 fn applied_record_path() -> Option<PathBuf> {
     bdo_bench::SessionStore::default_store()
@@ -467,6 +520,9 @@ pub mod worker {
         imported: &mut bool,
     ) -> Result<String, String> {
         let _serialized = job_lock();
+        // …and across processes, so a second copy of the app cannot interleave
+        // its own import and record rewrite with this one.
+        let _machine_wide = super::DriverLock::acquire()?;
         if cancelled(cancel) {
             return Err("cancelled".to_string());
         }

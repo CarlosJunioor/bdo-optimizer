@@ -297,7 +297,11 @@ impl App {
     pub(crate) fn refresh_verification(&mut self) {
         #[cfg(windows)]
         {
+            // Read the mask and note which process it came from together. A
+            // capture is saved carrying this mask and a trusted role, so it has
+            // to be able to prove the frames came from *this* instance.
             self.optimize.verify = Some(win_actions::verify(&self.optimize.mask_input));
+            self.optimize.verified_pid = win_actions::verified_pid();
             self.optimize.last_verify_at = Some(std::time::Instant::now());
         }
     }
@@ -936,6 +940,9 @@ impl App {
         // reports a verified success (see `poll_driver_worker`): clearing it up
         // front would leave a failed restore with nothing to retry from.
         if label == "apply" {
+            // Read-then-write on a file another instance may also be editing:
+            // hold the same machine-wide lock the job itself takes.
+            let _machine_wide = crate::video::DriverLock::acquire();
             self.video.applied_before = crate::video::recorded_applied();
             if let Err(e) = crate::video::record_applied(&settings) {
                 self.oneclick.steps.push((
@@ -1589,6 +1596,7 @@ impl App {
                                 crate::video::guide_settings(physical_cores, self.video.ull);
                             // Same contract as the one-click path: no record,
                             // no change — the button promises a reversible edit.
+                            let _machine_wide = crate::video::DriverLock::acquire();
                             self.video.applied_before = crate::video::recorded_applied();
                             match crate::video::record_applied(&settings) {
                                 Ok(()) => {
@@ -1950,6 +1958,12 @@ mod win_actions {
             .ok_or_else(|| bdo_launch::LaunchError::Os("no launcher path selected".into()))?;
         let mask = parse_mask_hex(mask_hex)?;
         bdo_launch::launch_with_affinity(&launcher, mask, steam)
+    }
+
+    /// The PID whose affinity the last [`verify`] read, so a capture can bind
+    /// to that exact instance instead of "whatever is running now".
+    pub fn verified_pid() -> Option<u32> {
+        bdo_bench::is_process_running(GAME_EXE).map(|pid| pid.as_u32())
     }
 
     pub fn verify(expected_hex: &str) -> VerifyOutcome {

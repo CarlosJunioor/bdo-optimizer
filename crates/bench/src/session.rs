@@ -104,7 +104,17 @@ impl Session {
     /// Filename this session is stored under: `<timestamp>_<label>.json`, sanitised so
     /// it is a valid, collision-resistant filename on all platforms.
     pub fn file_stem(&self) -> String {
-        format!("{}_{}", sanitize(&self.timestamp), sanitize(&self.label))
+        // Bounded, because this becomes one path component: NTFS caps those at
+        // 255 characters, and a label pasted past that made `save` fail *after*
+        // the capture finished — at which point the worker drops its cleanup
+        // guard and deletes the only CSV, losing the whole run to a text field.
+        // The full label is kept in the file's contents either way.
+        const MAX_LABEL: usize = 80;
+        let mut label = sanitize(&self.label);
+        if label.len() > MAX_LABEL {
+            label.truncate(MAX_LABEL);
+        }
+        format!("{}_{}", sanitize(&self.timestamp), label)
     }
 }
 
@@ -260,6 +270,19 @@ mod tests {
             frames_ms: vec![16.6, 16.9, 17.0, 16.7],
             presentmon_version: Some("2.5.0".to_string()),
         }
+    }
+
+    /// A label long enough to blow the filesystem's component limit must not
+    /// be able to fail the save — the capture is already finished by then and
+    /// its raw CSV is deleted on the way out.
+    #[test]
+    fn file_stem_is_bounded_however_long_the_label() {
+        let mut s = Session::new("x".repeat(4000), "cpu", "gpu", vec![16.6]);
+        s.timestamp = "2026-01-01T00:00:00Z".to_string();
+        let stem = s.file_stem();
+        assert!(stem.len() < 255, "stem was {} chars", stem.len());
+        // The label itself is still stored in full.
+        assert_eq!(s.label.len(), 4000);
     }
 
     #[test]
