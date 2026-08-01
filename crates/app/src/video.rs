@@ -221,16 +221,32 @@ pub fn write_no_follow(path: &Path, text: &str) -> std::io::Result<()> {
     #[cfg(windows)]
     use std::os::windows::fs::OpenOptionsExt;
 
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(windows)]
+    // Write a sibling and replace, rather than truncating in place. This file
+    // is the *only* record of which driver settings this app changed: a
+    // truncate that then fails to finish — disk full, a killed process, power
+    // loss — would leave the overrides applied with an empty or half-written
+    // list, and Undo could no longer reverse them. The replace is the last
+    // step, so the old contents survive every failure before it.
+    let tmp = path.with_extension("tmp");
     {
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(windows)]
+        {
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        let mut file = options.open(&tmp)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
     }
-    let mut file = options.open(path)?;
-    file.write_all(text.as_bytes())?;
-    file.sync_all()
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 /// Forget the applied-settings record once the profile has been restored.
@@ -578,7 +594,7 @@ pub mod worker {
         // each spawn, which is the same check-then-use gap the pin exists to
         // close. The integrity label on `run_dir` blocks a lower-integrity
         // writer, the pin blocks an equal-integrity one.
-        let (exe, _staged_pin) = match stage_inspector(&mut locked, &run_dir) {
+        let (exe, staged_pin) = match stage_inspector(&mut locked, &run_dir) {
             Ok(staged) => staged,
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&run_dir);
@@ -586,6 +602,11 @@ pub mod worker {
             }
         };
         let outcome = run_in(&exe, &run_dir, settings, cancel, imported);
+        // Release the pin *before* clearing up. It is opened `FILE_SHARE_READ`
+        // only, which denies delete — so leaving it open made `remove_dir_all`
+        // fail silently and every apply or restore left a copy of the inspector,
+        // its config and an exported profile behind in the temp folder.
+        drop(staged_pin);
         let _ = std::fs::remove_dir_all(&run_dir);
         outcome
     }

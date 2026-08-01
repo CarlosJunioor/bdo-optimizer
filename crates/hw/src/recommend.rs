@@ -84,10 +84,39 @@ pub fn recommend(cpu: &CpuInfo) -> Recommendation {
             if dual_ccd_x3d {
                 apply_x3d_topology(&mut rec, cpu);
             }
-            rec
+            // The table is keyed on the model *name*, which says nothing about
+            // how the chip is configured. A 5800X3D with SMT switched off in
+            // BIOS is still a 5800X3D, but it has 8 logical processors and the
+            // table's `5554` selects processors up to 14 — the UI would seed
+            // that mask and then refuse to apply it, leaving the main workflow
+            // dead with no way forward. Live topology wins when the two
+            // disagree, because it describes the machine in front of us.
+            if fits(&rec, cpu) {
+                rec
+            } else {
+                derive_from_topology(cpu)
+                    .map(|mut derived| {
+                        derived.explanation.push_str(
+                            " (The guide's mask for this model does not fit how this CPU is \
+                             configured — SMT or cores appear to be disabled — so it was \
+                             derived from the live topology instead.)",
+                        );
+                        derived
+                    })
+                    .unwrap_or(rec)
+            }
         }
         None => derive_from_topology(cpu).unwrap_or_else(Recommendation::unknown),
     }
+}
+
+/// Whether every processor a recommendation selects actually exists.
+fn fits(rec: &Recommendation, cpu: &CpuInfo) -> bool {
+    // "No change" advises nothing, so there is nothing to check.
+    if rec.mask_hex.is_none() {
+        return true;
+    }
+    cpu.logical_cores == 0 || rec.cores.iter().all(|core| *core < cpu.logical_cores)
 }
 
 fn is_amd(model: &str) -> bool {
@@ -697,6 +726,23 @@ mod tests {
         assert_eq!(rec.topology_confirmed, Some(true));
         assert_eq!(rec.mask_hex.as_deref(), Some("555"));
         assert_eq!(rec.cores, vec![0, 2, 4, 6, 8, 10]);
+    }
+
+    /// The table is keyed on the model name, which does not describe how the
+    /// chip is configured. With SMT off a 5800X3D has 8 logical processors and
+    /// the table's `5554` reaches processor 14 — the UI would seed a mask it
+    /// then refuses to apply, with no way forward.
+    #[test]
+    fn a_table_mask_that_does_not_fit_falls_back_to_topology() {
+        let mut c = cpu("AMD Ryzen 7 5800X3D 8-Core Processor", 8, 8);
+        c.cores = topo(&[(8, 0, false)]);
+        let rec = recommend(&c);
+        assert!(
+            rec.cores.iter().all(|core| *core < 8),
+            "every selected processor must exist: {:?}",
+            rec.cores
+        );
+        assert!(rec.explanation.contains("does not fit"), "{}", rec.explanation);
     }
 
     #[test]
