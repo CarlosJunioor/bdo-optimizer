@@ -78,12 +78,15 @@ pub enum BenchError {
 
 impl From<std::io::Error> for BenchError {
     fn from(e: std::io::Error) -> Self {
-        // Surface access-denied specifically so callers can prompt for elevation.
-        if e.kind() == std::io::ErrorKind::PermissionDenied {
-            BenchError::NeedsElevation
-        } else {
-            BenchError::Io(e.to_string())
-        }
+        // Deliberately *not* mapping `PermissionDenied` to `NeedsElevation`.
+        // This conversion is on every IO path in the crate, including saving
+        // and loading sessions — so a read-only sessions folder, an ACL, or an
+        // antivirus lock reported "PresentMon needs administrator rights",
+        // which is wrong, unactionable, and shown even when no capture ran and
+        // the app is already elevated. Elevation is classified only where it
+        // can actually be diagnosed: the PresentMon spawn and exit paths in
+        // `capture.rs`, which know it is an ETW failure.
+        BenchError::Io(e.to_string())
     }
 }
 

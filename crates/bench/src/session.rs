@@ -251,8 +251,11 @@ impl SessionStore {
     /// does not deserialise.
     pub fn load(&self, file_stem: &str) -> Result<Session, BenchError> {
         let path = self.session_path(file_stem)?;
+        // Same reason as `list`: a collision suffix must survive the round
+        // trip, or deleting this session would remove its same-second namesake.
         let text = fs::read_to_string(&path)?;
-        let session = serde_json::from_str::<Session>(&text)?;
+        let mut session = serde_json::from_str::<Session>(&text)?;
+        session.stored_stem = Some(file_stem.to_string());
         Ok(session)
     }
 
@@ -381,7 +384,11 @@ mod tests {
         let s = sample();
         let path = store.save(&s).unwrap();
         assert!(path.exists());
-        let loaded = store.load(&s.file_stem()).unwrap();
+        let mut loaded = store.load(&s.file_stem()).unwrap();
+        // The loader records where it read from; the fixture has no such
+        // provenance, so compare the persisted content.
+        assert_eq!(loaded.stored_stem.as_deref(), Some(s.file_stem().as_str()));
+        loaded.stored_stem = None;
         assert_eq!(loaded, s);
     }
 

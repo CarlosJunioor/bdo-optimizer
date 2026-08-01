@@ -204,6 +204,22 @@ fn capture_elapsed(start: &mut Option<Instant>, running: bool, now: Instant) -> 
 }
 
 fn run(p: CaptureParams, stop: Arc<AtomicBool>, tx: Sender<CaptureMsg>, ctx: egui::Context) {
+    // One capture at a time on the machine. PresentMon's start-up asks Windows
+    // to stop any existing trace session of its own, so a second instance
+    // launching would terminate the first one's — the first run then fails or
+    // saves a truncated benchmark with no sign of why. Held for the whole
+    // PresentMon lifetime, not just the spawn.
+    #[cfg(windows)]
+    let _capture_lock = match crate::privdir::lock("bdo-optimizer-capture") {
+        Ok(guard) => guard,
+        Err(e) => {
+            let _ = tx.send(CaptureMsg::Error(format!(
+                "another copy of BDO Optimizer is already capturing ({e}) — stop it first,                  otherwise the two runs would cut each other short"
+            )));
+            ctx.request_repaint();
+            return;
+        }
+    };
     let cfg = CaptureConfig {
         presentmon_path: p.presentmon_path.clone(),
         process_name: GAME_EXE.to_string(),

@@ -350,7 +350,12 @@ fn apply(
     // pre-positioned the path — unlike `create_dir_all`, which happily accepts a
     // directory an attacker created first. That matters because everything
     // staged here is later copied next to the (elevated) executable and run.
-    let tmp = crate::privdir::create("bdo-optimizer-update")?;
+    // Scoped, so the archive and the extracted binaries do not survive a failed
+    // download, checksum, extraction or install. `apply` returns early on all of
+    // those, and a bare `remove_dir_all` at the end only ran on success — every
+    // failed attempt left a full copy of a release behind.
+    let tmp = StagingDir(crate::privdir::create("bdo-optimizer-update")?);
+    let tmp = tmp.0.as_path();
 
     progress("Downloading…");
     let zip = tmp.join("update.zip");
@@ -452,7 +457,6 @@ fn apply(
     };
     // Release the source pins before the staging directory is removed.
     drop(staged);
-    let _ = std::fs::remove_dir_all(&tmp);
 
     progress("Restarting…");
     // `pinned_exe` has been held since the bytes were compared, so what starts
@@ -588,6 +592,15 @@ fn verify_checksum(zip: &mut impl std::io::Read, published: &str) -> Result<(), 
         ));
     }
     Ok(())
+}
+
+/// A staging directory removed when it goes out of scope, however that happens.
+struct StagingDir(PathBuf);
+
+impl Drop for StagingDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// One staged file, held open so nothing can change it before it is installed.

@@ -213,25 +213,47 @@ fn percentile_sorted(sorted: &[f64], pct: f64) -> f64 {
 /// CapFrameX-style time-weighted "low" frame time.
 ///
 /// Walks frame times from slowest to fastest, accumulating their durations until the
-/// running total reaches `threshold` of the whole session (`0.01` = 1%). Returns the
-/// frame time at that cutoff — invert it (`1000 / result`) to get FPS.
+/// running total reaches `threshold` of the whole session (`0.01` = 1%), and returns
+/// the **average** frame time over exactly that worst interval — invert it
+/// (`1000 / result`) to get FPS.
 ///
-/// `sorted` must be ascending; we iterate it in reverse (descending) so the slowest
-/// frames — the stutters — are counted first, which is what makes this metric
-/// duration-weighted rather than count-weighted.
+/// The average is what makes this the *integral* metric rather than a
+/// time-weighted percentile. Returning the frame time at the cutoff instead
+/// understates a non-uniform tail: a 10-second run whose worst 100 ms is a
+/// 60 ms frame and a 40 ms frame has a cutoff of 40 ms — reported as 25 FPS —
+/// while the interval those two frames actually describe averages 50 ms, which
+/// is the 20 FPS the player felt.
+///
+/// The last frame is counted only for the part of it that falls inside the
+/// budget, so the window really is `threshold` of the session and not "however
+/// far the last whole frame reached".
+///
+/// `sorted` must be ascending; iterated in reverse (descending) so the slowest
+/// frames — the stutters — are counted first.
 fn integral_low_frame_time(sorted: &[f64], total_ms: f64, threshold: f64) -> f64 {
     let budget = total_ms * threshold;
     let mut accum = 0.0;
-    // Reverse iteration = descending order.
+    let mut frames = 0.0;
     for &t in sorted.iter().rev() {
-        accum += t;
-        if accum >= budget {
-            return t;
+        let remaining = budget - accum;
+        if t >= remaining {
+            // Partial frame: take the fraction that fits, so the window is
+            // exactly `budget` long.
+            let fraction = if t > 0.0 { remaining / t } else { 1.0 };
+            accum += remaining;
+            frames += fraction;
+            return if frames > 0.0 { accum / frames } else { t };
         }
+        accum += t;
+        frames += 1.0;
     }
-    // Threshold never reached (e.g. a single frame > budget is caught on iter 1, so
-    // this only happens for degenerate all-tiny series): fall back to the slowest.
-    *sorted.last().expect("non-empty by contract")
+    // The whole series is shorter than the budget (degenerate input): the
+    // average over everything is the honest answer.
+    if frames > 0.0 {
+        accum / frames
+    } else {
+        *sorted.last().expect("non-empty by contract")
+    }
 }
 
 #[cfg(test)]
@@ -350,6 +372,25 @@ mod tests {
         frames.push(500.0);
         let m = Metrics::from_frame_times(&frames).unwrap();
         assert!(approx(m.one_percent_low_integral_fps, 2.0, 1e-9));
+    }
+
+    /// The integral low averages the worst interval; returning the frame time
+    /// at the cutoff understates a non-uniform tail. A 10 s run whose worst
+    /// 100 ms is one 60 ms and one 40 ms frame felt like 20 FPS, not the 25 FPS
+    /// the cutoff alone reports.
+    #[test]
+    fn integral_low_averages_a_non_uniform_tail() {
+        // 10 s total: 60 ms + 40 ms of stutter, the rest smooth 10 ms frames.
+        let mut frames = vec![10.0; 990];
+        frames.push(60.0);
+        frames.push(40.0);
+        let m = Metrics::from_frame_times(&frames).unwrap();
+        // Worst 1% of ~10 s is ~100 ms — exactly those two frames, mean 50 ms.
+        assert!(
+            (m.one_percent_low_integral_fps - 20.0).abs() < 1.0,
+            "expected ~20 FPS, got {}",
+            m.one_percent_low_integral_fps
+        );
     }
 
     #[test]
