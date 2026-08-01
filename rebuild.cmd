@@ -16,4 +16,5 @@ if errorlevel 1 (
   exit /b 1
 )
 copy /y "vendor\presentmon\PresentMon.exe" "target\release\PresentMon.exe" >nul
+copy /y "vendor\nvidiaProfileInspector\nvidiaProfileInspector.exe" "target\release\nvidiaProfileInspector.exe" >nul
 start "" "target\release\bdo-optimizer.exe"
