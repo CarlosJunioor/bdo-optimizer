@@ -531,11 +531,20 @@ fn verify_installed(staged: &mut [StagedFile], exe: &Path) -> Result<std::fs::Fi
 /// destination so a shorter new file cannot leave a tail of the old one.
 fn copy_from_handle(src: &mut std::fs::File, dest: &Path) -> std::io::Result<()> {
     use std::io::{Seek, SeekFrom};
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
     src.seek(SeekFrom::Start(0))?;
+    // `create_new` plus no-follow, not `create().truncate()`. The destination
+    // is a predictable `*.new` path in the user-writable install folder, and
+    // this runs elevated: a create-and-truncate open would follow a link raced
+    // into that name and overwrite whatever it points at. Winning `create_new`
+    // proves the name was free, and the reparse flag means the open lands on
+    // the name itself either way. The caller removes any stale file first.
     let mut out = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(dest)?;
     std::io::copy(src, &mut out)?;
     out.sync_all()

@@ -54,6 +54,15 @@ pub struct Session {
     pub frames_ms: Vec<f64>,
     /// PresentMon version that produced the capture, if known.
     pub presentmon_version: Option<String>,
+    /// The file stem this session was actually loaded from.
+    ///
+    /// Not persisted — it *is* the file name. A stem derived from the contents
+    /// stopped being unique once `save` started suffixing collisions: two
+    /// captures a second apart under one label produce `<stem>.json` and
+    /// `<stem>-1.json`, and deleting the second by its derived stem would
+    /// delete the first instead, leaving the second undeletable.
+    #[serde(skip)]
+    pub stored_stem: Option<String>,
 }
 
 impl Session {
@@ -77,6 +86,7 @@ impl Session {
             gpu: gpu.into(),
             frames_ms,
             presentmon_version: None,
+            stored_stem: None,
         }
     }
 
@@ -104,6 +114,10 @@ impl Session {
     /// Filename this session is stored under: `<timestamp>_<label>.json`, sanitised so
     /// it is a valid, collision-resistant filename on all platforms.
     pub fn file_stem(&self) -> String {
+        // Whatever it was actually saved as wins over a fresh derivation.
+        if let Some(stem) = &self.stored_stem {
+            return stem.clone();
+        }
         // Bounded, because this becomes one path component: NTFS caps those at
         // 255 characters, and a label pasted past that made `save` fail *after*
         // the capture finished — at which point the worker drops its cleanup
@@ -215,7 +229,13 @@ impl SessionStore {
                 continue;
             }
             if let Ok(text) = fs::read_to_string(&path) {
-                if let Ok(session) = serde_json::from_str::<Session>(&text) {
+                if let Ok(mut session) = serde_json::from_str::<Session>(&text) {
+                    // Remember where it came from, so deleting this row deletes
+                    // this file and not a same-second namesake.
+                    session.stored_stem = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(str::to_string);
                     sessions.push(session);
                 }
             }
@@ -296,6 +316,7 @@ mod tests {
             gpu: "RTX 4080".to_string(),
             frames_ms: vec![16.6, 16.9, 17.0, 16.7],
             presentmon_version: Some("2.5.0".to_string()),
+            stored_stem: None,
         }
     }
 
@@ -317,7 +338,18 @@ mod tests {
         let first = store.save(&a).unwrap();
         let second = store.save(&b).unwrap();
         assert_ne!(first, second);
-        assert_eq!(store.list().unwrap().len(), 2);
+
+        // …and each listed row must delete its *own* file. Before the stored
+        // stem was carried through, both rows derived the same name, so
+        // deleting the second removed the first and left the second stranded.
+        let listed = store.list().unwrap();
+        assert_eq!(listed.len(), 2);
+        let stems: Vec<String> = listed.iter().map(Session::file_stem).collect();
+        assert_ne!(stems[0], stems[1], "each row must name its own file");
+        for stem in &stems {
+            store.delete(stem).unwrap();
+        }
+        assert!(store.list().unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
