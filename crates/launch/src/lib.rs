@@ -49,6 +49,7 @@ mod common;
 mod error;
 
 pub use common::{
+    ProcessAffinity,
     build_cmd_arguments, build_launch_command_line, desktop_file_content, generate_taskset_command,
     mask_to_cores, mask_to_hex, parse_mask_hex, shortcut_description, validate_mask, LaunchMethod,
     ShortcutOptions, DEFAULT_SHORTCUT_NAME, GAME_EXE, LAUNCHER_EXE,

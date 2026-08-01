@@ -6,7 +6,7 @@
 
 use crate::common::{
     build_cmd_arguments, build_launch_command_line, mask_to_hex, shortcut_description,
-    LaunchMethod, ShortcutOptions, DEFAULT_SHORTCUT_NAME, LAUNCHER_EXE,
+    LaunchMethod, ProcessAffinity, ShortcutOptions, DEFAULT_SHORTCUT_NAME, LAUNCHER_EXE,
 };
 use crate::error::LaunchError;
 use std::ffi::c_void;
@@ -477,7 +477,7 @@ fn default_desktop_path() -> Result<PathBuf, LaunchError> {
 /// anti-cheat is not tripped), and calls `GetProcessAffinityMask`. Returns
 /// `Ok(None)` when the process is not running.
 pub fn read_process_affinity(process_name: &str) -> Result<Option<u64>, LaunchError> {
-    Ok(read_process_affinity_with_pid(process_name)?.map(|(_, mask)| mask))
+    Ok(read_process_affinity_with_pid(process_name)?.map(|a| a.process_mask))
 }
 
 /// [`read_process_affinity`], also reporting *which* process the mask came from.
@@ -489,7 +489,7 @@ pub fn read_process_affinity(process_name: &str) -> Result<Option<u64>, LaunchEr
 /// run would be saved as an optimized one.
 pub fn read_process_affinity_with_pid(
     process_name: &str,
-) -> Result<Option<(u32, u64)>, LaunchError> {
+) -> Result<Option<ProcessAffinity>, LaunchError> {
     use sysinfo::{ProcessesToUpdate, System};
 
     let mut sys = System::new();
@@ -514,7 +514,16 @@ pub fn read_process_affinity_with_pid(
         let _ = CloseHandle(handle);
         res.map_err(|e| LaunchError::Os(format!("GetProcessAffinityMask failed: {e}")))?;
 
-        Ok(Some((pid, process_mask as u64)))
+        // The *system* mask is the set of processors in this process's group,
+        // which on a >64-thread machine is not `u64::MAX` and not derivable
+        // from the machine-wide core count. Callers deciding "is this an
+        // unrestricted launch?" have to compare against it, not against a
+        // count-derived guess.
+        Ok(Some(ProcessAffinity {
+            pid,
+            process_mask: process_mask as u64,
+            system_mask: system_mask as u64,
+        }))
     }
 }
 

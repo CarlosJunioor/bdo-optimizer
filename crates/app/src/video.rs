@@ -196,7 +196,7 @@ pub fn record_applied(settings: &[(u32, u32)]) -> Result<(), String> {
         }
     }
     let text: Vec<String> = ids.iter().map(u32::to_string).collect();
-    std::fs::write(&path, text.join("\n"))
+    write_no_follow(&path, &text.join("\n"))
         .map_err(|e| format!("could not save {}: {e}", path.display()))
 }
 
@@ -258,7 +258,7 @@ pub fn restore_applied_record(previous: &[u32]) {
         return;
     };
     let text: Vec<String> = previous.iter().map(u32::to_string).collect();
-    let _ = std::fs::write(path, text.join("\n"));
+    let _ = write_no_follow(&path, &text.join("\n"));
 }
 
 /// Render the `.nip` XML for the Black Desert profile with the given settings.

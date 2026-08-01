@@ -56,6 +56,10 @@ pub struct OptimizeState {
     /// so a benchmark can refuse to measure a different instance under that
     /// instance's provenance.
     pub verified_pid: Option<u32>,
+    /// The processors that process's group offers, as Windows reported them.
+    /// The only correct yardstick for "unrestricted launch" — see
+    /// `bdo_launch::ProcessAffinity`.
+    pub system_mask: Option<u64>,
 }
 
 impl OptimizeState {

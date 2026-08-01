@@ -303,6 +303,15 @@ impl App {
             let (outcome, pid) = win_actions::verify(&self.optimize.mask_input);
             self.optimize.verify = Some(outcome);
             self.optimize.verified_pid = pid;
+            // The processors the running game's group actually offers. Deriving
+            // this from the machine-wide core count is wrong past 64 threads:
+            // a process in a 32-processor group reports 0xffff_ffff, and a
+            // perfectly normal launch would read as restricted.
+            self.optimize.system_mask =
+                bdo_launch::read_process_affinity_with_pid(bdo_launch::GAME_EXE)
+                    .ok()
+                    .flatten()
+                    .map(|a| a.system_mask);
             self.optimize.last_verify_at = Some(std::time::Instant::now());
         }
     }
@@ -1009,6 +1018,8 @@ impl App {
                          not be made undoable ({e}) — the profile was left alone"
                     )),
                 ));
+                // No worker starts, so nothing downstream releases this.
+                self.video.driver_lock = None;
                 return;
             }
         }
@@ -1710,15 +1721,35 @@ impl App {
                             })
                             .clicked()
                         {
-                            // The record is cleared by `poll_driver_worker`, and
-                            // only once the restore verifies — a failed one
-                            // must stay retryable.
+                            // Take the machine-wide lock *before* deciding what
+                            // to restore, and re-read the record under it: the
+                            // `applied` list above was read unlocked to size
+                            // the button, and another instance could have
+                            // changed the profile since. The lock is released
+                            // by `poll_driver_worker`, which also clears the
+                            // record — but only once the restore verifies, so a
+                            // failed one stays retryable.
+                            match crate::video::DriverLock::acquire() {
+                                Ok(lock) => self.video.driver_lock = Some(lock),
+                                Err(e) => {
+                                    self.video.last = Some(Err(e));
+                                    return;
+                                }
+                            }
+                            let applied = crate::video::recorded_applied();
+                            let settings = crate::video::restore_settings(&applied);
+                            if settings.is_empty() {
+                                self.video.last = Some(Ok(
+                                    "nothing to restore — no record of this app changing the \
+                                     profile"
+                                        .to_string(),
+                                ));
+                                self.video.driver_lock = None;
+                                return;
+                            }
                             self.video.last = None;
-                            self.video.worker = Some(crate::video::worker::start(
-                                exe,
-                                crate::video::restore_settings(&applied),
-                                "restore",
-                            ));
+                            self.video.worker =
+                                Some(crate::video::worker::start(exe, settings, "restore"));
                         }
                     });
                 }
@@ -2047,13 +2078,14 @@ mod win_actions {
         };
         match bdo_launch::read_process_affinity_with_pid(GAME_EXE) {
             Ok(None) => (VerifyOutcome::NotRunning, None),
-            Ok(Some((pid, actual))) => {
+            Ok(Some(affinity)) => {
+                let actual = affinity.process_mask;
                 let outcome = if actual == expected {
                     VerifyOutcome::Match { mask: actual }
                 } else {
                     VerifyOutcome::Mismatch { actual, expected }
                 };
-                (outcome, Some(pid))
+                (outcome, Some(affinity.pid))
             }
             Err(e) => (VerifyOutcome::Error(e.to_string()), None),
         }

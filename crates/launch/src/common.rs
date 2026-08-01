@@ -51,24 +51,23 @@ pub fn validate_mask(mask: u64, logical_cores: Option<usize>) -> Result<(), Laun
         return Err(LaunchError::InvalidMask("0".to_string()));
     }
     if let Some(cores) = logical_cores {
-        if cores == 0 {
+        // Above 64 logical processors Windows splits the machine into processor
+        // groups and an affinity mask addresses whichever group the process
+        // landed in. We cannot know that group when the shortcut is written,
+        // groups are not all the same size, and `start /affinity` has no way to
+        // name one — so a mask that looks fine here can be silently rejected at
+        // launch. Refusing is the honest answer; accepting by clamping to 64
+        // would wave through masks that cannot be applied.
+        //
+        // ponytail: group-aware launching (`SetThreadGroupAffinity` on a
+        // suspended process) would lift this. Worth it only if someone actually
+        // runs BDO on a >64-thread machine.
+        if cores == 0 || cores > 64 {
             return Err(LaunchError::MaskOutOfRange {
                 mask,
                 logical_cores: cores,
             });
         }
-        // Above 64 logical processors Windows splits the machine into processor
-        // groups, and an affinity mask addresses one group. Rejecting these
-        // outright meant a Threadripper or dual-socket box could never pass
-        // preflight at all — every bit of every mask is inside group 0, which
-        // is the group a process starts in, so the mask is valid there.
-        // Checking against the *machine-wide* count is the wrong comparison,
-        // not a stricter one.
-        //
-        // ponytail: group 0 only. Pinning to a different group needs
-        // `SetThreadGroupAffinity`, which `start /affinity` cannot express
-        // anyway; revisit if the recommendation engine ever targets one.
-        let cores = cores.min(64);
         // Bits at or above `cores` must all be clear.
         let allowed: u64 = if cores == 64 {
             u64::MAX
@@ -190,6 +189,28 @@ pub enum LaunchMethod {
     ElevatedShell,
 }
 
+/// One read of a running process's affinity.
+///
+/// `system_mask` is what `GetProcessAffinityMask` reports as available to that
+/// process — the processors in its group. It is the only correct answer to "is
+/// this launch unrestricted?": on a machine with more than 64 threads a process
+/// in a 32-processor group reports `0xffff_ffff`, not `u64::MAX`, and deriving
+/// the comparison from the machine-wide core count marks a perfectly normal
+/// launch as restricted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessAffinity {
+    pub pid: u32,
+    pub process_mask: u64,
+    pub system_mask: u64,
+}
+
+impl ProcessAffinity {
+    /// Whether the process may use every processor its group offers.
+    pub fn is_unrestricted(&self) -> bool {
+        self.process_mask == self.system_mask
+    }
+}
+
 /// Options controlling optimized-shortcut creation.
 #[derive(Debug, Clone)]
 pub struct ShortcutOptions {
@@ -309,14 +330,15 @@ mod tests {
         assert!(validate_mask(1 << 63, Some(64)).is_ok());
     }
 
-    /// Machines past 64 logical processors are split into processor groups and
-    /// a mask addresses one group. Comparing against the machine-wide count
-    /// rejected every mask on a Threadripper or dual-socket box, so preflight
-    /// could never pass there at all.
+    /// Past 64 logical processors Windows uses processor groups, which
+    /// `start /affinity` cannot name and whose sizes differ. A mask accepted
+    /// here could be silently rejected at launch, so these are refused rather
+    /// than waved through.
     #[test]
-    fn masks_are_valid_on_multi_group_machines() {
-        assert!(validate_mask(0x5555, Some(128)).is_ok());
-        assert!(validate_mask(1 << 63, Some(96)).is_ok());
+    fn multi_group_machines_are_refused_not_guessed() {
+        assert!(validate_mask(0x5555, Some(128)).is_err());
+        assert!(validate_mask(1 << 63, Some(96)).is_err());
+        assert!(validate_mask(1 << 63, Some(64)).is_ok());
     }
 
     #[test]

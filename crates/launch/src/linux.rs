@@ -83,7 +83,7 @@ pub fn create_shortcut(_opts: ShortcutOptions) -> Result<PathBuf, LaunchError> {
 /// does not run here, so there is never a process to report.
 pub fn read_process_affinity_with_pid(
     _process_name: &str,
-) -> Result<Option<(u32, u64)>, LaunchError> {
+) -> Result<Option<crate::common::ProcessAffinity>, LaunchError> {
     Ok(None)
 }
 

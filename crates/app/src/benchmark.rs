@@ -35,6 +35,37 @@ impl App {
         );
 
         self.poll_verification(ui.ctx());
+
+        // Elevating into a *different* account moves the session store to that
+        // account's AppData, so a capture would save where the player never
+        // looks. Stop before the capture controls exist at all — a warning
+        // above a working Start button is not a block. The saved-runs list and
+        // comparison stay visible: they are read-only and still useful.
+        #[cfg(windows)]
+        if let Some(origin) = crate::relaunch::elevated_into_another_account() {
+            crate::theme::section_card(ui, icons::WARNING, "Wrong Windows account", |ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "This window runs as {}, not {origin}. Captures would be saved to that                          account's data folder and disappear from your history, so capturing is                          disabled here.",
+                        crate::relaunch::current_account()
+                    ))
+                    .color(WARN)
+                    .strong(),
+                );
+                ui.label(
+                    RichText::new(
+                        "Sign in as an administrator and run it there, or run it normally —                          only the NVIDIA driver profile needs administrator rights.",
+                    )
+                    .size(12.0)
+                    .weak(),
+                );
+            });
+            crate::theme::section_card(ui, icons::ROWS, "Saved runs", |ui| {
+                self.sessions_section(ui)
+            });
+            return;
+        }
+
         self.elevation_banner(ui);
         crate::theme::section_card(ui, icons::RECORD, "Capture a run", |ui| {
             self.capture_section(ui)
@@ -56,22 +87,6 @@ impl App {
     /// ETW trace session, so we warn up front and offer a one-click elevated
     /// relaunch rather than letting the user hit a capture error first.
     fn elevation_banner(&mut self, ui: &mut egui::Ui) {
-        // Elevating into a *different* account moves the session store to that
-        // account's AppData, so captures would save somewhere the player never
-        // looks. Same reasoning as the Apply tab's refusal.
-        #[cfg(windows)]
-        if let Some(origin) = crate::relaunch::elevated_into_another_account() {
-            ui.label(
-                RichText::new(format!(
-                    "This window runs as {}, not {origin}. Saved runs would go to that                      account's data folder and vanish from your history — sign in as an                      administrator and run it there instead.",
-                    crate::relaunch::current_account()
-                ))
-                .color(WARN)
-                .strong(),
-            );
-            ui.add_space(8.0);
-            return;
-        }
         if self.benchmark.elevated {
             return;
         }
@@ -177,7 +192,8 @@ impl App {
             .map(|detection| detection.cpu.logical_cores)
             .unwrap_or(0);
         let running_mask = running_mask(self.optimize.verify.as_ref());
-        let baseline_ready = is_full_affinity(running_mask, logical_cores);
+        let baseline_ready =
+            is_full_affinity(running_mask, self.optimize.system_mask, logical_cores);
 
         if self.benchmark.baseline_capture {
             if baseline_ready {
@@ -1000,11 +1016,21 @@ fn running_mask(outcome: Option<&VerifyOutcome>) -> Option<u64> {
     }
 }
 
-fn is_full_affinity(mask: Option<u64>, logical_cores: usize) -> bool {
-    // Both sides must be known. Comparing the Options directly made
-    // `is_full_affinity(None, 0)` true — no running game and no detected CPU
-    // read as "full affinity detected", which is the opposite of the truth.
-    match (mask, full_affinity_mask(logical_cores)) {
+/// Whether the running game may use every processor available to it.
+///
+/// `system` is what `GetProcessAffinityMask` reported as that process's group,
+/// which is the only correct comparison: on a machine with more than 64 threads
+/// a process in a 32-processor group has a full mask of `0xffff_ffff`, and
+/// deriving one from the machine-wide count would mark an ordinary launch as
+/// restricted and disable baseline capture for good. `logical_cores` is the
+/// fallback for the ordinary single-group case where no process is running.
+///
+/// Both sides must be known: comparing the `Option`s directly made
+/// `is_full_affinity(None, None, 0)` true — no running game and no detected CPU
+/// reading as "full affinity detected", the opposite of the truth.
+fn is_full_affinity(mask: Option<u64>, system: Option<u64>, logical_cores: usize) -> bool {
+    let full = system.or_else(|| full_affinity_mask(logical_cores));
+    match (mask, full) {
         (Some(mask), Some(full)) => mask == full,
         _ => false,
     }
@@ -1082,15 +1108,28 @@ mod tests {
         assert!(!comparison_is_inconclusive(false, false, false, false));
     }
 
+    /// On a >64-thread machine the group's full mask is not derivable from the
+    /// machine-wide count, so a normal launch would read as restricted and
+    /// baseline capture would be disabled for good.
+    #[test]
+    fn a_full_group_mask_counts_as_unrestricted() {
+        // 96 threads, game in a 32-processor group: full is 0xffff_ffff.
+        assert!(is_full_affinity(Some(0xffff_ffff), Some(0xffff_ffff), 96));
+        // A genuinely restricted mask in that same group is still restricted.
+        assert!(!is_full_affinity(Some(0x5555_5555), Some(0xffff_ffff), 96));
+        // The reported mask wins over the count-derived guess.
+        assert!(!is_full_affinity(Some(0xffff), Some(0xffff_ffff), 96));
+    }
+
     #[test]
     fn full_affinity_needs_both_sides_known() {
         // Nothing running and no CPU detected yet must not read as "full affinity".
-        assert!(!is_full_affinity(None, 0));
-        assert!(!is_full_affinity(None, 16));
-        assert!(!is_full_affinity(Some(0xffff), 0));
+        assert!(!is_full_affinity(None, None, 0));
+        assert!(!is_full_affinity(None, None, 16));
+        assert!(!is_full_affinity(Some(0xffff), None, 0));
         // The real case still works.
-        assert!(is_full_affinity(Some(0xffff), 16));
-        assert!(!is_full_affinity(Some(0x5554), 16));
+        assert!(is_full_affinity(Some(0xffff), None, 16));
+        assert!(!is_full_affinity(Some(0x5554), None, 16));
     }
 
     #[test]
@@ -1124,7 +1163,7 @@ mod tests {
 
         assert!(capture_affinity(false, Some(0x555), Some(0x554)).is_err());
         assert!(capture_affinity(true, Some(0xfff), None).is_err());
-        assert!(is_full_affinity(Some(0xfff), 12));
-        assert!(!is_full_affinity(Some(0x555), 12));
+        assert!(is_full_affinity(Some(0xfff), None, 12));
+        assert!(!is_full_affinity(Some(0x555), None, 12));
     }
 }
