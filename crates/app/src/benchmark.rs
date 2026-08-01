@@ -56,6 +56,22 @@ impl App {
     /// ETW trace session, so we warn up front and offer a one-click elevated
     /// relaunch rather than letting the user hit a capture error first.
     fn elevation_banner(&mut self, ui: &mut egui::Ui) {
+        // Elevating into a *different* account moves the session store to that
+        // account's AppData, so captures would save somewhere the player never
+        // looks. Same reasoning as the Apply tab's refusal.
+        #[cfg(windows)]
+        if let Some(origin) = crate::relaunch::elevated_into_another_account() {
+            ui.label(
+                RichText::new(format!(
+                    "This window runs as {}, not {origin}. Saved runs would go to that                      account's data folder and vanish from your history — sign in as an                      administrator and run it there instead.",
+                    crate::relaunch::current_account()
+                ))
+                .color(WARN)
+                .strong(),
+            );
+            ui.add_space(8.0);
+            return;
+        }
         if self.benchmark.elevated {
             return;
         }

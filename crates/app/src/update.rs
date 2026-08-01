@@ -767,9 +767,16 @@ fn roll_back_completed_install(app_dir: &Path) -> Result<(), String> {
             ok = false;
         }
     }
-    if ok {
-        let _ = std::fs::remove_file(&ledger);
+    if !ok {
+        // The caller adds its "reinstall before starting" warning off the back
+        // of this. Reporting success while the canonical executable may still
+        // hold the rejected bytes would send the user to launch it.
+        return Err(
+            "some files could not be put back — the previous version is not fully restored"
+                .to_string(),
+        );
     }
+    let _ = std::fs::remove_file(&ledger);
     Ok(())
 }
 

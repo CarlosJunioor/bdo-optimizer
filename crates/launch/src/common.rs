@@ -51,12 +51,24 @@ pub fn validate_mask(mask: u64, logical_cores: Option<usize>) -> Result<(), Laun
         return Err(LaunchError::InvalidMask("0".to_string()));
     }
     if let Some(cores) = logical_cores {
-        if cores == 0 || cores > 64 {
+        if cores == 0 {
             return Err(LaunchError::MaskOutOfRange {
                 mask,
                 logical_cores: cores,
             });
         }
+        // Above 64 logical processors Windows splits the machine into processor
+        // groups, and an affinity mask addresses one group. Rejecting these
+        // outright meant a Threadripper or dual-socket box could never pass
+        // preflight at all — every bit of every mask is inside group 0, which
+        // is the group a process starts in, so the mask is valid there.
+        // Checking against the *machine-wide* count is the wrong comparison,
+        // not a stricter one.
+        //
+        // ponytail: group 0 only. Pinning to a different group needs
+        // `SetThreadGroupAffinity`, which `start /affinity` cannot express
+        // anyway; revisit if the recommendation engine ever targets one.
+        let cores = cores.min(64);
         // Bits at or above `cores` must all be clear.
         let allowed: u64 = if cores == 64 {
             u64::MAX
@@ -294,8 +306,17 @@ mod tests {
     fn validate_edges() {
         assert!(validate_mask(0, Some(8)).is_err());
         assert!(validate_mask(1, Some(0)).is_err());
-        assert!(validate_mask(1, Some(65)).is_err());
         assert!(validate_mask(1 << 63, Some(64)).is_ok());
+    }
+
+    /// Machines past 64 logical processors are split into processor groups and
+    /// a mask addresses one group. Comparing against the machine-wide count
+    /// rejected every mask on a Threadripper or dual-socket box, so preflight
+    /// could never pass there at all.
+    #[test]
+    fn masks_are_valid_on_multi_group_machines() {
+        assert!(validate_mask(0x5555, Some(128)).is_ok());
+        assert!(validate_mask(1 << 63, Some(96)).is_ok());
     }
 
     #[test]

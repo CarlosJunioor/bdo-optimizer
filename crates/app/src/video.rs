@@ -210,6 +210,29 @@ pub fn recorded_applied() -> Vec<u32> {
         .unwrap_or_default()
 }
 
+/// Write a file without following a reparse point planted at its path.
+///
+/// These records sit at predictable names under the per-user data directory,
+/// and the NVIDIA step runs elevated. `std::fs::write` follows a link, so one
+/// planted here would be followed with the administrator token and truncate
+/// whatever it points at.
+pub fn write_no_follow(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    #[cfg(windows)]
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(windows)]
+    {
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()
+}
+
 /// Forget the applied-settings record once the profile has been restored.
 pub fn clear_applied_record() {
     if let Some(path) = applied_record_path() {
@@ -602,7 +625,7 @@ pub mod worker {
         drop(out);
 
         let config = dir.join(format!("{}.config", super::INSPECTOR_EXE));
-        std::fs::write(&config, super::INSPECTOR_CONFIG)
+        super::write_no_follow(&config, super::INSPECTOR_CONFIG)
             .map_err(|e| format!("could not write {}: {e}", config.display()))?;
 
         // The staged copy is what actually runs, so it is what must be pinned
